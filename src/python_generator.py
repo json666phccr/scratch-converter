@@ -255,14 +255,14 @@ def _sc_join(a, b):
 
 
 def _sc_letter_of(index, string):
+    # 与 Scratch 一致：先减 1，再用未取整的浮点下标判断越界
     index = _sc_num(index) - 1
     text = _sc_str(string)
-    if isinstance(index, float) and (math.isnan(index) or math.isinf(index)):
+    if isinstance(index, float) and not math.isfinite(index):
         return ''
-    position = int(index)
-    if position < 0 or position >= len(text):
+    if index < 0 or index >= len(text):
         return ''
-    return text[position]
+    return text[int(index)]
 
 
 def _sc_length(string):
@@ -3329,14 +3329,19 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
         arg_ids = stmt.extra.get('argumentids')
         if arg_ids:
             meta.append(f"arg_ids={list(arg_ids)!r}")
-        arg_defaults = stmt.extra.get('argumentdefaults')
+        arg_defaults = list(stmt.extra.get('argumentdefaults') or [])
         if arg_defaults:
-            meta.append(f"arg_defaults={list(arg_defaults)!r}")
+            meta.append(f"arg_defaults={arg_defaults!r}")
 
         lines = [f"    @_as_procedure({', '.join(meta)})"]
         signature = ["self"]
         for index, python_arg in enumerate(python_args):
-            default = "False" if arg_types[index] == 'b' else "0"
+            # 与 Scratch 一致：未填参数取 definition 的 argumentdefaults，
+            # 新建积木的默认值是空字符串（布尔为 False）。
+            if index < len(arg_defaults):
+                default = repr(arg_defaults[index])
+            else:
+                default = repr(False if arg_types[index] == 'b' else '')
             signature.append(f"{python_arg}={default}")
         lines.append(f"    def {name}({', '.join(signature)}):")
         title = proccode or stmt.extra.get('name') or 'procedure'

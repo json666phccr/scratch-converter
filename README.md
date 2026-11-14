@@ -1,6 +1,6 @@
 # Scratch 3.0 <-> Python 双向转换器
 
-> 版本 **0.8.0** · [MIT License](LICENSE)
+> 版本 **0.8.1** · [MIT License](LICENSE)
 
 一个强大的 Scratch 3.0 与 Python 之间的双向转换工具，支持**一比一对应**的转换，同时支持高级 Python 语法。
 
@@ -15,6 +15,7 @@
 - **列表保持**: Scratch列表 -> Python列表
 - **自制积木**: Scratch自制积木 -> Python类方法
 - **两种 Python -> Scratch 模式**: DSL 模式保证高保真往返；通用模式可转换普通 Python 脚本（实验性）
+- **语义说明**: 空输入、缺失参数与类型转换的完整规则见 [docs/scratch-semantics.md](docs/scratch-semantics.md)
 
 ## 架构
 
@@ -230,12 +231,15 @@ converter.python_to_scratch('script.py', 'project.sb3', mode='general')
 
 生成的 Python 会在文件顶部定义一组 `_sc_*` 辅助函数，用于复刻 Scratch VM 的行为：
 
-- **类型转换**：`_sc_num`、`_sc_str`、`_sc_bool` 按 Scratch 规则处理 `"0"`、`"false"`、空字符串、`NaN`、`Infinity`、`0x/0o/0b` 等。
+- **类型转换**：`_sc_num`、`_sc_str`、`_sc_bool` 按 Scratch 规则处理空字符串、`"0"`、`"false"`、`NaN`、`Infinity`、`0x/0o/0b` 等。
 - **比较**：`_sc_eq/_sc_lt/_sc_gt` 两边都能转数字时按数字比较，否则忽略大小写按字符串比较。
-- **运算**：除法除以 0 得到 `Infinity/NaN`；`_sc_mod` 使用向下取整余数；`_sc_round` 使用 `floor(x + 0.5)`；三角函数使用角度制。
-- **列表**：下标支持 `last/random/any`，越界返回空而不是抛异常；列表“包含/项的位置”使用 Scratch 比较规则；“列表内容”按 VM 规则拼接。
-- **缺省参数**：自制积木调用完全没有传参数时按 `0` 处理；显式空字符串保持 `""`，它参与数值运算时等价于 0（所以 `"" + 5 == 5`），参与连接时仍是空字符串。
-- **孤儿积木**：只有以事件帽块（绿旗、按键、点击、广播、背景、克隆体启动等）或自制积木定义开头的脚本会被转换，未连接事件帽块的顶层积木会被忽略。
+- **运算**：除以 0 得到 `Infinity/NaN`；`_sc_mod` 使用向下取整余数；`_sc_round` 使用 `floor(x + 0.5)`；三角函数使用角度制。
+- **列表**：下标支持 `last/random/any`，越界返回空而不是抛异常；“包含/项的位置”使用 Scratch 比较规则。
+- **自制积木参数**：未填参数取空字符串（布尔为 `false`），**不是 0**；空字符串只有进入数值运算时才按 0 处理。
+- **孤儿积木**：只有以事件帽块（绿旗、按键、点击、广播、背景、克隆体启动等）或自制积木定义开头的脚本会被转换。
+
+完整的输入/参数语义、边界值与已知差异见
+[Scratch 输入与参数语义说明](docs/scratch-semantics.md)。
 
 ## 示例
 
@@ -394,7 +398,7 @@ python output.py --assets ./my_assets --trace
 |------|------|
 | `warp` 自制积木 | 保留 definition/call 的 mutation，Python 侧生成 `@_as_procedure(warp=True)`，循环内不逐帧等待 |
 | `proccode` / `argumentids` / `argumentdefaults` | 原样保留并写回，参数名不再被重新生成 |
-| `%s` / `%n` / `%b` 参数 | 按 proccode 解析类型；Python 缺省值为 `0`，布尔为 `False`；布尔参数使用 `argument_reporter_boolean` |
+| `%s` / `%n` / `%b` 参数 | 按 proccode 解析类型；Python 缺省值取 `argumentdefaults`（空字符串 / `False`）；布尔参数使用 `argument_reporter_boolean` |
 | 自定义 reporter | `procedures_return` → `return`，`procedures_call` 可作为表达式参与运算 |
 | 扩展积木 | 任意 `extensions` 中的扩展块转为 `self.extension(namespace, opcode, inputs, fields)`；未注册的扩展返回 `0` 而不是报错 |
 | `pen` 扩展 | 落笔/抬笔/清空/图章/颜色/颜色参数/粗细/色相/明度 |

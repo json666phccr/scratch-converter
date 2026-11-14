@@ -106,10 +106,6 @@ class PythonParser:
             if stmt.type == BlockType.PROCEDURE_DEFINE:
                 definitions[stmt.extra.get('name')] = stmt.extra
 
-        def defaults_for(meta):
-            types = meta.get('arg_types') or []
-            return [False if item == 'b' else 0 for item in types]
-
         def apply(node, args):
             meta = definitions.get(node.extra.get('name'))
             if meta is None:
@@ -117,8 +113,10 @@ class PythonParser:
             types = meta.get('arg_types') or []
             while len(args) < len(types):
                 index = len(args)
+                # 与原版 Scratch 一致：没填的参数取参数默认值（空字符串），
+                # 而不是数字 0；空字符串参与数值运算时才按 0 处理。
                 args.append(make_boolean(False) if types[index] == 'b'
-                            else make_number(0))
+                            else make_string(''))
             for key in ('proccode', 'argumentids', 'argumentdefaults',
                         'arg_types', 'warp'):
                 if key in meta and key not in node.extra:

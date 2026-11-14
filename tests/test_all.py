@@ -670,7 +670,8 @@ def test_procedure_roundtrip():
     scratch_json["targets"][0]["variables"] = {"v1": ["n", 0]}
 
     code = generate_python(parse_scratch_project(scratch_json))
-    assert "def add(self, arg_x=0):" in code, "应生成带默认参数的函数"
+    assert "def add(self, arg_x=''):" in code, \
+        "应生成带默认参数的函数（空字符串）"
     assert "self.add(7)" in code, "调用应带参数7"
     assert "self.n = _sc_add(self.n, 1)" in code, "函数体第一条语句"
     assert "self.say('hi')" in code, "函数体第二条语句不能丢失"
@@ -974,6 +975,9 @@ def test_scratch_runtime_semantics():
     assert round(mathop("sin", 90), 6) == 1
     assert mathop("tan", 90) == float("inf")
     assert letter(99, "abc") == ""
+    assert letter(0.5, "abc") == "", "小于1的小数下标按越界处理"
+    assert letter(1.9, "abc") == "a", "小数下标按 charAt 截断"
+    assert letter(2.5, "abc") == "b"
     # 列表语义
     items = ["a", "b"]
     assert item_of(items, "last") == "b"
@@ -990,8 +994,8 @@ def test_scratch_runtime_semantics():
     return True
 
 
-def test_procedure_missing_args_default_zero():
-    """自制积木调用没传参数时补0"""
+def test_procedure_missing_args_default_empty():
+    """自制积木调用没传参数时取空字符串（与原版Scratch一致）"""
     print("[测试20] 自制积木缺省参数")
 
     code = '''class X(ScratchSprite):
@@ -1012,10 +1016,52 @@ def test_procedure_missing_args_default_zero():
     arg_ids = json.loads(call["mutation"]["argumentids"])
     assert len(arg_ids) == 2, "调用参数数量应与定义一致"
     assert call["inputs"][arg_ids[0]][1] == [4, "1"]
-    assert call["inputs"][arg_ids[1]][1] == [4, "0"], "缺少的参数应补0"
+    assert call["inputs"][arg_ids[1]][1] == [10, ""], "缺少的参数应为空字符串"
 
     defaults = json.loads(defn["mutation"]["argumentdefaults"])
-    assert defaults == ["0", "0"]
+    assert defaults == ["", ""], "参数默认值应为空字符串"
+
+    generated = generate_python(parse_scratch_project(data))
+    assert "def add(self, arg_a='', arg_b='')" in generated, \
+        "生成的Python参数默认值应为空字符串"
+
+    # 运行时：没填的参数当成文本使用时必须为空，而不是 "0"
+    runtime_project = make_project({
+        "b1": block("event_whenflagclicked", "b2", None, top_level=True),
+        "b2": block("procedures_call", None, "b1",
+                    {"argid1": [1, [10, "first"]]},
+                    mutation={"proccode": "echo %s %s",
+                              "argumentids": '["argid1", "argid2"]',
+                              "warp": "false"}),
+        "p1": block("procedures_definition", "p2", None,
+                    {"custom_block": [1, "proto"]}, top_level=True),
+        "proto": {
+            "opcode": "procedures_prototype", "next": None, "parent": "p1",
+            "inputs": {}, "fields": {}, "shadow": True, "topLevel": False,
+            "mutation": {"proccode": "echo %s %s",
+                         "argumentids": '["argid1", "argid2"]',
+                         "argumentnames": '["a", "b"]',
+                         "argumentdefaults": '["", ""]', "warp": "false"},
+        },
+        "p2": block("looks_say", None, "p1", {"MESSAGE": [3, "arg_b", [10, ""]]}),
+        "arg_b": block("argument_reporter_string_number", None, "p2", {},
+                       {"VALUE": ["b", None]}),
+    }, name="DefaultArg")
+
+    import time
+    runtime_code = generate_python(parse_scratch_project(runtime_project))
+    namespace = {}
+    exec(compile(runtime_code, "<generated>", "exec"), namespace)
+    runtime = namespace["ScratchRuntime"](headless=True, audio=False)
+    sprite_obj = namespace["DefaultArg"]()
+    runtime.add_sprite(sprite_obj)
+    try:
+        runtime.start(max_frames=2)
+        time.sleep(0.1)
+        assert sprite_obj._say_text == "", \
+            f"缺省参数用于说话时应为空: {sprite_obj._say_text!r}"
+    finally:
+        runtime.shutdown()
 
     print("  [PASS] 自制积木缺省参数通过")
     return True
@@ -2420,7 +2466,7 @@ def main():
         test_clone_hat_block,
         test_orphan_blocks_ignored,
         test_scratch_runtime_semantics,
-        test_procedure_missing_args_default_zero,
+        test_procedure_missing_args_default_empty,
         test_empty_string_argument_preserved,
         test_pygame_runtime_runs_generated_script,
         test_generated_cli_mixed_arguments,

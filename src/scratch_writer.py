@@ -806,8 +806,8 @@ class ScratchWriter:
             if len(saved_defaults) == len(arg_names):
                 arg_defaults = saved_defaults
             else:
-                arg_defaults = [False if item == 'b' else '0' if item == 's' else 0
-                                for item in arg_types]
+                # 原版 Scratch 新建自制积木时参数默认值是空字符串（布尔为 false）
+                arg_defaults = [False if item == 'b' else '' for item in arg_types]
             warp = 'true' if stmt.extra.get('warp') else 'false'
 
             # 生成procedures_prototype以及参数reporter（Scratch加载项目时必需）

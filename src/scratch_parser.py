@@ -770,13 +770,9 @@ class ScratchParser:
 
             call_args = []
             for arg_id in argumentids:
-                if arg_id in raw.inputs:
-                    # 显式空字符串保持为空字符串：Scratch里 "" + 5 == 5，
-                    # 但 "" 参与连接/字符串运算时仍然是空字符串
-                    call_args.append(self.parse_input_by_id(raw, arg_id, ''))
-                else:
-                    # 调用时完全没有传入参数时补0
-                    call_args.append(make_number(0))
+                # 空输入/缺失输入都按空字符串处理：Scratch 调用时会用参数默认值
+                # （通常是 ""），"" + 5 == 5，但参与连接时仍是空字符串
+                call_args.append(self.parse_input_by_id(raw, arg_id, ''))
             stmt.extra['args'] = call_args
 
         elif block_type == BlockType.PROCEDURE_RETURN:
