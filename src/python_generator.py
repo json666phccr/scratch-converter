@@ -968,8 +968,8 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
             os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
         pygame.display.init()
         pygame.font.init()
-        self.screen = pygame.display.set_mode((self.stage_width, self.stage_height))
-        pygame.display.set_caption("Scratch 3.0 Runtime (ESC 退出)")
+        self._create_display()
+        pygame.display.set_caption("Scratch 3.0 Runtime (ESC 退出，可自由拉伸窗口)")
         self.pen_layer = pygame.Surface((self.stage_width, self.stage_height),
                                         pygame.SRCALPHA)
         self.clock = pygame.time.Clock()
@@ -1044,16 +1044,80 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
     def set_framerate(self, fps):
         self.fps = max(1, min(250, int(fps))) if fps else 0
 
+    def _create_display(self):
+        """创建可自由拉伸的窗口，舞台按宽高比自动缩放到窗口最大可用区域。
+
+        优先使用 pygame.SCALED：由 SDL 在渲染层缩放（类似 Switch 放大到最大），
+        有硬件加速、自动保留宽高比并加黑边，鼠标事件也由 pygame 换算成逻辑坐标。
+        平台不支持 SCALED 时退化为软件缩放。
+        """
+        width, height = self.stage_width, self.stage_height
+        self._scaled_view = False
+        self._manual_view = False
+        self.view_scale = 1.0
+        self.view_offset = (0, 0)
+        self._view_size = None
+        self._view_scaled = None
+        if self.headless:
+            self.screen = pygame.display.set_mode((width, height))
+            self.stage_surface = self.screen
+            return
+        try:
+            self.screen = pygame.display.set_mode(
+                (width, height), pygame.RESIZABLE | pygame.SCALED)
+            self.stage_surface = self.screen
+            self._scaled_view = True
+            return
+        except (pygame.error, AttributeError):
+            pass
+        try:
+            self.screen = pygame.display.set_mode(
+                (width, height), pygame.RESIZABLE)
+        except pygame.error:
+            self.screen = pygame.display.set_mode((width, height))
+        self.stage_surface = pygame.Surface((width, height))
+        self._manual_view = True
+
+    def _window_to_stage(self, pos):
+        """窗口坐标 -> 舞台逻辑坐标（SCALED 模式下pygame已换算，无需处理）"""
+        if not self._manual_view:
+            return pos
+        scale = self.view_scale or 1.0
+        offset_x, offset_y = self.view_offset
+        return ((pos[0] - offset_x) / scale, (pos[1] - offset_y) / scale)
+
+    def _present(self):
+        """把逻辑舞台呈现到窗口；手动缩放模式下按宽高比居中放大"""
+        if self._manual_view:
+            window_width, window_height = self.screen.get_size()
+            if window_width <= 0 or window_height <= 0:
+                return
+            scale = min(window_width / float(self.stage_width),
+                        window_height / float(self.stage_height))
+            draw_width = max(1, int(self.stage_width * scale))
+            draw_height = max(1, int(self.stage_height * scale))
+            self.view_scale = draw_width / float(self.stage_width)
+            self.view_offset = ((window_width - draw_width) // 2,
+                                (window_height - draw_height) // 2)
+            if self._view_scaled is None or self._view_size != (draw_width, draw_height):
+                self._view_size = (draw_width, draw_height)
+                self._view_scaled = pygame.Surface((draw_width, draw_height)).convert()
+            pygame.transform.scale(self.stage_surface, (draw_width, draw_height),
+                                   self._view_scaled)
+            self.screen.fill((0, 0, 0))
+            self.screen.blit(self._view_scaled, self.view_offset)
+        pygame.display.flip()
+
     def resize_stage(self, width, height):
         width = max(1, int(width))
         height = max(1, int(height))
         if width == self.stage_width and height == self.stage_height:
             return
         self.stage_width, self.stage_height = width, height
-        self.screen = pygame.display.set_mode((width, height))
         self.pen_layer = pygame.Surface((width, height), pygame.SRCALPHA)
         if self.background is not None:
             self.background = pygame.transform.smoothscale(self.background, (width, height))
+        self._create_display()
 
     def pen_clear(self):
         self.pen_layer.fill((0, 0, 0, 0))
@@ -1201,11 +1265,11 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
             return
         rect = pygame.Rect(20, self.stage_height - 60,
                            max(80, self.stage_width - 40), 40)
-        pygame.draw.rect(self.screen, (255, 255, 255), rect, border_radius=6)
-        pygame.draw.rect(self.screen, (90, 90, 90), rect, 1, border_radius=6)
+        pygame.draw.rect(self.stage_surface, (255, 255, 255), rect, border_radius=6)
+        pygame.draw.rect(self.stage_surface, (90, 90, 90), rect, 1, border_radius=6)
         text = self.ask_question + ' ' + self.ask_buffer + '_'
         surface = self.font.render(text, True, (30, 30, 30))
-        self.screen.blit(surface, (rect.x + 8, rect.y + 11))
+        self.stage_surface.blit(surface, (rect.x + 8, rect.y + 11))
 
     def stop_all_scripts(self):
         for context in list(self.scripts):
@@ -1255,8 +1319,9 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
         return name
 
     def _screen_to_scratch(self, pos):
-        return (pos[0] - self.stage_width // 2,
-                self.stage_height // 2 - pos[1])
+        x, y = self._window_to_stage(pos)
+        return (int(round(x)) - self.stage_width // 2,
+                self.stage_height // 2 - int(round(y)))
 
     def music_seconds(self, beats):
         tempo = _sc_num(self.music_tempo) or 60.0
@@ -1343,7 +1408,8 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
     def _handle_click(self, pos):
         if self.trace:
             print("[trace] click", pos)
-        if pos[0] < 28 and pos[1] < 28:
+        stage_pos = self._window_to_stage(pos)
+        if stage_pos[0] < 28 and stage_pos[1] < 28:
             self.green_flag()
             return
         x, y = self._screen_to_scratch(pos)
@@ -1406,7 +1472,7 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
                     self.dragging._apply_fencing()
         self._update_state()
         self._draw()
-        pygame.display.flip()
+        self._present()
         with self.frame_condition:
             self.frame += 1
             self.frame_condition.notify_all()
@@ -1443,15 +1509,15 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
 
     def _draw(self):
         if self.background is not None:
-            self.screen.blit(self.background, (0, 0))
+            self.stage_surface.blit(self.background, (0, 0))
         else:
-            self.screen.fill((247, 247, 247))
-        self.screen.blit(self.pen_layer, (0, 0))
-        pygame.draw.polygon(self.screen, (60, 170, 90),
+            self.stage_surface.fill((247, 247, 247))
+        self.stage_surface.blit(self.pen_layer, (0, 0))
+        pygame.draw.polygon(self.stage_surface, (60, 170, 90),
                             [(8, 22), (8, 6), (22, 6), (22, 12), (8, 12)])
         for sprite in list(self.sprites):
             if sprite.visible and not getattr(sprite, 'is_stage', False):
-                sprite._draw(self.screen, self.font)
+                sprite._draw(self.stage_surface, self.font)
         self._draw_monitors()
         self._draw_ask()
 
@@ -1494,24 +1560,24 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
             else:
                 value = GLOBALS.get(monitor["attr"])
             if monitor["kind"] == "list":
-                pygame.draw.rect(self.screen, (255, 255, 255), rect, border_radius=4)
-                pygame.draw.rect(self.screen, (130, 130, 130), rect, 1, border_radius=4)
+                pygame.draw.rect(self.stage_surface, (255, 255, 255), rect, border_radius=4)
+                pygame.draw.rect(self.stage_surface, (130, 130, 130), rect, 1, border_radius=4)
                 title = self.font.render(label, True, (40, 40, 40))
-                self.screen.blit(title, (rect.x + 5, rect.y + 3))
+                self.stage_surface.blit(title, (rect.x + 5, rect.y + 3))
                 if isinstance(value, list):
                     line_y = rect.y + 21
                     for item in value:
                         if line_y + 14 > rect.bottom - 2:
                             break
                         text = self.font.render(_sc_str(item), True, (60, 60, 60))
-                        self.screen.blit(text, (rect.x + 8, line_y))
+                        self.stage_surface.blit(text, (rect.x + 8, line_y))
                         line_y += 15
             else:
                 text = f"{label} {_sc_str(value)}"
-                pygame.draw.rect(self.screen, (255, 255, 255), rect, border_radius=3)
-                pygame.draw.rect(self.screen, (130, 130, 130), rect, 1, border_radius=3)
+                pygame.draw.rect(self.stage_surface, (255, 255, 255), rect, border_radius=3)
+                pygame.draw.rect(self.stage_surface, (130, 130, 130), rect, 1, border_radius=3)
                 surface = self.font.render(text, True, (40, 40, 40))
-                self.screen.blit(surface, (rect.x + 5, rect.y + 3))
+                self.stage_surface.blit(surface, (rect.x + 5, rect.y + 3))
 
     @property
     def backdrop_name(self):

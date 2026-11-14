@@ -28,11 +28,16 @@ def _sc_is_white(value):
 
 
 def _sc_str(value):
-    if isinstance(value, bool):
+    cls = value.__class__
+    if cls is str:
+        return value
+    if cls is int:
+        return str(value)
+    if cls is bool:
         return 'true' if value else 'false'
     if value is None:
         return 'null'
-    if isinstance(value, float):
+    if cls is float:
         if math.isnan(value):
             return 'NaN'
         if math.isinf(value):
@@ -57,12 +62,13 @@ def _sc_str(value):
 
 
 def _sc_num(value):
-    if isinstance(value, bool):
-        return 1 if value else 0
-    if isinstance(value, (int, float)):
-        if isinstance(value, float) and math.isnan(value):
-            return 0
+    cls = value.__class__
+    if cls is int:
         return value
+    if cls is float:
+        return 0 if value != value else value
+    if cls is bool:
+        return 1 if value else 0
     text = _sc_str(value).strip()
     if text == '':
         return 0
@@ -101,14 +107,15 @@ def _sc_bool(value):
 
 
 def _sc_number_or_nan(value):
+    cls = value.__class__
+    if cls is int:
+        return float(value)
+    if cls is float:
+        return value
     if _sc_is_white(value):
         return math.nan
-    if isinstance(value, bool):
+    if cls is bool:
         return 1.0 if value else 0.0
-    if isinstance(value, (int, float)):
-        if isinstance(value, float) and math.isnan(value):
-            return math.nan
-        return float(value)
     text = _sc_str(value).strip()
     if text == '':
         return math.nan
@@ -325,7 +332,18 @@ def _sc_wait_time(value):
     return max(0, value)
 
 
+def _sc_parse_int10(value):
+    """复刻 JS parseInt(value, 10)：取开头的整数部分，失败返回 None"""
+    text = _sc_str(value).lstrip()
+    match = re.match(r'[+-]?\d+', text)
+    if not match:
+        return None
+    return int(match.group(0))
+
+
 def _sc_list_index(index, length, accept_all):
+    if index.__class__ is int:
+        return index if 1 <= index <= length else None
     if not isinstance(index, (int, float)) or isinstance(index, bool):
         text = _sc_str(index)
         if text == 'all':
@@ -341,10 +359,15 @@ def _sc_list_index(index, length, accept_all):
 
 
 def _sc_item_of(items, index):
-    position = _sc_list_index(index, len(items), False)
-    if position is None:
+    # Scratch允许越界读取，越界时返回空字符串。
+    # 同时列表可能被其他脚本并发修改，这里也要避免下标失效。
+    try:
+        position = _sc_list_index(index, len(items), False)
+        if position is None:
+            return ''
+        return items[position - 1]
+    except (IndexError, TypeError, ValueError):
         return ''
-    return items[position - 1]
 
 
 def _sc_list_delete(items, index):
@@ -354,7 +377,10 @@ def _sc_list_delete(items, index):
     if position == 'ALL':
         items.clear()
         return
-    del items[position - 1]
+    try:
+        del items[position - 1]
+    except IndexError:
+        pass
 
 
 def _sc_list_insert(items, index, item):
@@ -370,7 +396,10 @@ def _sc_list_replace(items, index, item):
     position = _sc_list_index(index, len(items), False)
     if position is None:
         return
-    items[position - 1] = item
+    try:
+        items[position - 1] = item
+    except IndexError:
+        pass
 
 
 def _sc_list_contains(items, item):
@@ -878,17 +907,17 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
             _ext_input(inputs, fields, 'INSTRUMENT', 'instrument', default=1)))
         return 0
     if 'restforbeats' in key:
-        runtime.music_wait(_sc_num(_ext_input(inputs, fields, 'BEATS', 'beats', default=0.25)))
+        runtime.music_wait(sprite, _sc_num(_ext_input(inputs, fields, 'BEATS', 'beats', default=0.25)))
         return 0
     if 'playdrum' in key:
         drum = int(_sc_num(_ext_input(inputs, fields, 'DRUM', 'drum', default=1)))
         beats = _sc_num(_ext_input(inputs, fields, 'BEATS', 'beats', default=0.25))
-        runtime.music_play_drum(drum, beats)
+        runtime.music_play_drum(sprite, drum, beats)
         return 0
     if 'playnote' in key:
         note = _sc_num(_ext_input(inputs, fields, 'NOTE', 'note', default=60))
         beats = _sc_num(_ext_input(inputs, fields, 'BEATS', 'beats', default=0.5))
-        runtime.music_play_note(note, beats)
+        runtime.music_play_note(sprite, note, beats)
         return 0
     return 0
 
@@ -944,18 +973,21 @@ class ScratchRuntime:
             os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
         pygame.display.init()
         pygame.font.init()
-        self.screen = pygame.display.set_mode((self.stage_width, self.stage_height))
-        pygame.display.set_caption("Scratch 3.0 Runtime (ESC 退出)")
+        self._create_display()
+        pygame.display.set_caption("Scratch 3.0 Runtime (ESC 退出，可自由拉伸窗口)")
         self.pen_layer = pygame.Surface((self.stage_width, self.stage_height),
                                         pygame.SRCALPHA)
         self.clock = pygame.time.Clock()
         self.sprites = []
         self.scripts = []
+        self.turn_lock = threading.Lock()
         self.running = True
         self.frame = 0
         self.frame_condition = threading.Condition()
         self.start_time = time.time()
         self.timer_offset = 0.0
+        # “2000年以来的天数”按本地时间计算，与Scratch一致
+        self.epoch_2000 = time.mktime((2000, 1, 1, 0, 0, 0, 0, 0, -1))
         self.keys = set()
         self.mouse_down = False
         self.mouse_x = 0
@@ -968,6 +1000,7 @@ class ScratchRuntime:
         self.ask_question = ''
         self.ask_buffer = ''
         self.ask_answer = ''
+        self.answer = ''
         self.music_tempo = 60.0
         self.music_instrument = 1
         self.music_cache = {}
@@ -1016,16 +1049,80 @@ class ScratchRuntime:
     def set_framerate(self, fps):
         self.fps = max(1, min(250, int(fps))) if fps else 0
 
+    def _create_display(self):
+        """创建可自由拉伸的窗口，舞台按宽高比自动缩放到窗口最大可用区域。
+
+        优先使用 pygame.SCALED：由 SDL 在渲染层缩放（类似 Switch 放大到最大），
+        有硬件加速、自动保留宽高比并加黑边，鼠标事件也由 pygame 换算成逻辑坐标。
+        平台不支持 SCALED 时退化为软件缩放。
+        """
+        width, height = self.stage_width, self.stage_height
+        self._scaled_view = False
+        self._manual_view = False
+        self.view_scale = 1.0
+        self.view_offset = (0, 0)
+        self._view_size = None
+        self._view_scaled = None
+        if self.headless:
+            self.screen = pygame.display.set_mode((width, height))
+            self.stage_surface = self.screen
+            return
+        try:
+            self.screen = pygame.display.set_mode(
+                (width, height), pygame.RESIZABLE | pygame.SCALED)
+            self.stage_surface = self.screen
+            self._scaled_view = True
+            return
+        except (pygame.error, AttributeError):
+            pass
+        try:
+            self.screen = pygame.display.set_mode(
+                (width, height), pygame.RESIZABLE)
+        except pygame.error:
+            self.screen = pygame.display.set_mode((width, height))
+        self.stage_surface = pygame.Surface((width, height))
+        self._manual_view = True
+
+    def _window_to_stage(self, pos):
+        """窗口坐标 -> 舞台逻辑坐标（SCALED 模式下pygame已换算，无需处理）"""
+        if not self._manual_view:
+            return pos
+        scale = self.view_scale or 1.0
+        offset_x, offset_y = self.view_offset
+        return ((pos[0] - offset_x) / scale, (pos[1] - offset_y) / scale)
+
+    def _present(self):
+        """把逻辑舞台呈现到窗口；手动缩放模式下按宽高比居中放大"""
+        if self._manual_view:
+            window_width, window_height = self.screen.get_size()
+            if window_width <= 0 or window_height <= 0:
+                return
+            scale = min(window_width / float(self.stage_width),
+                        window_height / float(self.stage_height))
+            draw_width = max(1, int(self.stage_width * scale))
+            draw_height = max(1, int(self.stage_height * scale))
+            self.view_scale = draw_width / float(self.stage_width)
+            self.view_offset = ((window_width - draw_width) // 2,
+                                (window_height - draw_height) // 2)
+            if self._view_scaled is None or self._view_size != (draw_width, draw_height):
+                self._view_size = (draw_width, draw_height)
+                self._view_scaled = pygame.Surface((draw_width, draw_height)).convert()
+            pygame.transform.scale(self.stage_surface, (draw_width, draw_height),
+                                   self._view_scaled)
+            self.screen.fill((0, 0, 0))
+            self.screen.blit(self._view_scaled, self.view_offset)
+        pygame.display.flip()
+
     def resize_stage(self, width, height):
         width = max(1, int(width))
         height = max(1, int(height))
         if width == self.stage_width and height == self.stage_height:
             return
         self.stage_width, self.stage_height = width, height
-        self.screen = pygame.display.set_mode((width, height))
         self.pen_layer = pygame.Surface((width, height), pygame.SRCALPHA)
         if self.background is not None:
             self.background = pygame.transform.smoothscale(self.background, (width, height))
+        self._create_display()
 
     def pen_clear(self):
         self.pen_layer.fill((0, 0, 0, 0))
@@ -1053,7 +1150,10 @@ class ScratchRuntime:
             angle = 90 - _sc_num(sprite.direction)
             if sprite.rotation_style in ('left-right', "don't rotate"):
                 angle = 0
-            transformed = pygame.transform.rotozoom(image, angle, scale)
+            if angle == 0 and scale == 1.0:
+                transformed = image
+            else:
+                transformed = pygame.transform.rotozoom(image, angle, scale)
             if sprite.rotation_style == 'left-right' \
                     and math.cos(math.radians(_sc_num(sprite.direction))) < 0:
                 transformed = pygame.transform.flip(transformed, True, False)
@@ -1071,10 +1171,16 @@ class ScratchRuntime:
             self.sprites.remove(sprite)
 
     def find_sprite(self, name):
+        """按名字找角色，优先返回本体（原版Scratch的sensing/运动积木都基于本体）"""
+        fallback = None
         for sprite in self.sprites:
-            if sprite.name == name:
+            if sprite.name != name:
+                continue
+            if not getattr(sprite, '_is_clone', False):
                 return sprite
-        return None
+            if fallback is None:
+                fallback = sprite
+        return fallback
 
     def elapsed(self):
         return max(0.0, time.time() - self.start_time - self.timer_offset)
@@ -1086,6 +1192,7 @@ class ScratchRuntime:
         self.running = True
         self.start_time = time.time()
         self.timer_offset = 0.0
+        self.answer = ''
         if self.trace:
             print("[trace] green flag")
         # 绿旗会删除所有克隆体，并重启动原有脚本
@@ -1093,6 +1200,10 @@ class ScratchRuntime:
             if getattr(sprite, "_is_clone", False):
                 self.sprites.remove(sprite)
         self.stop_all_scripts()
+        self.stop_sounds()
+        for sprite in list(self.sprites):
+            # 绿旗会清空音效，但保留图形特效与造型
+            sprite._sound_effects = {'pitch': 0.0, 'pan': 0.0}
         time.sleep(0.02)
         for sprite in list(self.sprites):
             sprite._global_running = True
@@ -1109,6 +1220,8 @@ class ScratchRuntime:
             # threading.local 必须在线程内部赋值，否则主线程的context会串到脚本线程
             if sprite is not None:
                 sprite._local.context = context
+                sprite._local.turn_owned = False
+                sprite._turn_acquire()
             name = getattr(sprite, "name", getattr(func, "__name__", "script"))
             if self.trace:
                 print("[trace] start", name, getattr(func, "__name__", ""))
@@ -1120,6 +1233,8 @@ class ScratchRuntime:
                 import traceback
                 traceback.print_exc()
             finally:
+                if sprite is not None:
+                    sprite._turn_release()
                 if context in self.scripts:
                     self.scripts.remove(context)
                 if sprite is not None and getattr(sprite._local, "context", None) is context:
@@ -1155,11 +1270,11 @@ class ScratchRuntime:
             return
         rect = pygame.Rect(20, self.stage_height - 60,
                            max(80, self.stage_width - 40), 40)
-        pygame.draw.rect(self.screen, (255, 255, 255), rect, border_radius=6)
-        pygame.draw.rect(self.screen, (90, 90, 90), rect, 1, border_radius=6)
+        pygame.draw.rect(self.stage_surface, (255, 255, 255), rect, border_radius=6)
+        pygame.draw.rect(self.stage_surface, (90, 90, 90), rect, 1, border_radius=6)
         text = self.ask_question + ' ' + self.ask_buffer + '_'
         surface = self.font.render(text, True, (30, 30, 30))
-        self.screen.blit(surface, (rect.x + 8, rect.y + 11))
+        self.stage_surface.blit(surface, (rect.x + 8, rect.y + 11))
 
     def stop_all_scripts(self):
         for context in list(self.scripts):
@@ -1209,8 +1324,9 @@ class ScratchRuntime:
         return name
 
     def _screen_to_scratch(self, pos):
-        return (pos[0] - self.stage_width // 2,
-                self.stage_height // 2 - pos[1])
+        x, y = self._window_to_stage(pos)
+        return (int(round(x)) - self.stage_width // 2,
+                self.stage_height // 2 - int(round(y)))
 
     def music_seconds(self, beats):
         tempo = _sc_num(self.music_tempo) or 60.0
@@ -1246,7 +1362,7 @@ class ScratchRuntime:
         self.music_cache[key] = sound
         return sound
 
-    def music_play_note(self, note, beats):
+    def music_play_note(self, sprite, note, beats):
         seconds = self.music_seconds(beats)
         frequency = 440.0 * (2 ** ((_sc_num(note) - 69) / 12.0))
         if self.mixer_ready:
@@ -1254,9 +1370,9 @@ class ScratchRuntime:
             if sound is not None:
                 sound.play()
         if seconds > 0:
-            time.sleep(seconds)
+            self._coop_sleep(sprite, seconds)
 
-    def music_play_drum(self, drum, beats):
+    def music_play_drum(self, sprite, drum, beats):
         seconds = self.music_seconds(beats)
         if self.mixer_ready:
             frequencies = {1: 261.63, 2: 196.0, 3: 130.81, 4: 523.25}
@@ -1265,12 +1381,22 @@ class ScratchRuntime:
             if sound is not None:
                 sound.play()
         if seconds > 0:
-            time.sleep(seconds)
+            self._coop_sleep(sprite, seconds)
 
-    def music_wait(self, beats):
+    def music_wait(self, sprite, beats):
         seconds = self.music_seconds(beats)
         if seconds > 0:
+            self._coop_sleep(sprite, seconds)
+
+    def _coop_sleep(self, sprite, seconds):
+        if sprite is None:
             time.sleep(seconds)
+            return
+        sprite._turn_release()
+        try:
+            time.sleep(seconds)
+        finally:
+            sprite._turn_acquire()
 
     def _start_drag(self, pos):
         """按下鼠标时，找到可拖动的角色开始拖动"""
@@ -1287,7 +1413,8 @@ class ScratchRuntime:
     def _handle_click(self, pos):
         if self.trace:
             print("[trace] click", pos)
-        if pos[0] < 28 and pos[1] < 28:
+        stage_pos = self._window_to_stage(pos)
+        if stage_pos[0] < 28 and stage_pos[1] < 28:
             self.green_flag()
             return
         x, y = self._screen_to_scratch(pos)
@@ -1350,7 +1477,7 @@ class ScratchRuntime:
                     self.dragging._apply_fencing()
         self._update_state()
         self._draw()
-        pygame.display.flip()
+        self._present()
         with self.frame_condition:
             self.frame += 1
             self.frame_condition.notify_all()
@@ -1359,13 +1486,14 @@ class ScratchRuntime:
 
     def _update_state(self):
         elapsed = self.elapsed()
-        days = (time.time() - 946684800.0) / 86400.0
+        days = (time.time() - self.epoch_2000) / 86400.0
         for sprite in list(self.sprites):
             sprite.timer = elapsed
             sprite.days_since_2000 = days
             sprite.mouse_x = self.mouse_x
             sprite.mouse_y = self.mouse_y
             sprite.mouse_down = self.mouse_down
+            sprite.answer = self.answer
             sprite._update_say()
             if self.interpolation:
                 target_x = _sc_num(sprite.x)
@@ -1386,15 +1514,15 @@ class ScratchRuntime:
 
     def _draw(self):
         if self.background is not None:
-            self.screen.blit(self.background, (0, 0))
+            self.stage_surface.blit(self.background, (0, 0))
         else:
-            self.screen.fill((247, 247, 247))
-        self.screen.blit(self.pen_layer, (0, 0))
-        pygame.draw.polygon(self.screen, (60, 170, 90),
+            self.stage_surface.fill((247, 247, 247))
+        self.stage_surface.blit(self.pen_layer, (0, 0))
+        pygame.draw.polygon(self.stage_surface, (60, 170, 90),
                             [(8, 22), (8, 6), (22, 6), (22, 12), (8, 12)])
         for sprite in list(self.sprites):
             if sprite.visible and not getattr(sprite, 'is_stage', False):
-                sprite._draw(self.screen, self.font)
+                sprite._draw(self.stage_surface, self.font)
         self._draw_monitors()
         self._draw_ask()
 
@@ -1437,24 +1565,24 @@ class ScratchRuntime:
             else:
                 value = GLOBALS.get(monitor["attr"])
             if monitor["kind"] == "list":
-                pygame.draw.rect(self.screen, (255, 255, 255), rect, border_radius=4)
-                pygame.draw.rect(self.screen, (130, 130, 130), rect, 1, border_radius=4)
+                pygame.draw.rect(self.stage_surface, (255, 255, 255), rect, border_radius=4)
+                pygame.draw.rect(self.stage_surface, (130, 130, 130), rect, 1, border_radius=4)
                 title = self.font.render(label, True, (40, 40, 40))
-                self.screen.blit(title, (rect.x + 5, rect.y + 3))
+                self.stage_surface.blit(title, (rect.x + 5, rect.y + 3))
                 if isinstance(value, list):
                     line_y = rect.y + 21
                     for item in value:
                         if line_y + 14 > rect.bottom - 2:
                             break
                         text = self.font.render(_sc_str(item), True, (60, 60, 60))
-                        self.screen.blit(text, (rect.x + 8, line_y))
+                        self.stage_surface.blit(text, (rect.x + 8, line_y))
                         line_y += 15
             else:
                 text = f"{label} {_sc_str(value)}"
-                pygame.draw.rect(self.screen, (255, 255, 255), rect, border_radius=3)
-                pygame.draw.rect(self.screen, (130, 130, 130), rect, 1, border_radius=3)
+                pygame.draw.rect(self.stage_surface, (255, 255, 255), rect, border_radius=3)
+                pygame.draw.rect(self.stage_surface, (130, 130, 130), rect, 1, border_radius=3)
                 surface = self.font.render(text, True, (40, 40, 40))
-                self.screen.blit(surface, (rect.x + 5, rect.y + 3))
+                self.stage_surface.blit(surface, (rect.x + 5, rect.y + 3))
 
     @property
     def backdrop_name(self):
@@ -1468,24 +1596,49 @@ class ScratchRuntime:
         return self.current_backdrop + 1
 
     def set_backdrop(self, name):
+        # 与 scratch-vm 的 _setBackdrop 保持一致：
+        # 数字→编号；字符串→名字/next/previous/random backdrop/数字字符串。
+        # 无法识别的名字不切换背景，也不触发“当背景换成”帽子。
         if not BACKDROPS:
-            return
-        value = _sc_str(name)
-        index = None
-        for position, item in enumerate(BACKDROPS):
-            if item[0] == value:
-                index = position
-                break
-        if index is None:
-            index = int(_sc_num(value)) - 1
-        self._apply_backdrop(index % len(BACKDROPS))
+            return []
+        count = len(BACKDROPS)
+        names = [item[0] for item in BACKDROPS]
+        if isinstance(name, (int, float)) and not isinstance(name, bool):
+            number = float(name)
+            if math.isnan(number) or math.isinf(number):
+                index = 0
+            else:
+                index = _sc_round(number) - 1
+        else:
+            value = _sc_str(name)
+            if value in names:
+                index = names.index(value)
+            elif value == 'next backdrop':
+                index = self.current_backdrop + 1
+            elif value == 'previous backdrop':
+                index = self.current_backdrop - 1
+            elif value == 'random backdrop':
+                if count <= 1:
+                    return []
+                index = random.randrange(count - 1)
+                if index >= self.current_backdrop:
+                    index += 1
+            elif _sc_is_white(value):
+                return []
+            else:
+                number = _sc_number_or_nan(value)
+                if math.isnan(number) or math.isinf(number):
+                    return []
+                index = _sc_round(number) - 1
+        return self._apply_backdrop(index)
 
     def next_backdrop(self):
         if BACKDROPS:
-            self._apply_backdrop((self.current_backdrop + 1) % len(BACKDROPS))
+            return self._apply_backdrop(self.current_backdrop + 1)
+        return []
 
     def _apply_backdrop(self, index):
-        self.current_backdrop = index % len(BACKDROPS)
+        self.current_backdrop = int(index) % len(BACKDROPS)
         filename = BACKDROPS[self.current_backdrop][1]
         image = self._load_image(filename) if filename else None
         self.background = None
@@ -1493,12 +1646,14 @@ class ScratchRuntime:
             self.background = pygame.transform.smoothscale(
                 image, (self.stage_width, self.stage_height))
         name = BACKDROPS[self.current_backdrop][0]
+        threads = []
         for sprite in list(self.sprites):
             sprite._running = True
             for func in list(sprite._handlers.get('backdrop:' + name, [])):
-                self.start_script(func)
+                threads.append(self.start_script(func))
             for func in list(sprite._handlers.get('backdrop:any', [])):
-                self.start_script(func)
+                threads.append(self.start_script(func))
+        return threads
 
     def go_to_layer(self, sprite, where):
         if sprite not in self.sprites:
@@ -1658,20 +1813,27 @@ class ScratchRuntime:
             x = self.stage_width // 2 + self.mouse_x
             y = self.stage_height // 2 - self.mouse_y
             return rect.collidepoint(x, y)
-        other = self.find_sprite(target)
-        if other is None or not other.visible:
-            return False
-        other_rect = self._sprite_rect(other)
-        if not rect.colliderect(other_rect):
-            return False
-        first = self._sprite_mask(sprite)
-        second = self._sprite_mask(other)
-        if first is None or second is None:
-            return True
-        offset = (other_rect.x - rect.x, other_rect.y - rect.y)
-        return first.overlap(second, offset) is not None
+        # “碰到角色”应检查该角色的所有可见克隆体（不包括自己）
+        first = None
+        for other in list(self.sprites):
+            if other is sprite or not other.visible or other.name != target:
+                continue
+            other_rect = self._sprite_rect(other)
+            if not rect.colliderect(other_rect):
+                continue
+            if first is None:
+                first = self._sprite_mask(sprite)
+            second = self._sprite_mask(other)
+            if first is None or second is None:
+                return True
+            offset = (other_rect.x - rect.x, other_rect.y - rect.y)
+            if first.overlap(second, offset) is not None:
+                return True
+        return False
 
     def distance_to(self, sprite, target):
+        if getattr(sprite, 'is_stage', False):
+            return 10000
         if target == "_mouse_":
             return math.hypot(_sc_num(sprite.x) - self.mouse_x,
                               _sc_num(sprite.y) - self.mouse_y)
@@ -1684,11 +1846,22 @@ class ScratchRuntime:
     def play_sound(self, sprite, name):
         if not self.mixer_ready:
             return 0
+        sounds = getattr(sprite, "sounds", [])
+        if not sounds:
+            return 0
+        # scratch-vm 的 _getSoundIndex：先按名字找，再按1起编号找
+        text = _sc_str(name)
         filename = None
-        for sound in getattr(sprite, "sounds", []):
-            if sound.get("name") == name:
+        for sound in sounds:
+            if sound.get("name") == text:
                 filename = sound.get("md5ext")
                 break
+        if not filename:
+            number = _sc_parse_int10(text)
+            if number is None:
+                return 0
+            index = int(number - 1) % len(sounds)
+            filename = sounds[index].get("md5ext")
         if not filename:
             return 0
         path = self._asset_path(filename)
@@ -1705,10 +1878,11 @@ class ScratchRuntime:
             return 0
         channel = sound.play()
         pan = _sc_num(getattr(sprite, '_sound_effects', {}).get('pan', 0))
-        if channel is not None and pan:
-            left = max(0.0, min(1.0, 1.0 - max(0.0, pan) / 100.0))
-            right = max(0.0, min(1.0, 1.0 + min(0.0, pan) / 100.0))
-            volume = max(0.0, min(1.0, _sc_num(getattr(sprite, 'volume', 100)) / 100.0))
+        volume = max(0.0, min(1.0,
+                                _sc_num(getattr(sprite, 'volume', 100)) / 100.0))
+        left = max(0.0, min(1.0, 1.0 - max(0.0, pan) / 100.0))
+        right = max(0.0, min(1.0, 1.0 + min(0.0, pan) / 100.0))
+        if channel is not None and (pan or volume != 1.0):
             channel.set_volume(left * volume, right * volume)
         return sound.get_length()
 
@@ -1996,6 +2170,9 @@ class ScratchRuntime:
 class ScratchSprite:
     """Scratch精灵基类"""
 
+    GLOBAL_NAMES = ()
+    GLOBAL_NAMES_SET = frozenset()
+
     def __init__(self):
         self.x = 0
         self.y = 0
@@ -2045,7 +2222,8 @@ class ScratchSprite:
         raise AttributeError(name)
 
     def __setattr__(self, name, value):
-        if name in getattr(type(self), 'GLOBAL_NAMES', ()):
+        # 用 frozenset 做 O(1) 判断，替代逐项扫描GLOBAL_NAMES元组
+        if name in type(self).GLOBAL_NAMES_SET:
             GLOBALS[name] = value
         else:
             object.__setattr__(self, name, value)
@@ -2167,7 +2345,7 @@ class ScratchSprite:
         self._say_kind = 'say'
         duration = _sc_wait_time(secs)
         self._say_until = time.time() + duration
-        time.sleep(duration)
+        self._sleep(duration)
         if self._say_text == text:
             self._say_text = ''
             self._say_until = None
@@ -2184,7 +2362,7 @@ class ScratchSprite:
         self._say_kind = 'think'
         duration = _sc_wait_time(secs)
         self._say_until = time.time() + duration
-        time.sleep(duration)
+        self._sleep(duration)
         if self._say_text == text:
             self._say_text = ''
             self._say_until = None
@@ -2196,21 +2374,37 @@ class ScratchSprite:
         self.visible = False
 
     def switch_costume(self, costume):
+        # 与 scratch-vm 的 _setCostume/setCostume 保持一致：
+        # - 数字类型一律当作1起的造型编号（四舍五入，越界循环）
+        # - 字符串先按名字匹配，再处理 next/previous costume，最后才尝试转数字
         names = [item.get('name', '') for item in self.costumes]
-        value = _sc_str(costume)
-        if value in names:
-            index = names.index(value)
-        else:
-            number = _sc_number_or_nan(value)
+        count = len(names)
+        if not count:
+            return
+        if isinstance(costume, (int, float)) and not isinstance(costume, bool):
+            number = float(costume)
             if math.isnan(number) or math.isinf(number):
-                return
-            index = int(number) - 1
-        if names:
-            index = index % len(names)
+                index = 0
+            else:
+                index = _sc_round(number) - 1
         else:
-            index = 0
+            value = _sc_str(costume)
+            if value in names:
+                index = names.index(value)
+            elif value == 'next costume':
+                index = int(_sc_num(self.costume_number))
+            elif value == 'previous costume':
+                index = int(_sc_num(self.costume_number)) - 2
+            elif _sc_is_white(value):
+                return
+            else:
+                number = _sc_number_or_nan(value)
+                if math.isnan(number) or math.isinf(number):
+                    return
+                index = _sc_round(number) - 1
+        index = int(index) % count
         self.costume_number = index + 1
-        self.costume_name = names[index] if names else value
+        self.costume_name = names[index]
 
     def next_costume(self):
         count = len(self.costumes)
@@ -2244,7 +2438,7 @@ class ScratchSprite:
         if self._runtime is not None:
             duration = self._runtime.play_sound(self, _sc_str(sound))
         if wait and duration:
-            time.sleep(duration)
+            self._sleep(duration)
 
     def stop_all_sounds(self):
         if self._runtime is not None:
@@ -2262,7 +2456,7 @@ class ScratchSprite:
 
     def wait(self, seconds):
         """等待指定秒数"""
-        time.sleep(_sc_wait_time(seconds))
+        self._sleep(seconds)
 
     def wait_until(self, condition_func):
         """等待直到条件为真"""
@@ -2311,8 +2505,12 @@ class ScratchSprite:
 
     def broadcast_and_wait(self, message):
         if self._runtime is not None:
-            self._runtime.broadcast_and_wait(
-                message, getattr(self._local, 'context', None))
+            self._turn_release()
+            try:
+                self._runtime.broadcast_and_wait(
+                    message, getattr(self._local, 'context', None))
+            finally:
+                self._turn_acquire()
 
     def touching(self, object):
         if self._runtime is None:
@@ -2337,7 +2535,12 @@ class ScratchSprite:
         if self._runtime is None:
             self.answer = input(question)
             return
-        self.answer = self._runtime.ask(question)
+        self._turn_release()
+        try:
+            self.answer = self._runtime.ask(question)
+            self._runtime.answer = self.answer
+        finally:
+            self._turn_acquire()
 
     def reset_timer(self):
         if self._runtime is not None:
@@ -2375,7 +2578,7 @@ class ScratchSprite:
         start_x, start_y = self.x, self.y
         steps = 20
         for i in range(1, steps + 1):
-            time.sleep(secs / steps)
+            self._sleep(secs / steps)
             self.x = start_x + (x - start_x) * i / steps
             self.y = start_y + (y - start_y) * i / steps
             self._apply_fencing()
@@ -2443,6 +2646,30 @@ class ScratchSprite:
         if func not in handlers:
             handlers.append(func)
 
+    def _turn_acquire(self):
+        """获取脚本执行权（同一时刻只让一个脚本执行，模拟Scratch单线程调度）"""
+        runtime = self._runtime
+        if runtime is not None and not getattr(self._local, 'turn_owned', False):
+            runtime.turn_lock.acquire()
+            self._local.turn_owned = True
+
+    def _turn_release(self):
+        runtime = self._runtime
+        if runtime is not None and getattr(self._local, 'turn_owned', False):
+            self._local.turn_owned = False
+            runtime.turn_lock.release()
+
+    def _sleep(self, seconds):
+        """等待期间让出执行权，避免阻塞其他脚本"""
+        seconds = _sc_wait_time(seconds)
+        if seconds <= 0:
+            return
+        self._turn_release()
+        try:
+            time.sleep(seconds)
+        finally:
+            self._turn_acquire()
+
     def _yield_frame(self):
         """让当前脚本等待到下一帧；warp/turbo模式下不等待"""
         if self._runtime is None:
@@ -2451,7 +2678,9 @@ class ScratchSprite:
         context = getattr(self._local, 'context', None)
         warp = getattr(self._local, 'warp_depth', 0) > 0 or getattr(self._runtime, 'turbo', False)
         if not warp:
+            self._turn_release()
             self._runtime.wait_frame(context)
+            self._turn_acquire()
             return
         limit = getattr(self._runtime, 'warp_timer', 0.5)
         if limit:
@@ -2461,7 +2690,9 @@ class ScratchSprite:
                 self._local.warp_start = now
             elif now - start >= limit:
                 self._local.warp_start = now
+                self._turn_release()
                 self._runtime.wait_frame(context)
+                self._turn_acquire()
 
     def _update_say(self):
         if self._say_until is not None and time.time() >= self._say_until:
@@ -2493,6 +2724,43 @@ class ScratchSprite:
         seed = sum(ord(ch) for ch in self.name) if self.name else 0
         return (70 + seed * 37 % 150, 70 + seed * 67 % 150, 70 + seed * 97 % 150)
 
+    def _color_effect_image(self, image, effect):
+        """按(造型Surface, 特效值)缓存颜色特效结果，避免每帧做HSV转换"""
+        cache = getattr(self, '_color_cache', None)
+        if cache is None:
+            cache = self._color_cache = {}
+        key = (id(image), round(_sc_num(effect), 3))
+        surface = cache.get(key)
+        if surface is None:
+            surface = self._runtime.apply_color_effect(image, effect)
+            if len(cache) >= 8:
+                cache.clear()
+            cache[key] = surface
+        return surface
+
+    def _brightness_image(self, image, brightness):
+        """按(造型Surface, 亮度值)缓存亮度特效结果，避免每帧fill整张图"""
+        cache = getattr(self, '_brightness_cache', None)
+        if cache is None:
+            cache = self._brightness_cache = {}
+        delta = int(255 * max(-100.0, min(100.0, _sc_num(brightness))) / 100.0)
+        if delta == 0:
+            return image
+        key = (id(image), delta)
+        surface = cache.get(key)
+        if surface is None:
+            surface = image.copy()
+            if delta > 0:
+                surface.fill((delta, delta, delta, 0),
+                             special_flags=pygame.BLEND_RGB_ADD)
+            else:
+                surface.fill((-delta, -delta, -delta, 0),
+                             special_flags=pygame.BLEND_RGB_SUB)
+            if len(cache) >= 8:
+                cache.clear()
+            cache[key] = surface
+        return surface
+
     def _draw(self, screen, font):
         image = self._costume_surface()
         runtime = self._runtime
@@ -2510,25 +2778,29 @@ class ScratchSprite:
             angle = 90 - draw_direction
             if self.rotation_style in ('left-right', "don't rotate"):
                 angle = 0
-            transformed = pygame.transform.rotozoom(image, angle, scale)
+            color_effect = _sc_num(self._effects.get('color', 0))
+            brightness = _sc_num(self._effects.get('brightness', 0))
+            ghost = max(0.0, min(100.0, _sc_num(self._effects.get('ghost', 0))))
+            # 颜色/亮度特效很耗CPU，按(造型Surface, 特效值)缓存；特效值不变时直接复用
+            base = image
+            if color_effect and self._runtime is not None:
+                base = self._color_effect_image(image, color_effect)
+            if brightness and self._runtime is not None:
+                base = self._brightness_image(base, brightness)
+            # 无旋转/无缩放时直接复用缓存的Surface，避免每帧rotozoom拷贝
+            if angle == 0 and scale == 1.0:
+                transformed = base
+                fresh = False
+            else:
+                transformed = pygame.transform.rotozoom(base, angle, scale)
+                fresh = True
             if self.rotation_style == 'left-right' and math.cos(math.radians(draw_direction)) < 0:
                 transformed = pygame.transform.flip(transformed, True, False)
-            color_effect = _sc_num(self._effects.get('color', 0))
-            if color_effect:
-                transformed = self._runtime.apply_color_effect(
-                    transformed, color_effect) if self._runtime else transformed
-            brightness = _sc_num(self._effects.get('brightness', 0))
-            if brightness:
-                delta = int(255 * max(-100.0, min(100.0, brightness)) / 100.0)
-                if delta > 0:
-                    transformed.fill((delta, delta, delta, 0),
-                                     special_flags=pygame.BLEND_RGB_ADD)
-                elif delta < 0:
-                    transformed.fill((-delta, -delta, -delta, 0),
-                                     special_flags=pygame.BLEND_RGB_SUB)
-            ghost = max(0.0, min(100.0, _sc_num(self._effects.get('ghost', 0))))
+                fresh = True
+            # 幽灵特效需要修改Surface，不能污染缓存
             if ghost > 0:
-                transformed = transformed.copy()
+                if not fresh:
+                    transformed = transformed.copy()
                 transformed.set_alpha(int(255 * (1 - ghost / 100.0)))
             rect = transformed.get_rect(center=(x, y))
             info = self._costume_info()
@@ -2537,8 +2809,9 @@ class ScratchSprite:
             center_x = image.get_width() / 2 if center_x is None else _sc_num(center_x)
             center_y = image.get_height() / 2 if center_y is None else _sc_num(center_y)
             if angle == 0:
-                rect.center = (x + int((center_x - image.get_width() / 2) * scale),
-                               y + int((center_y - image.get_height() / 2) * scale))
+                # Scratch的position对应旋转中心，旋转中心坐标以图片左上角为原点(y向下)
+                rect.center = (x - int((center_x - image.get_width() / 2) * scale),
+                               y - int((center_y - image.get_height() / 2) * scale))
             screen.blit(transformed, rect)
         else:
             radius = max(6, int(20 * scale))
@@ -2649,11 +2922,25 @@ class ScratchSprite:
     def set_backdrop(self, name):
         """切换舞台背景"""
         if self._runtime is not None:
-            self._runtime.set_backdrop(_sc_str(name))
+            self._runtime.set_backdrop(name)
 
     def set_backdrop_and_wait(self, name):
-        self.set_backdrop(name)
-        self._yield_frame()
+        """切换背景并等待这次切换触发的“当背景换成”脚本结束"""
+        if self._runtime is None:
+            return
+        threads = self._runtime.set_backdrop(name)
+        if not threads:
+            self._yield_frame()
+            return
+        context = getattr(self._local, 'context', None)
+        self._turn_release()
+        try:
+            for thread in threads:
+                while (thread.is_alive() and self._runtime.running
+                       and (context is None or context.running)):
+                    self._runtime.wait_frame(context)
+        finally:
+            self._turn_acquire()
 
     def next_backdrop(self):
         if self._runtime is not None:
@@ -2735,6 +3022,7 @@ class Stage(ScratchSprite):
     """精灵: Stage"""
 
     GLOBAL_NAMES = ('FortunateOS_系统版本号', '我的变量')
+    GLOBAL_NAMES_SET = frozenset(GLOBAL_NAMES)
 
     def __init__(self):
         super().__init__()
@@ -2760,6 +3048,7 @@ class BIOS(ScratchSprite):
     """精灵: BIOS"""
 
     GLOBAL_NAMES = ('FortunateOS_系统版本号', '我的变量')
+    GLOBAL_NAMES_SET = frozenset(GLOBAL_NAMES)
 
     def __init__(self):
         super().__init__()
@@ -2797,6 +3086,7 @@ class FortunateOS(ScratchSprite):
     """精灵: FortunateOS"""
 
     GLOBAL_NAMES = ('FortunateOS_系统版本号', '我的变量')
+    GLOBAL_NAMES_SET = frozenset(GLOBAL_NAMES)
 
     def __init__(self):
         super().__init__()

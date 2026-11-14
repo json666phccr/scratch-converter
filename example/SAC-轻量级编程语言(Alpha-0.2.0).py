@@ -973,8 +973,8 @@ class ScratchRuntime:
             os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
         pygame.display.init()
         pygame.font.init()
-        self.screen = pygame.display.set_mode((self.stage_width, self.stage_height))
-        pygame.display.set_caption("Scratch 3.0 Runtime (ESC 退出)")
+        self._create_display()
+        pygame.display.set_caption("Scratch 3.0 Runtime (ESC 退出，可自由拉伸窗口)")
         self.pen_layer = pygame.Surface((self.stage_width, self.stage_height),
                                         pygame.SRCALPHA)
         self.clock = pygame.time.Clock()
@@ -1049,16 +1049,80 @@ class ScratchRuntime:
     def set_framerate(self, fps):
         self.fps = max(1, min(250, int(fps))) if fps else 0
 
+    def _create_display(self):
+        """创建可自由拉伸的窗口，舞台按宽高比自动缩放到窗口最大可用区域。
+
+        优先使用 pygame.SCALED：由 SDL 在渲染层缩放（类似 Switch 放大到最大），
+        有硬件加速、自动保留宽高比并加黑边，鼠标事件也由 pygame 换算成逻辑坐标。
+        平台不支持 SCALED 时退化为软件缩放。
+        """
+        width, height = self.stage_width, self.stage_height
+        self._scaled_view = False
+        self._manual_view = False
+        self.view_scale = 1.0
+        self.view_offset = (0, 0)
+        self._view_size = None
+        self._view_scaled = None
+        if self.headless:
+            self.screen = pygame.display.set_mode((width, height))
+            self.stage_surface = self.screen
+            return
+        try:
+            self.screen = pygame.display.set_mode(
+                (width, height), pygame.RESIZABLE | pygame.SCALED)
+            self.stage_surface = self.screen
+            self._scaled_view = True
+            return
+        except (pygame.error, AttributeError):
+            pass
+        try:
+            self.screen = pygame.display.set_mode(
+                (width, height), pygame.RESIZABLE)
+        except pygame.error:
+            self.screen = pygame.display.set_mode((width, height))
+        self.stage_surface = pygame.Surface((width, height))
+        self._manual_view = True
+
+    def _window_to_stage(self, pos):
+        """窗口坐标 -> 舞台逻辑坐标（SCALED 模式下pygame已换算，无需处理）"""
+        if not self._manual_view:
+            return pos
+        scale = self.view_scale or 1.0
+        offset_x, offset_y = self.view_offset
+        return ((pos[0] - offset_x) / scale, (pos[1] - offset_y) / scale)
+
+    def _present(self):
+        """把逻辑舞台呈现到窗口；手动缩放模式下按宽高比居中放大"""
+        if self._manual_view:
+            window_width, window_height = self.screen.get_size()
+            if window_width <= 0 or window_height <= 0:
+                return
+            scale = min(window_width / float(self.stage_width),
+                        window_height / float(self.stage_height))
+            draw_width = max(1, int(self.stage_width * scale))
+            draw_height = max(1, int(self.stage_height * scale))
+            self.view_scale = draw_width / float(self.stage_width)
+            self.view_offset = ((window_width - draw_width) // 2,
+                                (window_height - draw_height) // 2)
+            if self._view_scaled is None or self._view_size != (draw_width, draw_height):
+                self._view_size = (draw_width, draw_height)
+                self._view_scaled = pygame.Surface((draw_width, draw_height)).convert()
+            pygame.transform.scale(self.stage_surface, (draw_width, draw_height),
+                                   self._view_scaled)
+            self.screen.fill((0, 0, 0))
+            self.screen.blit(self._view_scaled, self.view_offset)
+        pygame.display.flip()
+
     def resize_stage(self, width, height):
         width = max(1, int(width))
         height = max(1, int(height))
         if width == self.stage_width and height == self.stage_height:
             return
         self.stage_width, self.stage_height = width, height
-        self.screen = pygame.display.set_mode((width, height))
         self.pen_layer = pygame.Surface((width, height), pygame.SRCALPHA)
         if self.background is not None:
             self.background = pygame.transform.smoothscale(self.background, (width, height))
+        self._create_display()
 
     def pen_clear(self):
         self.pen_layer.fill((0, 0, 0, 0))
@@ -1136,6 +1200,10 @@ class ScratchRuntime:
             if getattr(sprite, "_is_clone", False):
                 self.sprites.remove(sprite)
         self.stop_all_scripts()
+        self.stop_sounds()
+        for sprite in list(self.sprites):
+            # 绿旗会清空音效，但保留图形特效与造型
+            sprite._sound_effects = {'pitch': 0.0, 'pan': 0.0}
         time.sleep(0.02)
         for sprite in list(self.sprites):
             sprite._global_running = True
@@ -1202,11 +1270,11 @@ class ScratchRuntime:
             return
         rect = pygame.Rect(20, self.stage_height - 60,
                            max(80, self.stage_width - 40), 40)
-        pygame.draw.rect(self.screen, (255, 255, 255), rect, border_radius=6)
-        pygame.draw.rect(self.screen, (90, 90, 90), rect, 1, border_radius=6)
+        pygame.draw.rect(self.stage_surface, (255, 255, 255), rect, border_radius=6)
+        pygame.draw.rect(self.stage_surface, (90, 90, 90), rect, 1, border_radius=6)
         text = self.ask_question + ' ' + self.ask_buffer + '_'
         surface = self.font.render(text, True, (30, 30, 30))
-        self.screen.blit(surface, (rect.x + 8, rect.y + 11))
+        self.stage_surface.blit(surface, (rect.x + 8, rect.y + 11))
 
     def stop_all_scripts(self):
         for context in list(self.scripts):
@@ -1256,8 +1324,9 @@ class ScratchRuntime:
         return name
 
     def _screen_to_scratch(self, pos):
-        return (pos[0] - self.stage_width // 2,
-                self.stage_height // 2 - pos[1])
+        x, y = self._window_to_stage(pos)
+        return (int(round(x)) - self.stage_width // 2,
+                self.stage_height // 2 - int(round(y)))
 
     def music_seconds(self, beats):
         tempo = _sc_num(self.music_tempo) or 60.0
@@ -1344,7 +1413,8 @@ class ScratchRuntime:
     def _handle_click(self, pos):
         if self.trace:
             print("[trace] click", pos)
-        if pos[0] < 28 and pos[1] < 28:
+        stage_pos = self._window_to_stage(pos)
+        if stage_pos[0] < 28 and stage_pos[1] < 28:
             self.green_flag()
             return
         x, y = self._screen_to_scratch(pos)
@@ -1407,7 +1477,7 @@ class ScratchRuntime:
                     self.dragging._apply_fencing()
         self._update_state()
         self._draw()
-        pygame.display.flip()
+        self._present()
         with self.frame_condition:
             self.frame += 1
             self.frame_condition.notify_all()
@@ -1444,15 +1514,15 @@ class ScratchRuntime:
 
     def _draw(self):
         if self.background is not None:
-            self.screen.blit(self.background, (0, 0))
+            self.stage_surface.blit(self.background, (0, 0))
         else:
-            self.screen.fill((247, 247, 247))
-        self.screen.blit(self.pen_layer, (0, 0))
-        pygame.draw.polygon(self.screen, (60, 170, 90),
+            self.stage_surface.fill((247, 247, 247))
+        self.stage_surface.blit(self.pen_layer, (0, 0))
+        pygame.draw.polygon(self.stage_surface, (60, 170, 90),
                             [(8, 22), (8, 6), (22, 6), (22, 12), (8, 12)])
         for sprite in list(self.sprites):
             if sprite.visible and not getattr(sprite, 'is_stage', False):
-                sprite._draw(self.screen, self.font)
+                sprite._draw(self.stage_surface, self.font)
         self._draw_monitors()
         self._draw_ask()
 
@@ -1495,24 +1565,24 @@ class ScratchRuntime:
             else:
                 value = GLOBALS.get(monitor["attr"])
             if monitor["kind"] == "list":
-                pygame.draw.rect(self.screen, (255, 255, 255), rect, border_radius=4)
-                pygame.draw.rect(self.screen, (130, 130, 130), rect, 1, border_radius=4)
+                pygame.draw.rect(self.stage_surface, (255, 255, 255), rect, border_radius=4)
+                pygame.draw.rect(self.stage_surface, (130, 130, 130), rect, 1, border_radius=4)
                 title = self.font.render(label, True, (40, 40, 40))
-                self.screen.blit(title, (rect.x + 5, rect.y + 3))
+                self.stage_surface.blit(title, (rect.x + 5, rect.y + 3))
                 if isinstance(value, list):
                     line_y = rect.y + 21
                     for item in value:
                         if line_y + 14 > rect.bottom - 2:
                             break
                         text = self.font.render(_sc_str(item), True, (60, 60, 60))
-                        self.screen.blit(text, (rect.x + 8, line_y))
+                        self.stage_surface.blit(text, (rect.x + 8, line_y))
                         line_y += 15
             else:
                 text = f"{label} {_sc_str(value)}"
-                pygame.draw.rect(self.screen, (255, 255, 255), rect, border_radius=3)
-                pygame.draw.rect(self.screen, (130, 130, 130), rect, 1, border_radius=3)
+                pygame.draw.rect(self.stage_surface, (255, 255, 255), rect, border_radius=3)
+                pygame.draw.rect(self.stage_surface, (130, 130, 130), rect, 1, border_radius=3)
                 surface = self.font.render(text, True, (40, 40, 40))
-                self.screen.blit(surface, (rect.x + 5, rect.y + 3))
+                self.stage_surface.blit(surface, (rect.x + 5, rect.y + 3))
 
     @property
     def backdrop_name(self):
@@ -1534,9 +1604,8 @@ class ScratchRuntime:
         count = len(BACKDROPS)
         names = [item[0] for item in BACKDROPS]
         if isinstance(name, (int, float)) and not isinstance(name, bool):
-            number = _sc_num(name)
-            if isinstance(number, float) and (math.isnan(number)
-                                              or math.isinf(number)):
+            number = float(name)
+            if math.isnan(number) or math.isinf(number):
                 index = 0
             else:
                 index = _sc_round(number) - 1
@@ -2101,7 +2170,8 @@ class ScratchRuntime:
 class ScratchSprite:
     """Scratch精灵基类"""
 
-    GLOBAL_NAMES = frozenset()
+    GLOBAL_NAMES = ()
+    GLOBAL_NAMES_SET = frozenset()
 
     def __init__(self):
         self.x = 0
@@ -2152,8 +2222,8 @@ class ScratchSprite:
         raise AttributeError(name)
 
     def __setattr__(self, name, value):
-        # GLOBAL_NAMES 由生成器输出为 frozenset，用 O(1) 判断替代逐项扫描
-        if name in type(self).GLOBAL_NAMES:
+        # 用 frozenset 做 O(1) 判断，替代逐项扫描GLOBAL_NAMES元组
+        if name in type(self).GLOBAL_NAMES_SET:
             GLOBALS[name] = value
         else:
             object.__setattr__(self, name, value)
@@ -2312,9 +2382,8 @@ class ScratchSprite:
         if not count:
             return
         if isinstance(costume, (int, float)) and not isinstance(costume, bool):
-            number = _sc_num(costume)
-            if isinstance(number, float) and (math.isnan(number)
-                                              or math.isinf(number)):
+            number = float(costume)
+            if math.isnan(number) or math.isinf(number):
                 index = 0
             else:
                 index = _sc_round(number) - 1
@@ -2655,6 +2724,43 @@ class ScratchSprite:
         seed = sum(ord(ch) for ch in self.name) if self.name else 0
         return (70 + seed * 37 % 150, 70 + seed * 67 % 150, 70 + seed * 97 % 150)
 
+    def _color_effect_image(self, image, effect):
+        """按(造型Surface, 特效值)缓存颜色特效结果，避免每帧做HSV转换"""
+        cache = getattr(self, '_color_cache', None)
+        if cache is None:
+            cache = self._color_cache = {}
+        key = (id(image), round(_sc_num(effect), 3))
+        surface = cache.get(key)
+        if surface is None:
+            surface = self._runtime.apply_color_effect(image, effect)
+            if len(cache) >= 8:
+                cache.clear()
+            cache[key] = surface
+        return surface
+
+    def _brightness_image(self, image, brightness):
+        """按(造型Surface, 亮度值)缓存亮度特效结果，避免每帧fill整张图"""
+        cache = getattr(self, '_brightness_cache', None)
+        if cache is None:
+            cache = self._brightness_cache = {}
+        delta = int(255 * max(-100.0, min(100.0, _sc_num(brightness))) / 100.0)
+        if delta == 0:
+            return image
+        key = (id(image), delta)
+        surface = cache.get(key)
+        if surface is None:
+            surface = image.copy()
+            if delta > 0:
+                surface.fill((delta, delta, delta, 0),
+                             special_flags=pygame.BLEND_RGB_ADD)
+            else:
+                surface.fill((-delta, -delta, -delta, 0),
+                             special_flags=pygame.BLEND_RGB_SUB)
+            if len(cache) >= 8:
+                cache.clear()
+            cache[key] = surface
+        return surface
+
     def _draw(self, screen, font):
         image = self._costume_surface()
         runtime = self._runtime
@@ -2672,38 +2778,29 @@ class ScratchSprite:
             angle = 90 - draw_direction
             if self.rotation_style in ('left-right', "don't rotate"):
                 angle = 0
-            # 无旋转/无缩放时直接复用缓存的Surface，避免每帧rotozoom拷贝
-            if angle == 0 and scale == 1.0:
-                transformed = image
-            elif angle == 0:
-                transformed = pygame.transform.smoothscale(
-                    image, (max(1, int(image.get_width() * scale)),
-                            max(1, int(image.get_height() * scale))))
-            elif scale == 1.0:
-                transformed = pygame.transform.rotate(image, angle)
-            else:
-                transformed = pygame.transform.rotozoom(image, angle, scale)
-            if self.rotation_style == 'left-right' and math.cos(math.radians(draw_direction)) < 0:
-                transformed = pygame.transform.flip(transformed, True, False)
             color_effect = _sc_num(self._effects.get('color', 0))
             brightness = _sc_num(self._effects.get('brightness', 0))
             ghost = max(0.0, min(100.0, _sc_num(self._effects.get('ghost', 0))))
-            # 需要原地修改特效时必须先复制，不能污染造型缓存
-            if transformed is image and (color_effect or brightness or ghost > 0):
-                transformed = image.copy()
-            if color_effect:
-                transformed = self._runtime.apply_color_effect(
-                    transformed, color_effect) if self._runtime else transformed
-            if brightness:
-                delta = int(255 * max(-100.0, min(100.0, brightness)) / 100.0)
-                if delta > 0:
-                    transformed.fill((delta, delta, delta, 0),
-                                     special_flags=pygame.BLEND_RGB_ADD)
-                elif delta < 0:
-                    transformed.fill((-delta, -delta, -delta, 0),
-                                     special_flags=pygame.BLEND_RGB_SUB)
+            # 颜色/亮度特效很耗CPU，按(造型Surface, 特效值)缓存；特效值不变时直接复用
+            base = image
+            if color_effect and self._runtime is not None:
+                base = self._color_effect_image(image, color_effect)
+            if brightness and self._runtime is not None:
+                base = self._brightness_image(base, brightness)
+            # 无旋转/无缩放时直接复用缓存的Surface，避免每帧rotozoom拷贝
+            if angle == 0 and scale == 1.0:
+                transformed = base
+                fresh = False
+            else:
+                transformed = pygame.transform.rotozoom(base, angle, scale)
+                fresh = True
+            if self.rotation_style == 'left-right' and math.cos(math.radians(draw_direction)) < 0:
+                transformed = pygame.transform.flip(transformed, True, False)
+                fresh = True
+            # 幽灵特效需要修改Surface，不能污染缓存
             if ghost > 0:
-                transformed = transformed.copy()
+                if not fresh:
+                    transformed = transformed.copy()
                 transformed.set_alpha(int(255 * (1 - ghost / 100.0)))
             rect = transformed.get_rect(center=(x, y))
             info = self._costume_info()
@@ -2924,7 +3021,8 @@ class ScratchSprite:
 class Stage(ScratchSprite):
     """精灵: Stage"""
 
-    GLOBAL_NAMES = frozenset(())
+    GLOBAL_NAMES = ()
+    GLOBAL_NAMES_SET = frozenset(GLOBAL_NAMES)
 
     def __init__(self):
         super().__init__()
@@ -2949,7 +3047,8 @@ class Stage(ScratchSprite):
 class SAC_轻量级编程语言(ScratchSprite):
     """精灵: SAC-轻量级编程语言"""
 
-    GLOBAL_NAMES = frozenset(())
+    GLOBAL_NAMES = ()
+    GLOBAL_NAMES_SET = frozenset(GLOBAL_NAMES)
 
     def __init__(self):
         super().__init__()
