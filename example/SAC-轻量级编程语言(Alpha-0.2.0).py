@@ -994,6 +994,7 @@ class ScratchRuntime:
         self.mouse_x = 0
         self.mouse_y = 0
         self.current_backdrop = 0
+        self.stage_sprite = None
         self.counter = 0
         self.dragging = None
         self.dragging_offset = (0, 0)
@@ -1188,6 +1189,8 @@ class ScratchRuntime:
     def add_sprite(self, sprite):
         sprite._runtime = self
         self.sprites.append(sprite)
+        if getattr(sprite, 'is_stage', False):
+            self.stage_sprite = sprite
 
     def remove_sprite(self, sprite):
         if sprite in self.sprites:
@@ -1536,8 +1539,27 @@ class ScratchRuntime:
                     sprite._render_size += (target_s - sprite._render_size) * 0.5
 
     def _draw(self):
-        if self.background is not None:
-            self.stage_surface.blit(self.background, (0, 0))
+        background = self.background
+        ghost = 0.0
+        stage = self.stage_sprite
+        if background is not None and stage is not None:
+            # 舞台自身的图形特效要作用在背景上（Scratch 中舞台也是角色）
+            effects = stage._effects
+            color = _sc_num(effects.get('color', 0))
+            brightness = _sc_num(effects.get('brightness', 0))
+            ghost = max(0.0, min(100.0, _sc_num(effects.get('ghost', 0))))
+            if color:
+                background = stage._color_effect_image(background, color)
+            if brightness:
+                background = stage._brightness_image(background, brightness)
+            if ghost > 0:
+                background = background.copy()
+                background.set_alpha(int(255 * (1 - ghost / 100.0)))
+        if background is not None:
+            if ghost > 0:
+                # 半透明背景需要先铺底色，避免叠到上一帧画面
+                self.stage_surface.fill((255, 255, 255))
+            self.stage_surface.blit(background, (0, 0))
         else:
             self.stage_surface.fill((247, 247, 247))
         self.stage_surface.blit(self.pen_layer, (0, 0))
