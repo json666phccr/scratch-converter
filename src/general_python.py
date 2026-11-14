@@ -98,6 +98,7 @@ class GeneralPythonParser(PythonParser):
         self._list_vars: set = set()
         self._current_function: Optional[str] = None
         self._loop_serial = 0
+        self._loop_stack: List[Dict[str, Any]] = []
 
     # ---------- 基础工具 ----------
 
@@ -117,19 +118,75 @@ class GeneralPythonParser(PythonParser):
         return statements[0] if statements else None
 
     def _parse_stmt_list(self, nodes: List[ast.stmt]) -> List[Statement]:
-        """解析语句列表，并把表达式里提升出来的调用语句插到对应位置"""
+        """解析语句列表，并把表达式里提升出来的调用语句插到对应位置
+
+        在循环体内：一旦某条语句可能执行 break/continue，后续语句会被包进
+        `如果 <没有 break 且没有 continue>` 里，保证控制流立刻生效。
+        """
         result: List[Statement] = []
+        target: List[Statement] = result
         for node in nodes:
             saved = self._pending
             self._pending = []
+            context = self._loop_stack[-1] if self._loop_stack else None
+            if context is not None:
+                context['saw_control'] = False
             try:
                 stmt = self._parse_statement(node)
-                result.extend(self._pending)
+                pending = self._pending
             finally:
                 self._pending = saved
+            target.extend(pending)
             if stmt is not None:
-                result.append(stmt)
+                target.append(stmt)
+            if context is not None and context['saw_control']:
+                # 后续语句必须等 break/continue 标志检查通过才执行；
+                # 用嵌套的“如果”保证同一层里多次控制流也正确。
+                nested = Statement(type=BlockType.IF,
+                                   condition=self._loop_guard(context))
+                target.append(nested)
+                target = nested.body
         return result
+
+    @staticmethod
+    def _loop_guard(context: Dict[str, Any]) -> Expr:
+        return Expr(
+            ExprType.AND,
+            left=Expr(ExprType.NOT, right=make_variable(context['break'])),
+            right=Expr(ExprType.NOT, right=make_variable(context['continue'])))
+
+    def _new_loop_context(self) -> Dict[str, Any]:
+        self._loop_serial += 1
+        return {
+            'break': f'__py_break_{self._loop_serial}',
+            'continue': f'__py_continue_{self._loop_serial}',
+            'used': False,
+            'saw_control': False,
+        }
+
+    def _loop_flags_init(self, context: Dict[str, Any]) -> List[Statement]:
+        self.sprite.variables[context['break']] = 0
+        self.sprite.variables[context['continue']] = 0
+        return [
+            Statement(type=BlockType.SET_VARIABLE,
+                      extra={'name': context['break']}, value=make_number(0)),
+            Statement(type=BlockType.SET_VARIABLE,
+                      extra={'name': context['continue']}, value=make_number(0)),
+        ]
+
+    def _parse_loop_body(self, nodes: List[ast.stmt],
+                         context: Dict[str, Any]) -> List[Statement]:
+        self._loop_stack.append(context)
+        try:
+            return self._parse_stmt_list(nodes)
+        finally:
+            self._loop_stack.pop()
+
+    @staticmethod
+    def _chain_list(statements: List[Statement]) -> Optional[Statement]:
+        for current, following in zip(statements, statements[1:]):
+            current.next = following
+        return statements[0] if statements else None
 
     def _py_index(self, index: Expr) -> Expr:
         """Python 0 起始下标 -> Scratch 1 起始下标"""
@@ -182,6 +239,7 @@ class GeneralPythonParser(PythonParser):
         self._result_vars = {}
         self._list_vars = set()
         self._loop_serial = 0
+        self._loop_stack = []
         self._current_function = None
         self.warnings = {}
 
@@ -274,9 +332,10 @@ class GeneralPythonParser(PythonParser):
     # ---------- 语句 ----------
 
     def _parse_statement(self, node: ast.AST) -> Optional[Statement]:
-        if isinstance(node, (ast.Break, ast.Continue)):
-            self.warn('break/continue')
-            return None
+        if isinstance(node, ast.Break):
+            return self._parse_break_or_continue(node, 'break')
+        if isinstance(node, ast.Continue):
+            return self._parse_break_or_continue(node, 'continue')
         if isinstance(node, ast.FunctionDef):
             self.warn('嵌套函数')
             return None
@@ -296,6 +355,16 @@ class GeneralPythonParser(PythonParser):
         if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
             return None  # docstring / 无副作用的常量
         return super()._parse_statement(node)
+
+    def _parse_break_or_continue(self, node: ast.stmt, kind: str) -> Optional[Statement]:
+        if not self._loop_stack:
+            self.warn(f'循环外 {kind}')
+            return None
+        context = self._loop_stack[-1]
+        context['used'] = True
+        context['saw_control'] = True
+        return Statement(type=BlockType.SET_VARIABLE,
+                         extra={'name': context[kind]}, value=make_number(1))
 
     def _parse_return(self, node: ast.Return) -> Optional[Statement]:
         func_name = self._current_function
@@ -329,13 +398,31 @@ class GeneralPythonParser(PythonParser):
     def _parse_while_loop(self, node: ast.While) -> Optional[Statement]:
         if isinstance(node.test, ast.Constant) and node.test.value is False:
             return None
-        if isinstance(node.test, ast.Constant) and node.test.value is True:
-            stmt = Statement(type=BlockType.FOREVER)
-        else:
-            condition = self._parse_expr_to_ir(node.test)
-            stmt = Statement(type=BlockType.REPEAT_UNTIL,
-                             condition=Expr(ExprType.NOT, right=condition))
-        stmt.body = self._parse_stmt_list(node.body)
+        is_forever = isinstance(node.test, ast.Constant) and node.test.value is True
+        condition = None if is_forever else self._parse_expr_to_ir(node.test)
+
+        context = self._new_loop_context()
+        body = self._parse_loop_body(node.body, context)
+        if context['used']:
+            if condition is None:
+                loop_condition = make_variable(context['break'])
+            else:
+                loop_condition = Expr(
+                    ExprType.OR,
+                    left=Expr(ExprType.NOT, right=condition),
+                    right=make_variable(context['break']))
+            loop = Statement(type=BlockType.REPEAT_UNTIL,
+                             condition=loop_condition)
+            body.append(Statement(type=BlockType.SET_VARIABLE,
+                                  extra={'name': context['continue']},
+                                  value=make_number(0)))
+            loop.body = body
+            return self._chain_list(self._loop_flags_init(context) + [loop])
+
+        stmt = Statement(type=BlockType.FOREVER) if is_forever else Statement(
+            type=BlockType.REPEAT_UNTIL,
+            condition=Expr(ExprType.NOT, right=condition))
+        stmt.body = body
         return stmt
 
     def _parse_for_loop(self, node: ast.For) -> Optional[Statement]:
@@ -404,10 +491,40 @@ class GeneralPythonParser(PythonParser):
             self.warn('range 参数数量')
             return None
 
+        context = self._new_loop_context()
+        parsed_body = self._parse_loop_body(body, context)
+        if context['used']:
+            counter = f'__py_i_{self._loop_serial}'
+            self.sprite.variables[counter] = 0
+            init = [Statement(type=BlockType.SET_VARIABLE,
+                              extra={'name': var}, value=start),
+                    Statement(type=BlockType.SET_VARIABLE,
+                              extra={'name': counter}, value=make_number(0))]
+            init.extend(self._loop_flags_init(context))
+            loop = Statement(
+                type=BlockType.REPEAT_UNTIL,
+                condition=Expr(
+                    ExprType.OR,
+                    left=Expr(ExprType.NOT, right=Expr(
+                        ExprType.LESS_THAN,
+                        left=make_variable(counter), right=count)),
+                    right=make_variable(context['break'])))
+            parsed_body.append(Statement(
+                type=BlockType.SET_VARIABLE,
+                extra={'name': context['continue']}, value=make_number(0)))
+            parsed_body.append(Statement(
+                type=BlockType.CHANGE_VARIABLE,
+                extra={'name': counter}, value=make_number(1)))
+            parsed_body.append(Statement(
+                type=BlockType.CHANGE_VARIABLE,
+                extra={'name': var}, value=step))
+            loop.body = parsed_body
+            return self._chain_list(init + [loop])
+
         init = Statement(type=BlockType.SET_VARIABLE,
                          extra={'name': var}, value=start)
         loop = Statement(type=BlockType.REPEAT, value=count)
-        loop.body = self._parse_stmt_list(body)
+        loop.body = parsed_body
         loop.body.append(Statement(type=BlockType.CHANGE_VARIABLE,
                                    extra={'name': var}, value=step))
         init.next = loop
@@ -415,19 +532,48 @@ class GeneralPythonParser(PythonParser):
 
     def _parse_list_loop(self, var: str, list_name: str,
                          body: List[ast.stmt]) -> Statement:
-        self._loop_serial += 1
+        context = self._new_loop_context()
+        parsed_body = self._parse_loop_body(body, context)
         index_var = f'__py_idx_{self._loop_serial}'
         self.sprite.variables[index_var] = 0
         init = Statement(type=BlockType.SET_VARIABLE,
                          extra={'name': index_var}, value=make_number(0))
-        loop = Statement(type=BlockType.REPEAT,
-                         value=Expr(ExprType.LENGTH_OF_LIST, name=list_name))
         first = Statement(
             type=BlockType.SET_VARIABLE, extra={'name': var},
             value=make_list_access(
                 list_name,
                 make_binary_op('+', make_variable(index_var), make_number(1))))
-        loop.body = [first] + self._parse_stmt_list(body)
+
+        if context['used']:
+            statements = [
+                init,
+                Statement(type=BlockType.SET_VARIABLE,
+                          extra={'name': context['break']}, value=make_number(0)),
+                Statement(type=BlockType.SET_VARIABLE,
+                          extra={'name': context['continue']}, value=make_number(0)),
+            ]
+            loop = Statement(
+                type=BlockType.REPEAT_UNTIL,
+                condition=Expr(
+                    ExprType.OR,
+                    left=Expr(ExprType.NOT, right=Expr(
+                        ExprType.LESS_THAN,
+                        left=make_variable(index_var),
+                        right=Expr(ExprType.LENGTH_OF_LIST, name=list_name))),
+                    right=make_variable(context['break'])))
+            loop.body = [first] + parsed_body
+            loop.body.append(Statement(
+                type=BlockType.SET_VARIABLE,
+                extra={'name': context['continue']}, value=make_number(0)))
+            loop.body.append(Statement(
+                type=BlockType.CHANGE_VARIABLE,
+                extra={'name': index_var}, value=make_number(1)))
+            statements.append(loop)
+            return self._chain_list(statements)
+
+        loop = Statement(type=BlockType.REPEAT,
+                         value=Expr(ExprType.LENGTH_OF_LIST, name=list_name))
+        loop.body = [first] + parsed_body
         loop.body.append(Statement(type=BlockType.CHANGE_VARIABLE,
                                    extra={'name': index_var},
                                    value=make_number(1)))

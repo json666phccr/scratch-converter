@@ -1,6 +1,6 @@
 # Scratch 3.0 <-> Python 双向转换器
 
-> 版本 **0.6.0** · [MIT License](LICENSE)
+> 版本 **0.7.0** · [MIT License](LICENSE)
 
 一个强大的 Scratch 3.0 与 Python 之间的双向转换工具，支持**一比一对应**的转换，同时支持高级 Python 语法。
 
@@ -118,12 +118,13 @@ converter.python_to_scratch('script.py', 'project.sb3', mode='general')
 | `"a=" + str(a)` | 字符串拼接自动使用连接 |
 | `a // b` | `floor(a / b)` |
 | `range(a, b, step)` | 支持动态起止与步长 |
+| `break` / `continue` | 循环标志变量 + 条件包裹，立即跳出/进入下一轮 |
 | `print(...)` | 说话 |
 | `input(...)` | 询问并等待，返回回答 |
 
 自动生成一个蓝色 `Py` 造型和一个白色背景，项目可直接用 Scratch 打开。
 
-**通用模式限制**：类、异常、生成器、装饰器、多返回值、`break/continue`、
+**通用模式限制**：类、异常、生成器、装饰器、多返回值、
 `match`、文件/网络等不支持；遇到时会在命令行打印“转换报告”，
 并把这些特性记录到 `ProjectIR.warnings`，不会静默改变语义。
 

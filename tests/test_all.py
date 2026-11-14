@@ -2238,6 +2238,54 @@ print("chain:", 0 < a <= 3)
     return True
 
 
+def test_general_python_break_continue():
+    print("[测试41] 通用Python break/continue")
+    from general_python import parse_general_project
+
+    code = '''
+nums = []
+for i in range(10):
+    if i == 3:
+        continue
+    if i == 7:
+        break
+    nums.append(i)
+
+total = 0
+i = 0
+while i < 10:
+    i += 1
+    if i % 2 == 0:
+        continue
+    if i > 7:
+        break
+    total += i
+
+count = 0
+for x in [1, 2, 3, 4, 5]:
+    if x == 4:
+        break
+    count += x
+print(nums, total, count)
+'''
+    project = parse_general_project(code, 'BreakTest')
+    assert not project.warnings, f"不应有未支持特性: {project.warnings}"
+    data = write_scratch_project(project)
+    opcodes = {}
+    variables = []
+    for target in data['targets']:
+        variables.extend(name for name, _ in target.get('variables', {}).values())
+        for block in target['blocks'].values():
+            opcodes[block['opcode']] = opcodes.get(block['opcode'], 0) + 1
+    assert any(name.startswith('__py_break_') for name in variables)
+    assert any(name.startswith('__py_continue_') for name in variables)
+    assert 'control_repeat_until' in opcodes
+    assert 'operator_or' in opcodes
+    assert 'operator_not' in opcodes
+    print("  [PASS] 通用Python break/continue 通过")
+    return True
+
+
 def main():
     """运行所有测试"""
     print("=" * 60)
@@ -2285,6 +2333,7 @@ def main():
         test_list_out_of_range_reads,
         test_general_python_mode,
         test_general_python_more_syntax,
+        test_general_python_break_continue,
     ]
     
     passed = 0
