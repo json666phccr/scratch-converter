@@ -27,7 +27,7 @@ from scratch_writer import write_scratch_project, save_scratch_file
 from python_generator import generate_python, save_python
 from python_parser import parse_python_code, parse_python_file, python_to_project
 
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 
 
 class ScratchConverter:

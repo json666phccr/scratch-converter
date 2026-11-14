@@ -949,10 +949,11 @@ class ScratchRuntime:
                  assets_dir=None, interpolation=False, turbo=False,
                  fencing=True, infinite_clones=False, misc_limits=True,
                  hq_pen=False, stage_size=None, warp_timer=0.5,
-                 disable_compiler=False):
+                 disable_compiler=False, maximize=True):
         if pygame is None:
             raise RuntimeError("运行生成的脚本需要pygame: pip install pygame")
         self.headless = headless
+        self.maximize = maximize
         self.fps = fps or self.FPS
         self.trace = trace
         self.assets_dir = assets_dir or ASSETS_DIR
@@ -973,7 +974,7 @@ class ScratchRuntime:
             os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
         pygame.display.init()
         pygame.font.init()
-        self._create_display()
+        self._create_display(maximize=self.maximize)
         pygame.display.set_caption("Scratch 3.0 Runtime (ESC 退出，可自由拉伸窗口)")
         self.pen_layer = pygame.Surface((self.stage_width, self.stage_height),
                                         pygame.SRCALPHA)
@@ -1049,12 +1050,12 @@ class ScratchRuntime:
     def set_framerate(self, fps):
         self.fps = max(1, min(250, int(fps))) if fps else 0
 
-    def _create_display(self):
-        """创建可自由拉伸的窗口，舞台按宽高比自动缩放到窗口最大可用区域。
+    def _create_display(self, maximize=False):
+        """创建可自由拉伸的窗口，启动时最大化，舞台按宽高比缩放到最大可用区域。
 
-        优先使用 pygame.SCALED：由 SDL 在渲染层缩放（类似 Switch 放大到最大），
-        有硬件加速、自动保留宽高比并加黑边，鼠标事件也由 pygame 换算成逻辑坐标。
-        平台不支持 SCALED 时退化为软件缩放。
+        不使用 pygame.SCALED：在高DPI屏幕上 SCALED 可能只按固定整数倍放大，
+        导致舞台只占窗口一部分。这里始终把逻辑舞台软件缩放到窗口实际像素，
+        保证最大化后一定填满可用区域（保留宽高比，多余部分补黑边）。
         """
         width, height = self.stage_width, self.stage_height
         self._scaled_view = False
@@ -1069,48 +1070,70 @@ class ScratchRuntime:
             return
         try:
             self.screen = pygame.display.set_mode(
-                (width, height), pygame.RESIZABLE | pygame.SCALED)
-            self.stage_surface = self.screen
-            self._scaled_view = True
-            return
-        except (pygame.error, AttributeError):
-            pass
-        try:
-            self.screen = pygame.display.set_mode(
                 (width, height), pygame.RESIZABLE)
         except pygame.error:
             self.screen = pygame.display.set_mode((width, height))
         self.stage_surface = pygame.Surface((width, height))
         self._manual_view = True
+        if maximize:
+            self._maximize_window()
+
+    def _maximize_window(self):
+        """把窗口最大化到桌面可用区域（类似 Scratch 舞台放大到最大）"""
+        try:
+            if os.name == 'nt':
+                import ctypes
+                hwnd = pygame.display.get_wm_info().get('window')
+                if hwnd:
+                    ctypes.windll.user32.ShowWindow(hwnd, 3)  # SW_MAXIMIZE
+                    return
+            maximize = getattr(pygame.display, 'maximize', None)
+            if maximize is not None:
+                maximize()
+        except Exception:
+            pass
+
+    def _view_geometry(self):
+        """返回 (缩放比, 黑边偏移, 绘制尺寸)"""
+        window_width, window_height = self.screen.get_size()
+        if window_width <= 0 or window_height <= 0:
+            return 1.0, (0, 0), (self.stage_width, self.stage_height)
+        scale = min(window_width / float(self.stage_width),
+                    window_height / float(self.stage_height))
+        draw_width = max(1, int(self.stage_width * scale))
+        draw_height = max(1, int(self.stage_height * scale))
+        return (draw_width / float(self.stage_width),
+                ((window_width - draw_width) // 2,
+                 (window_height - draw_height) // 2),
+                (draw_width, draw_height))
 
     def _window_to_stage(self, pos):
-        """窗口坐标 -> 舞台逻辑坐标（SCALED 模式下pygame已换算，无需处理）"""
+        """窗口坐标 -> 舞台逻辑坐标（窗口缩放/最大化后仍能正确点击）"""
         if not self._manual_view:
             return pos
-        scale = self.view_scale or 1.0
-        offset_x, offset_y = self.view_offset
-        return ((pos[0] - offset_x) / scale, (pos[1] - offset_y) / scale)
+        scale, offset, _size = self._view_geometry()
+        return ((pos[0] - offset[0]) / scale, (pos[1] - offset[1]) / scale)
 
     def _present(self):
-        """把逻辑舞台呈现到窗口；手动缩放模式下按宽高比居中放大"""
+        """把逻辑舞台呈现到窗口；按宽高比居中放大到窗口最大可用区域"""
         if self._manual_view:
+            scale, offset, (draw_width, draw_height) = self._view_geometry()
+            self.view_scale = scale
+            self.view_offset = offset
             window_width, window_height = self.screen.get_size()
             if window_width <= 0 or window_height <= 0:
                 return
-            scale = min(window_width / float(self.stage_width),
-                        window_height / float(self.stage_height))
-            draw_width = max(1, int(self.stage_width * scale))
-            draw_height = max(1, int(self.stage_height * scale))
-            self.view_scale = draw_width / float(self.stage_width)
-            self.view_offset = ((window_width - draw_width) // 2,
-                                (window_height - draw_height) // 2)
             if self._view_scaled is None or self._view_size != (draw_width, draw_height):
                 self._view_size = (draw_width, draw_height)
                 self._view_scaled = pygame.Surface((draw_width, draw_height)).convert()
-            pygame.transform.scale(self.stage_surface, (draw_width, draw_height),
-                                   self._view_scaled)
+            if self._view_size == (self.stage_width, self.stage_height):
+                self._view_scaled.blit(self.stage_surface, (0, 0))
+            else:
+                pygame.transform.smoothscale(self.stage_surface,
+                                             (draw_width, draw_height),
+                                             self._view_scaled)
             self.screen.fill((0, 0, 0))
-            self.screen.blit(self._view_scaled, self.view_offset)
+            self.screen.blit(self._view_scaled, offset)
         pygame.display.flip()
 
     def resize_stage(self, width, height):
@@ -1122,7 +1145,7 @@ class ScratchRuntime:
         self.pen_layer = pygame.Surface((width, height), pygame.SRCALPHA)
         if self.background is not None:
             self.background = pygame.transform.smoothscale(self.background, (width, height))
-        self._create_display()
+        self._create_display(maximize=self.maximize)
 
     def pen_clear(self):
         self.pen_layer.fill((0, 0, 0, 0))
@@ -3227,6 +3250,7 @@ def main(argv=None):
     parser.add_argument('--hq-pen', action='store_true', help='高质量画笔')
     parser.add_argument('--warp-timer', type=float, default=0.5, help='warp模式超时秒数')
     parser.add_argument('--disable-compiler', action='store_true', help='兼容参数（无操作）')
+    parser.add_argument('--windowed', action='store_true', help='以普通窗口启动（默认自动最大化）')
     args = parser.parse_args(argv)
     if args.seed is not None:
         random.seed(args.seed)
@@ -3244,7 +3268,8 @@ def main(argv=None):
         fencing=args.fencing, infinite_clones=args.infinite_clones,
         misc_limits=args.misc_limits, hq_pen=args.hq_pen,
         stage_size=stage_size, warp_timer=args.warp_timer,
-        disable_compiler=args.disable_compiler)
+        disable_compiler=args.disable_compiler,
+        maximize=not args.windowed)
 
     stage = Stage()
     runtime.add_sprite(stage)
