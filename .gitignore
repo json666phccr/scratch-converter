@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 工具与编辑器
+.ai-cli/
+.screenshots/
+.idea/
+.vscode/
+.DS_Store
+
+# 临时/调试产物
+*.log
+*.tmp
+example/output.py
+example/project.json
+example/*.zip
