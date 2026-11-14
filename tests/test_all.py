@@ -2440,6 +2440,30 @@ print("done")
     return True
 
 
+def test_chinese_sprite_instance_name():
+    """中文角色名 lower() 后与类名相同，不能被 main() 的局部变量遮蔽"""
+    print("[测试43] 中文角色名的实例命名")
+
+    project = make_project({
+        "b1": block("event_whenflagclicked", None, None, top_level=True),
+    }, name="角色1")
+    code = generate_python(parse_scratch_project(project))
+
+    lines = {line.strip() for line in code.splitlines()}
+    assert "角色1 = 角色1()" not in lines, \
+        "main() 里不能出现自我遮蔽的赋值"
+    assert "inst_角色1 = 角色1()" in lines, "中文角色名应加 inst_ 前缀"
+
+    # 实际执行 main()，确认不再抛 UnboundLocalError
+    namespace = {"__file__": os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "generated_run.py")}
+    exec(compile(code, "<generated>", "exec"), namespace)
+    namespace["main"](["--headless", "--frames", "1", "--no-audio"])
+
+    print("  [PASS] 中文角色名的实例命名通过")
+    return True
+
+
 def main():
     """运行所有测试"""
     print("=" * 60)
@@ -2489,6 +2513,7 @@ def main():
         test_general_python_more_syntax,
         test_general_python_break_continue,
         test_general_python_builtins_and_methods,
+        test_chinese_sprite_instance_name,
     ]
     
     passed = 0

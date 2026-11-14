@@ -3893,11 +3893,26 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
         lines.append("        maximize=not args.windowed)")
         lines.append("")
 
+        # 实例名必须避开类名和 main() 里的局部变量名。
+        # 中文/无大小写的角色名（如“角色1”）lower() 后与类名相同，
+        # 直接写 `角色1 = 角色1()` 会触发 UnboundLocalError。
+        reserved_names = {'parser', 'args', 'runtime', 'stage_size',
+                          'width', 'height'}
+        class_names = {sanitize_name(item.name, "Sprite")
+                       for item in project.sprites}
+        used_instances = set()
         for sprite in project.sprites:
             safe_class = sanitize_name(sprite.name, "Sprite")
-            safe_instance = sanitize_name(sprite.name.lower(), "inst")
-            lines.append(f"    {safe_instance} = {safe_class}()")
-            lines.append(f"    runtime.add_sprite({safe_instance})")
+            instance = sanitize_name(sprite.name.lower(), "inst")
+            if instance == safe_class or instance in class_names \
+                    or instance in reserved_names:
+                instance = f'inst_{instance}'
+            while instance in used_instances or instance in class_names \
+                    or instance in reserved_names:
+                instance = f'{instance}_'
+            used_instances.add(instance)
+            lines.append(f"    {instance} = {safe_class}()")
+            lines.append(f"    runtime.add_sprite({instance})")
 
         lines.append("")
         lines.append("    try:")

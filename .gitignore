@@ -18,6 +18,6 @@ env/
 # 临时/调试产物
 *.log
 *.tmp
-example/output.py
-example/project.json
-example/*.zip
+
+# 本地示例项目（含用户自己的 sb3/py 与导出素材，不上传）
+/example/
