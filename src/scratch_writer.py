@@ -346,9 +346,16 @@ class ScratchWriter:
         self.all_blocks = {}
 
         blocks = {}
-        for stmt in sprite.statements:
+        for index, stmt in enumerate(sprite.statements):
             block_dict = self.write_statement(stmt, None)
             blocks.update(block_dict)
+            # 顶层脚本（事件帽子/自制积木定义）必须带 topLevel 与坐标，
+            # 否则 Scratch/TurboWarp 会把它们当成孤儿块不显示。
+            top_id = next((bid for bid, data in block_dict.items()
+                           if data.get("topLevel")), None)
+            if top_id:
+                block_dict[top_id]["x"] = 50 + (index % 2) * 560
+                block_dict[top_id]["y"] = 50 + (index // 2) * 420
         # 合并子堆栈中创建的块
         blocks.update(self.all_blocks)
 
@@ -783,6 +790,8 @@ class ScratchWriter:
                 block_data["inputs"]["VALUE"] = self.write_any_input(stmt.value)
 
         elif stmt.type == BlockType.PROCEDURE_DEFINE:
+            # 自定义积木定义是独立的顶层脚本，必须有 topLevel/坐标
+            block_data["topLevel"] = True
             proc_name = stmt.extra.get('name', 'procedure')
             arg_names = stmt.extra.get('args', [])
             arg_types = list(stmt.extra.get('arg_types') or [])

@@ -2187,6 +2187,12 @@ print("fib", x)
                      'procedures_call', 'control_repeat_until', 'looks_say'):
         assert expected in opcodes, f"缺少积木: {expected}"
     assert not project.warnings, f"简单脚本不应有未支持特性: {project.warnings}"
+    definitions = [block for target in data['targets']
+                   for block in target['blocks'].values()
+                   if block['opcode'] == 'procedures_definition']
+    assert definitions, "必须生成自制积木定义"
+    assert all(block.get('topLevel') and block.get('x') is not None
+               for block in definitions), "自制积木定义必须是带坐标的顶层脚本"
     print("  [PASS] 通用Python转换通过")
     return True
 
