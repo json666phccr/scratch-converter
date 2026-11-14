@@ -1,6 +1,6 @@
 # Scratch 3.0 <-> Python 双向转换器
 
-> 版本 **0.7.0** · [MIT License](LICENSE)
+> 版本 **0.8.0** · [MIT License](LICENSE)
 
 一个强大的 Scratch 3.0 与 Python 之间的双向转换工具，支持**一比一对应**的转换，同时支持高级 Python 语法。
 
@@ -105,27 +105,40 @@ converter.python_to_scratch('script.py', 'project.sb3', mode='general')
 | `while cond:` | `重复执行直到 <not cond>` |
 | `for i in range(...)` | `重复执行 N 次` + 维护循环变量 |
 | `for x in 列表:` | `重复执行 (列表长度) 次` + `第 n 项` |
+| `for ch in "abc":` / `for ch in 文本:` | `重复执行 (字符数) 次` + `第 n 个字符` |
+| `for i, v in enumerate(...)` | 循环计数器同时写入下标变量（0 起始） |
 | `x = 1` / `x += 1` | `将 x 设为` / `将 x 增加` |
 | `nums = [1,2,3]` | 创建列表并写入初值 |
+| `alias = nums` | 逐项复制（保持 Python 的拷贝语义） |
 | `nums.append(x)` / `insert` / `clear` | 列表添加 / 插入 / 删除全部 |
+| `nums.pop()` / `pop(i)` | 读取后删除，结果写入临时变量 |
+| `nums.index(x)` / `count(x)` / `remove(x)` | 顺序查找（`index` 未找到返回 -1） |
+| `nums.reverse()` / `sort()` | 交换循环 / 冒泡排序 |
 | `nums[i]` / `nums[i] = x` | 自动把 0 起始下标转换为 Scratch 的 1 起始 |
 | `del nums[i]` | 删除列表第 i 项 |
 | `a = b = 0` | 连续赋值（右侧只求值一次） |
-| `a -= x` / `*= x` / `/= x` / `//= x` / `%= x` | 增加/设值 + 对应运算 |
+| `a, b = b, a` | 临时变量解构交换 |
+| `a -= x` / `*= x` / `/= x` / `//= x` / `%= x` / `**= x` | 增加/设值 + 对应运算 |
+| `a ** b` | 小整数指数展开成乘法，其余按 `e^(b·ln a)` 计算 |
+| `min/max(a, b)` / `min/max(列表)` / `sum(列表)` | 数学公式或遍历归并 |
+| `"sep".join(列表)` | 循环使用连接积木拼接 |
 | `0 < a <= 3` 链式比较 | `与` 组合的多个比较 |
 | `x in nums` / `x not in nums` | 列表包含 / 不包含 |
+| `"ell" in "hello"` | `包含` 积木（字符串包含） |
 | `f"count={count}"` | 连接积木（忽略格式说明） |
-| `"a=" + str(a)` | 字符串拼接自动使用连接 |
+| `"a=" + str(a)` / `s += ch` | 含字符串操作数的 `+` 自动使用连接 |
 | `a // b` | `floor(a / b)` |
 | `range(a, b, step)` | 支持动态起止与步长 |
 | `break` / `continue` | 循环标志变量 + 条件包裹，立即跳出/进入下一轮 |
 | `print(...)` | 说话 |
 | `input(...)` | 询问并等待，返回回答 |
+| `math.pi` / `math.e` / `math.tau` | 直接写入常量值 |
 
 自动生成一个蓝色 `Py` 造型和一个白色背景，项目可直接用 Scratch 打开。
 
 **通用模式限制**：类、异常、生成器、装饰器、多返回值、
-`match`、文件/网络等不支持；遇到时会在命令行打印“转换报告”，
+`match`、`sorted`、大部分字符串方法（`upper/lower/strip/replace/split` 等）、
+文件/网络等不支持；遇到时会在命令行打印“转换报告”，
 并把这些特性记录到 `ProjectIR.warnings`，不会静默改变语义。
 
 ## 转换映射表

@@ -2286,6 +2286,114 @@ print(nums, total, count)
     return True
 
 
+def test_general_python_builtins_and_methods():
+    """通用模式：**、min/max/sum、列表方法、join、enumerate/字符串循环、列表拷贝"""
+    print("[测试42] 通用Python内置函数与列表方法")
+    from general_python import parse_general_project
+
+    code = '''
+nums = [3, 1, 4, 1, 5]
+total = sum(nums)
+lo = min(nums)
+hi = max(nums)
+low2 = min(3, 8)
+high2 = max(3, 8)
+nums.sort()
+sorted_first = nums[0]
+nums.reverse()
+reversed_first = nums[0]
+last = nums.pop()
+idx = nums.index(4)
+cnt = nums.count(4)
+nums.remove(1)
+remaining = len(nums)
+power = 2 ** 5
+power2 = 3 ** 2
+mod_power = 2
+mod_power **= 3
+b = [10, 20, 30]
+joined = "-".join(b)
+has_ell = "ell" in "hello"
+no_z = "z" not in "hello"
+pi_part = math.pi
+count = 0
+for i, v in enumerate(b):
+    count += i * v
+chars = []
+for ch in "abc":
+    chars.append(ch)
+indexes = []
+for i, ch in enumerate("xy"):
+    indexes.append(i)
+alias = b
+alias_lo = min(alias)
+text = "abc"
+out = ""
+for ch in text:
+    if ch == "b":
+        continue
+    out = out + ch
+x, y = 1, 2
+x, y = y, x
+print("done")
+'''
+    project = parse_general_project(code, 'BatchTest')
+    assert not project.warnings, f"不应有未支持特性: {project.warnings}"
+
+    data = write_scratch_project(project)
+    opcodes = {}
+    for target in data['targets']:
+        for block in target['blocks'].values():
+            opcodes[block['opcode']] = opcodes.get(block['opcode'], 0) + 1
+    for expected in ('operator_mathop', 'operator_contains', 'operator_join',
+                     'data_itemoflist', 'data_replaceitemoflist',
+                     'data_deleteoflist', 'data_lengthoflist',
+                     'data_addtolist', 'control_repeat_until'):
+        assert expected in opcodes, f"缺少积木: {expected}"
+
+    # 端到端：sb3 -> Python -> pygame 运行时，验证真实执行结果
+    exec_code = generate_python(parse_scratch_project(data))
+    namespace = {}
+    exec(compile(exec_code, "<generated>", "exec"), namespace)
+
+    import time
+    runtime = namespace["ScratchRuntime"](headless=True, audio=False)
+    sprite = namespace["BatchTest"]()
+    runtime.add_sprite(sprite)
+    try:
+        runtime.start(max_frames=4)
+        time.sleep(0.2)
+        expected_values = {
+            'total': 14, 'lo': 1, 'hi': 5, 'low2': 3, 'high2': 8,
+            'sorted_first': 1, 'reversed_first': 5, 'last': 1, 'idx': 2,
+            'cnt': 1, 'remaining': 3, 'power': 32, 'power2': 9,
+            'mod_power': 8, 'count': 80, 'alias_lo': 10, 'x': 2, 'y': 1,
+        }
+        for name, expected in expected_values.items():
+            actual = getattr(sprite, name)
+            assert float(actual) == float(expected), \
+                f"{name}: 期望 {expected}, 实际 {actual}"
+        assert str(sprite.joined) == '10-20-30', \
+            f"join 结果不正确: {sprite.joined}"
+        assert str(sprite.out) == 'ac', \
+            f"字符串变量累加应为拼接: {sprite.out!r}"
+        assert bool(sprite.has_ell) is True, "字符串包含应成立"
+        assert bool(sprite.no_z) is True, "字符串不包含应成立"
+        assert abs(float(sprite.pi_part) - math.pi) < 1e-9, "math.pi 应保真"
+        assert list(sprite.chars) == ['a', 'b', 'c'], "字符串遍历结果不正确"
+        assert [float(v) for v in sprite.indexes] == [0.0, 1.0], \
+            "enumerate 下标应从 0 开始"
+        assert [float(v) for v in sprite.nums] == [5.0, 4.0, 3.0], \
+            "sort/reverse/pop/remove 后的列表不正确"
+        assert [float(v) for v in sprite.alias] == [10.0, 20.0, 30.0], \
+            "列表拷贝不应共享内容"
+    finally:
+        runtime.shutdown()
+
+    print("  [PASS] 通用Python内置函数与列表方法通过")
+    return True
+
+
 def main():
     """运行所有测试"""
     print("=" * 60)
@@ -2334,6 +2442,7 @@ def main():
         test_general_python_mode,
         test_general_python_more_syntax,
         test_general_python_break_continue,
+        test_general_python_builtins_and_methods,
     ]
     
     passed = 0
