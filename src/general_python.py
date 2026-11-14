@@ -25,6 +25,7 @@ from ir import (
     BlockType, ExprType, Expr, Statement, ProjectIR, SpriteIR,
     make_number, make_string, make_boolean, make_variable,
     make_binary_op, make_list_access,
+
 )
 from python_parser import PythonParser
 
@@ -388,22 +389,17 @@ class GeneralPythonParser(PythonParser):
             else:
                 count = make_binary_op('-', self._parse_expr_to_ir(args[1]), start)
         elif len(args) == 3:
-            if any(value is None for value in values):
-                self.warn('range 动态步长')
-                return None
-            start_value, stop_value, step_value = values
-            if step_value == 0:
+            # 支持动态起止和步长：次数 = ceil((stop - start) / step)
+            if values[2] == 0:
                 self.warn('range 步长为0')
                 return None
-            if step_value > 0:
-                count_value = max(0, (stop_value - start_value + step_value - 1)
-                                  // step_value)
-            else:
-                count_value = max(0, (start_value - stop_value - step_value - 1)
-                                  // (-step_value))
-            start = make_number(start_value)
-            step = make_number(step_value)
-            count = make_number(count_value)
+            start = self._parse_expr_to_ir(args[0])
+            stop = self._parse_expr_to_ir(args[1])
+            step = self._parse_expr_to_ir(args[2])
+            count = Expr(
+                ExprType.CEILING,
+                right=make_binary_op(
+                    '/', make_binary_op('-', stop, start), step))
         else:
             self.warn('range 参数数量')
             return None
@@ -439,9 +435,20 @@ class GeneralPythonParser(PythonParser):
         return init
 
     def _parse_assignment(self, node: ast.Assign) -> Optional[Statement]:
-        if len(node.targets) != 1:
-            self.warn('链式赋值')
-            return None
+        if len(node.targets) > 1:
+            # a = b = 0：右侧只求值一次，再依次赋值
+            if not all(isinstance(item, ast.Name) for item in node.targets):
+                self.warn('链式解构赋值')
+                return None
+            value = self._parse_expr_to_ir(node.value)
+            statements = [
+                Statement(type=BlockType.SET_VARIABLE,
+                          extra={'name': item.id}, value=value)
+                for item in node.targets
+            ]
+            for current, following in zip(statements, statements[1:]):
+                current.next = following
+            return statements[0]
         target = node.targets[0]
 
         # 列表字面量：nums = [1, 2, 3]
@@ -470,6 +477,30 @@ class GeneralPythonParser(PythonParser):
         return super()._parse_assignment(node)
 
     def _parse_aug_assignment(self, node: ast.AugAssign) -> Optional[Statement]:
+        if isinstance(node.target, ast.Name):
+            name = node.target.id
+            value = self._parse_expr_to_ir(node.value)
+            if isinstance(node.op, ast.Add):
+                return Statement(type=BlockType.CHANGE_VARIABLE,
+                                 extra={'name': name}, value=value)
+            if isinstance(node.op, ast.Sub):
+                return Statement(type=BlockType.CHANGE_VARIABLE,
+                                 extra={'name': name},
+                                 value=make_binary_op('-', make_number(0), value))
+            if isinstance(node.op, ast.Mult):
+                item = make_binary_op('*', make_variable(name), value)
+            elif isinstance(node.op, ast.Div):
+                item = make_binary_op('/', make_variable(name), value)
+            elif isinstance(node.op, ast.FloorDiv):
+                item = Expr(ExprType.FLOOR, right=make_binary_op(
+                    '/', make_variable(name), value))
+            elif isinstance(node.op, ast.Mod):
+                item = Expr(ExprType.MOD, left=make_variable(name), right=value)
+            else:
+                self.warn('复合赋值运算符')
+                return None
+            return Statement(type=BlockType.SET_VARIABLE,
+                             extra={'name': name}, value=item)
         if isinstance(node.target, ast.Subscript) and isinstance(node.target.value, ast.Name):
             list_name = node.target.value.id
             self._ensure_list(list_name)
@@ -553,9 +584,42 @@ class GeneralPythonParser(PythonParser):
         return value
 
     def _parse_expr_to_ir(self, node: ast.AST) -> Expr:
-        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow):
-            self.warn('幂运算 **')
-            return make_number(0)
+        if isinstance(node, ast.JoinedStr):
+            return self._joined_str(node)
+
+        if isinstance(node, ast.BinOp):
+            if isinstance(node.op, ast.Pow):
+                self.warn('幂运算 **')
+                return make_number(0)
+            if isinstance(node.op, ast.FloorDiv):
+                # Python // -> floor(a / b)
+                return Expr(ExprType.FLOOR, right=make_binary_op(
+                    '/', self._parse_expr_to_ir(node.left),
+                    self._parse_expr_to_ir(node.right)))
+            if isinstance(node.op, ast.Add):
+                left_str = isinstance(node.left, ast.Constant) \
+                    and isinstance(node.left.value, str)
+                right_str = isinstance(node.right, ast.Constant) \
+                    and isinstance(node.right.value, str)
+                if left_str or right_str:
+                    return Expr(ExprType.JOIN,
+                                left=self._parse_expr_to_ir(node.left),
+                                right=self._parse_expr_to_ir(node.right))
+
+        if isinstance(node, ast.Compare):
+            if len(node.ops) > 1:
+                parts = []
+                left_node = node.left
+                for operator, comparator in zip(node.ops, node.comparators):
+                    parts.append(self._compare_node(operator, left_node, comparator))
+                    left_node = comparator
+                result = parts[0]
+                for part in parts[1:]:
+                    result = Expr(ExprType.AND, left=result, right=part)
+                return result
+            if isinstance(node.ops[0], (ast.In, ast.NotIn)):
+                return self._compare_node(node.ops[0], node.left, node.comparators[0])
+
         if isinstance(node, ast.Call):
             return self._parse_call_expr(node)
 
@@ -570,6 +634,66 @@ class GeneralPythonParser(PythonParser):
             return make_string('')
 
         return super()._parse_expr_to_ir(node)
+
+    def _joined_str(self, node: ast.JoinedStr) -> Expr:
+        """f-string -> 连接积木（忽略格式说明）"""
+        parts: List[Expr] = []
+        for value in node.values:
+            if isinstance(value, ast.Constant):
+                parts.append(make_string(str(value.value)))
+            elif isinstance(value, ast.FormattedValue):
+                if value.format_spec is not None:
+                    self.warn('f-string 格式说明')
+                parts.append(self._parse_expr_to_ir(value.value))
+            else:
+                self.warn('f-string')
+        if not parts:
+            return make_string('')
+        result = parts[0]
+        for part in parts[1:]:
+            result = Expr(ExprType.JOIN, left=result, right=part)
+        return result
+
+    def _compare_node(self, operator: ast.cmpop, left_node: ast.expr,
+                      right_node: ast.expr) -> Expr:
+        left = self._parse_expr_to_ir(left_node)
+        right = self._parse_expr_to_ir(right_node)
+        if isinstance(operator, (ast.In, ast.NotIn)):
+            if isinstance(right_node, ast.Name) and self._is_list(right_node.id):
+                contains = Expr(ExprType.LIST_CONTAINS, name=right_node.id, left=left)
+                return Expr(ExprType.NOT, right=contains) \
+                    if isinstance(operator, ast.NotIn) else contains
+            self.warn('in 非列表')
+            return make_boolean(False)
+        if isinstance(operator, ast.Lt):
+            return Expr(ExprType.LESS_THAN, left=left, right=right)
+        if isinstance(operator, ast.LtE):
+            return Expr(ExprType.NOT, right=Expr(
+                ExprType.GREATER_THAN, left=left, right=right))
+        if isinstance(operator, ast.Gt):
+            return Expr(ExprType.GREATER_THAN, left=left, right=right)
+        if isinstance(operator, ast.GtE):
+            return Expr(ExprType.NOT, right=Expr(
+                ExprType.LESS_THAN, left=left, right=right))
+        if isinstance(operator, (ast.Eq, ast.Is)):
+            return Expr(ExprType.EQUAL, left=left, right=right)
+        if isinstance(operator, (ast.NotEq, ast.IsNot)):
+            return Expr(ExprType.NOT, right=Expr(
+                ExprType.EQUAL, left=left, right=right))
+        self.warn('比较运算符')
+        return make_boolean(False)
+
+    def _parse_delete(self, node: ast.Delete) -> Optional[Statement]:
+        if len(node.targets) == 1 and isinstance(node.targets[0], ast.Subscript) \
+                and isinstance(node.targets[0].value, ast.Name):
+            list_name = node.targets[0].value.id
+            self._ensure_list(list_name)
+            index = self._py_index(
+                self._parse_expr_to_ir(node.targets[0].slice))
+            return Statement(type=BlockType.DELETE_FROM_LIST, value=index,
+                             extra={'name': list_name})
+        self.warn('del 非列表下标')
+        return None
 
     def _parse_call_expr(self, node: ast.Call) -> Expr:
         func = node.func

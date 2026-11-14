@@ -2197,6 +2197,47 @@ print("fib", x)
     return True
 
 
+def test_general_python_more_syntax():
+    print("[测试40] 通用Python更多语法")
+    from general_python import parse_general_project
+
+    code = '''
+a = b = 2
+a -= 1
+a *= 3
+a //= 2
+a %= 2
+nums = [1, 2, 3, 4]
+del nums[0]
+nums[0] = 20
+count = 0
+for i in range(0, 6, 2):
+    count += i
+n = 10
+total = 0
+for i in range(0, n, 3):
+    total += i
+print(f"count={count}, total={total}")
+print("a=" + str(a))
+print("in list:", 20 in nums, 99 not in nums)
+print("chain:", 0 < a <= 3)
+'''
+    project = parse_general_project(code, 'SyntaxTest')
+    assert not project.warnings, f"不应有未支持特性: {project.warnings}"
+    data = write_scratch_project(project)
+    opcodes = {}
+    for target in data['targets']:
+        for block in target['blocks'].values():
+            opcodes[block['opcode']] = opcodes.get(block['opcode'], 0) + 1
+    for expected in ('operator_mod', 'operator_mathop',
+                     'data_deleteoflist', 'data_listcontainsitem',
+                     'operator_and', 'operator_join'):
+        assert expected in opcodes, f"缺少积木: {expected}"
+    assert opcodes.get('data_setvariableto', 0) >= 3, "链式赋值应生成多个设为块"
+    print("  [PASS] 通用Python更多语法通过")
+    return True
+
+
 def main():
     """运行所有测试"""
     print("=" * 60)
@@ -2243,6 +2284,7 @@ def main():
         test_turbowarp_options_and_rotation_center,
         test_list_out_of_range_reads,
         test_general_python_mode,
+        test_general_python_more_syntax,
     ]
     
     passed = 0

@@ -1,6 +1,6 @@
 # Scratch 3.0 <-> Python 双向转换器
 
-> 版本 **0.5.2** · [MIT License](LICENSE)
+> 版本 **0.6.0** · [MIT License](LICENSE)
 
 一个强大的 Scratch 3.0 与 Python 之间的双向转换工具，支持**一比一对应**的转换，同时支持高级 Python 语法。
 
@@ -109,6 +109,15 @@ converter.python_to_scratch('script.py', 'project.sb3', mode='general')
 | `nums = [1,2,3]` | 创建列表并写入初值 |
 | `nums.append(x)` / `insert` / `clear` | 列表添加 / 插入 / 删除全部 |
 | `nums[i]` / `nums[i] = x` | 自动把 0 起始下标转换为 Scratch 的 1 起始 |
+| `del nums[i]` | 删除列表第 i 项 |
+| `a = b = 0` | 连续赋值（右侧只求值一次） |
+| `a -= x` / `*= x` / `/= x` / `//= x` / `%= x` | 增加/设值 + 对应运算 |
+| `0 < a <= 3` 链式比较 | `与` 组合的多个比较 |
+| `x in nums` / `x not in nums` | 列表包含 / 不包含 |
+| `f"count={count}"` | 连接积木（忽略格式说明） |
+| `"a=" + str(a)` | 字符串拼接自动使用连接 |
+| `a // b` | `floor(a / b)` |
+| `range(a, b, step)` | 支持动态起止与步长 |
 | `print(...)` | 说话 |
 | `input(...)` | 询问并等待，返回回答 |
 
