@@ -960,6 +960,9 @@ class PythonParser:
                 ast.Mult: '*', ast.Div: '/',
                 ast.Mod: '%', ast.Pow: '**',
             }
+            if isinstance(node.op, ast.Mod):
+                # Scratch 有独立的“余数”积木
+                return Expr(ExprType.MOD, left=left, right=right)
             op = op_map.get(type(node.op), '+')
             return make_binary_op(op, left, right)
 
@@ -981,11 +984,15 @@ class PythonParser:
                 if isinstance(op, ast.Lt):
                     return Expr(ExprType.LESS_THAN, left=left, right=right)
                 elif isinstance(op, ast.LtE):
-                    return Expr(ExprType.LESS_THAN, left=left, right=right)
+                    # Scratch 没有 <=，用 not (a > b) 保持语义
+                    return Expr(ExprType.NOT, right=Expr(
+                        ExprType.GREATER_THAN, left=left, right=right))
                 elif isinstance(op, ast.Gt):
                     return Expr(ExprType.GREATER_THAN, left=left, right=right)
                 elif isinstance(op, ast.GtE):
-                    return Expr(ExprType.GREATER_THAN, left=left, right=right)
+                    # Scratch 没有 >=，用 not (a < b) 保持语义
+                    return Expr(ExprType.NOT, right=Expr(
+                        ExprType.LESS_THAN, left=left, right=right))
                 elif isinstance(op, ast.Eq):
                     return Expr(ExprType.EQUAL, left=left, right=right)
                 elif isinstance(op, ast.NotEq):

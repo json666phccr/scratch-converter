@@ -1,6 +1,6 @@
 # Scratch 3.0 <-> Python 双向转换器
 
-> 版本 **0.5.0** · [MIT License](LICENSE)
+> 版本 **0.5.1** · [MIT License](LICENSE)
 
 一个强大的 Scratch 3.0 与 Python 之间的双向转换工具，支持**一比一对应**的转换，同时支持高级 Python 语法。
 
@@ -304,6 +304,15 @@ pip install pygame
 python converter.py scratch2py example/SAC-轻量级编程语言\(Alpha-0.2.0\).sb3
 python example/SAC-轻量级编程语言\(Alpha-0.2.0\).py
 ```
+
+通用 Python 模式的完整示例：
+
+```bash
+python converter.py py2scratch example/general_demo.py example/general_demo.sb3 --mode general
+```
+
+`example/general_demo.py` 演示了变量、列表、for/while、if、列表统计、函数与返回值、
+`print` 输出和取余运算；转换结果 `example/general_demo.sb3` 可直接用 Scratch 打开运行。
 
 - 程序会打开舞台窗口，绿旗脚本在后台线程中逐帧执行。
 - 启动时窗口自动最大化，舞台按宽高比缩放到窗口的最大可用区域，多余部分补黑边，类似 Scratch 舞台放大到最大时的行为；最大化后仍可自由拉伸窗口，舞台会实时重新适配。鼠标坐标始终换算回舞台逻辑坐标，点击/拖动不受缩放影响。使用 `--windowed` 可以普通窗口尺寸启动。

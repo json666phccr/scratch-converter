@@ -112,7 +112,11 @@ def _sc_bool(value):
 def _sc_number_or_nan(value):
     cls = value.__class__
     if cls is int:
-        return float(value)
+        try:
+            return float(value)
+        except OverflowError:
+            # Scratch 使用双精度，超大整数视为无穷
+            return math.inf if value > 0 else -math.inf
     if cls is float:
         return value
     if _sc_is_white(value):

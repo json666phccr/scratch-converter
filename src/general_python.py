@@ -553,6 +553,9 @@ class GeneralPythonParser(PythonParser):
         return value
 
     def _parse_expr_to_ir(self, node: ast.AST) -> Expr:
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow):
+            self.warn('幂运算 **')
+            return make_number(0)
         if isinstance(node, ast.Call):
             return self._parse_call_expr(node)
 

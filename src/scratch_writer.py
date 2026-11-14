@@ -1015,6 +1015,7 @@ class ScratchWriter:
                 '-': 'operator_subtract',
                 '*': 'operator_multiply',
                 '/': 'operator_divide',
+                '%': 'operator_mod',
             }
             block_data["opcode"] = op_map.get(expr.name, 'operator_add')
             block_data["inputs"]["NUM1"] = self.write_any_input(expr.left)
