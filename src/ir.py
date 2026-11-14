@@ -847,6 +847,8 @@ class ProjectIR:
     warnings: Dict[str, int] = field(default_factory=dict)
     monitors: List[Dict[str, Any]] = field(default_factory=list)
     runtime_options: Dict[str, Any] = field(default_factory=dict)
+    # 需要随 .sb3 一起写入的额外资源（文件名 -> 字节内容）
+    assets: Dict[str, bytes] = field(default_factory=dict)
 
     def add_sprite(self, sprite: SpriteIR):
         self.sprites.append(sprite)

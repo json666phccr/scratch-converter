@@ -2144,6 +2144,53 @@ def test_list_out_of_range_reads():
     return True
 
 
+def test_general_python_mode():
+    print("[测试39] 通用Python -> Scratch")
+    from general_python import parse_general_project
+
+    code = '''
+total = 0
+nums = [1, 2, 3, 4]
+for n in nums:
+    total += n
+print("sum", total)
+
+def fib(n):
+    a = 0
+    b = 1
+    i = 0
+    while i < n:
+        t = a + b
+        a = b
+        b = t
+        i += 1
+    return a
+
+x = fib(6)
+print("fib", x)
+'''
+    project = parse_general_project(code, 'PyTest')
+    assert project.sprites[0].is_stage, "通用模式必须生成舞台"
+    assert project.assets, "必须输出默认造型资源"
+    sprite = [item for item in project.sprites if not item.is_stage][0]
+    assert sprite.costumes, "精灵必须有默认造型"
+
+    data = write_scratch_project(project)
+    assert data['targets'][0]['isStage']
+    opcodes = {}
+    for target in data['targets']:
+        for block in target['blocks'].values():
+            opcodes[block['opcode']] = opcodes.get(block['opcode'], 0) + 1
+    for expected in ('event_whenflagclicked', 'control_repeat',
+                     'data_lengthoflist', 'data_itemoflist',
+                     'data_changevariableby', 'procedures_definition',
+                     'procedures_call', 'control_repeat_until', 'looks_say'):
+        assert expected in opcodes, f"缺少积木: {expected}"
+    assert not project.warnings, f"简单脚本不应有未支持特性: {project.warnings}"
+    print("  [PASS] 通用Python转换通过")
+    return True
+
+
 def main():
     """运行所有测试"""
     print("=" * 60)
@@ -2189,6 +2236,7 @@ def main():
         test_effects_monitors_and_mask_touching,
         test_turbowarp_options_and_rotation_center,
         test_list_out_of_range_reads,
+        test_general_python_mode,
     ]
     
     passed = 0

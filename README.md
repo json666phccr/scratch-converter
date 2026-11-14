@@ -1,6 +1,6 @@
 # Scratch 3.0 <-> Python 双向转换器
 
-> 版本 **0.4.3** · [MIT License](LICENSE)
+> 版本 **0.5.0** · [MIT License](LICENSE)
 
 一个强大的 Scratch 3.0 与 Python 之间的双向转换工具，支持**一比一对应**的转换，同时支持高级 Python 语法。
 
@@ -14,6 +14,7 @@
 - **变量保持**: Scratch变量 -> Python实例变量
 - **列表保持**: Scratch列表 -> Python列表
 - **自制积木**: Scratch自制积木 -> Python类方法
+- **两种 Python -> Scratch 模式**: DSL 模式保证高保真往返；通用模式可转换普通 Python 脚本（实验性）
 
 ## 架构
 
@@ -30,7 +31,8 @@ Scratch JSON  <--->  中间表示(IR)  <--->  Python 代码
 | `scratch_parser.py` | Scratch JSON -> IR 解析器 |
 | `scratch_writer.py` | IR -> Scratch JSON 写入器 |
 | `python_generator.py` | IR -> Python 代码生成器 |
-| `python_parser.py` | Python 代码 -> IR 解析器 |
+| `python_parser.py` | Python DSL -> IR 解析器（高保真） |
+| `general_python.py` | 通用 Python -> IR 解析器（实验性） |
 | `converter.py` | 主转换器入口 |
 
 ## 使用方法
@@ -41,8 +43,12 @@ Scratch JSON  <--->  中间表示(IR)  <--->  Python 代码
 # Scratch -> Python
 python converter.py scratch2py input.sb3 output.py
 
-# Python -> Scratch
+# Python -> Scratch（自动识别 DSL / 通用脚本）
 python converter.py py2scratch input.py output.sb3
+
+# 指定模式：dsl（本转换器生成的代码，高保真）或 general（任意普通Python脚本）
+python converter.py py2scratch input.py output.sb3 --mode dsl
+python converter.py py2scratch input.py output.sb3 --mode general
 
 # 往返测试 (Scratch -> Python -> Scratch)
 python converter.py roundtrip-sb3 input.sb3 output.sb3
@@ -72,7 +78,45 @@ ir = converter.scratch_json_to_python(scratch_json_dict)
 
 # Python代码字符串 -> Scratch JSON
 scratch_json = converter.python_code_to_scratch_json(python_code_string)
+
+# 指定模式（auto / dsl / general）
+converter.python_to_scratch('script.py', 'project.sb3', mode='general')
 ```
+
+## 两种 Python -> Scratch 模式
+
+### DSL 模式（默认自动识别，高保真）
+
+输入是本转换器生成的 Python（包含 `ScratchSprite` 类、`when_green_flag`、
+`@_as_procedure` 等标记）时自动使用。会解析文件中的所有角色类，
+按原顺序生成舞台与多个角色，并完整恢复变量、列表、造型、广播、
+自制积木与事件脚本，适合 Scratch -> Python -> Scratch 往返。
+
+### 通用模式（实验性）
+
+输入是普通 Python 脚本时使用（也可用 `--mode general` 强制）。
+转换器会把常见语法翻译成 Scratch 积木：
+
+| Python | Scratch |
+|--------|---------|
+| 顶层语句 | 绿旗脚本 |
+| `def f(a):` + `return x` | 自制积木，返回值写入 `__py_ret_f` 变量 |
+| `if / elif / else` | `如果…否则` |
+| `while cond:` | `重复执行直到 <not cond>` |
+| `for i in range(...)` | `重复执行 N 次` + 维护循环变量 |
+| `for x in 列表:` | `重复执行 (列表长度) 次` + `第 n 项` |
+| `x = 1` / `x += 1` | `将 x 设为` / `将 x 增加` |
+| `nums = [1,2,3]` | 创建列表并写入初值 |
+| `nums.append(x)` / `insert` / `clear` | 列表添加 / 插入 / 删除全部 |
+| `nums[i]` / `nums[i] = x` | 自动把 0 起始下标转换为 Scratch 的 1 起始 |
+| `print(...)` | 说话 |
+| `input(...)` | 询问并等待，返回回答 |
+
+自动生成一个蓝色 `Py` 造型和一个白色背景，项目可直接用 Scratch 打开。
+
+**通用模式限制**：类、异常、生成器、装饰器、多返回值、`break/continue`、
+`match`、文件/网络等不支持；遇到时会在命令行打印“转换报告”，
+并把这些特性记录到 `ProjectIR.warnings`，不会静默改变语义。
 
 ## 转换映射表
 

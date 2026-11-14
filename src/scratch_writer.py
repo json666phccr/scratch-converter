@@ -848,6 +848,9 @@ class ScratchWriter:
                 first_id = list(body_blocks.keys())[0]
                 if first_body_id is None:
                     first_body_id = first_id
+                # 把上一条函数体语句接到这一条上（definition本身稍后单独设置next）
+                if prev_id != block_id and prev_id in blocks:
+                    blocks[prev_id]["next"] = first_id
                 prev_id = self._chain_tail(first_id, body_blocks)
             if first_body_id:
                 block_data["next"] = first_body_id

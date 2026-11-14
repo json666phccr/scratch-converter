@@ -25,9 +25,11 @@ from ir import ProjectIR, SpriteIR
 from scratch_parser import load_scratch_file, parse_scratch_project
 from scratch_writer import write_scratch_project, save_scratch_file
 from python_generator import generate_python, save_python
-from python_parser import parse_python_code, parse_python_file, python_to_project
+from python_parser import (parse_python_code, parse_python_file,
+                           python_to_project, PythonParser)
+from general_python import parse_general_project
 
-__version__ = "0.4.3"
+__version__ = "0.5.0"
 
 
 class ScratchConverter:
@@ -73,33 +75,92 @@ class ScratchConverter:
         print(f"[转换完成] Python代码共 {len(python_code.splitlines())} 行")
         return python_code
 
-    def python_to_scratch(self, py_path: str, sb3_path: Optional[str] = None) -> dict:
+    @staticmethod
+    def _parse_dsl_project(code: str):
+        """DSL 模式：解析文件中所有 ScratchSprite 子类，保留多精灵项目"""
+        import ast as _ast
+        class_names = []
+        try:
+            tree = _ast.parse(code)
+            for node in tree.body:
+                if isinstance(node, _ast.ClassDef) and any(
+                        isinstance(base, _ast.Name) and base.id == 'ScratchSprite'
+                        for base in node.bases):
+                    class_names.append(node.name)
+        except SyntaxError:
+            class_names = []
+
+        project = ProjectIR()
+        if not class_names:
+            project.add_sprite(parse_python_code(code, 'Sprite'))
+            return project
+        for name in class_names:
+            parser = PythonParser()
+            sprite = parser.parse_code(code, name)
+            if name == 'Stage':
+                sprite.is_stage = True
+                sprite.variables.pop('is_stage', None)
+            project.add_sprite(sprite)
+        return project
+
+    @staticmethod
+    def _detect_python_mode(code: str) -> str:
+        """判断输入是转换器DSL还是普通Python脚本"""
+        markers = ('ScratchSprite', '@_as_procedure', 'when_green_flag',
+                   'when_clicked', 'when_clone_starts', 'def when_')
+        if any(marker in code for marker in markers):
+            return 'dsl'
+        return 'general'
+
+    def python_to_scratch(self, py_path: str, sb3_path: Optional[str] = None,
+                          mode: str = 'auto') -> dict:
         """
         将Python代码转换为Scratch项目
 
         Args:
             py_path: .py文件路径
             sb3_path: 输出.sb3文件路径(可选)
+            mode: 'auto' | 'dsl' | 'general'
+                - dsl: 本转换器生成的Scratch DSL（默认自动识别，准确率最高）
+                - general: 通用Python脚本（支持常见语法，复杂特性会记录到转换报告）
 
         Returns:
             Scratch项目JSON字典
         """
         print(f"[Python -> Scratch] 正在转换: {py_path}")
 
+        with open(py_path, 'r', encoding='utf-8') as f:
+            code = f.read()
+        if mode == 'auto':
+            mode = self._detect_python_mode(code)
+        if mode not in ('dsl', 'general'):
+            raise ValueError(f"未知转换模式: {mode}")
+
         # 1. 解析Python代码为IR
-        sprite = parse_python_file(py_path)
-        project = python_to_project(sprite)
+        if mode == 'general':
+            sprite_name = os.path.splitext(os.path.basename(py_path))[0] or 'Python'
+            project = parse_general_project(code, sprite_name)
+            print(f"  解析模式: 通用Python（实验性）")
+        else:
+            project = self._parse_dsl_project(code)
+            print(f"  解析模式: Scratch DSL")
+        sprite = next((item for item in project.sprites if not item.is_stage),
+                      project.sprites[0])
         print(f"  解析完成: 精灵 '{sprite.name}'")
+        if project.warnings:
+            summary = ', '.join(f"{name}×{count}"
+                                for name, count in project.warnings.items())
+            print(f"  转换报告（以下特性未完整支持）: {summary}")
 
         # 2. 转换为Scratch JSON
         scratch_json = write_scratch_project(project)
 
         # 3. 保存到文件
         if sb3_path:
-            self._write_sb3(scratch_json, sb3_path)
+            self._write_sb3(scratch_json, sb3_path, project.assets)
             print(f"  Scratch项目已保存: {sb3_path}")
 
-        print(f"[转换完成] Scratch项目")
+        print(f"[转换完成] Scratch项目（{mode} 模式）")
         return scratch_json
 
     def scratch_json_to_python(self, json_data: dict) -> str:
@@ -107,10 +168,15 @@ class ScratchConverter:
         ir = parse_scratch_project(json_data)
         return generate_python(ir)
 
-    def python_code_to_scratch_json(self, code: str, sprite_name: str = "Sprite") -> dict:
+    def python_code_to_scratch_json(self, code: str, sprite_name: str = "Sprite",
+                                    mode: str = 'auto') -> dict:
         """从Python代码字符串生成Scratch JSON"""
-        sprite = parse_python_code(code, sprite_name)
-        project = python_to_project(sprite)
+        if mode == 'auto':
+            mode = self._detect_python_mode(code)
+        if mode == 'general':
+            project = parse_general_project(code, sprite_name)
+        else:
+            project = self._parse_dsl_project(code)
         return write_scratch_project(project)
 
     def roundtrip_scratch(self, sb3_path: str, output_sb3_path: str) -> dict:
@@ -218,15 +284,19 @@ class ScratchConverter:
                             return json.load(f)
                 raise ValueError(f"在 {sb3_path} 中找不到 project.json")
 
-    def _write_sb3(self, scratch_json: dict, sb3_path: str):
-        """写入.sb3文件"""
+    def _write_sb3(self, scratch_json: dict, sb3_path: str, assets=None):
+        """写入.sb3文件（JSON 输出无法携带资源，仅写 project.json）"""
         if sb3_path.endswith('.json'):
             with open(sb3_path, 'w', encoding='utf-8') as f:
                 json.dump(scratch_json, f, indent=2, ensure_ascii=False)
+            if assets:
+                print("  [提示] .json 输出不包含造型资源，请改用 .sb3")
             return
 
         with zipfile.ZipFile(sb3_path, 'w', zipfile.ZIP_DEFLATED) as zf:
             zf.writestr('project.json', json.dumps(scratch_json, ensure_ascii=False))
+            for name, data in (assets or {}).items():
+                zf.writestr(name, data)
 
 
 def main():
@@ -238,7 +308,7 @@ def main():
         print()
         print("用法:")
         print("  python converter.py scratch2py <input.sb3> [output.py]")
-        print("  python converter.py py2scratch <input.py> [output.sb3]")
+        print("  python converter.py py2scratch <input.py> [output.sb3] [--mode dsl|general|auto]")
         print("  python converter.py roundtrip-sb3 <input.sb3> [output.sb3]")
         print("  python converter.py roundtrip-py <input.py> [output.py]")
         print("  python converter.py demo")
@@ -255,12 +325,19 @@ def main():
         converter.scratch_to_python(input_path, output_path)
 
     elif command == 'py2scratch':
-        if len(sys.argv) < 3:
-            print("用法: python converter.py py2scratch <input.py> [output.sb3]")
+        args = sys.argv[2:]
+        mode = 'auto'
+        if '--mode' in args:
+            index = args.index('--mode')
+            mode = args[index + 1] if index + 1 < len(args) else 'auto'
+            del args[index:index + 2]
+        if not args:
+            print("用法: python converter.py py2scratch <input.py> [output.sb3] "
+                  "[--mode dsl|general|auto]")
             sys.exit(1)
-        input_path = sys.argv[2]
-        output_path = sys.argv[3] if len(sys.argv) > 3 else input_path.replace('.py', '.sb3')
-        converter.python_to_scratch(input_path, output_path)
+        input_path = args[0]
+        output_path = args[1] if len(args) > 1 else input_path.replace('.py', '.sb3')
+        converter.python_to_scratch(input_path, output_path, mode)
 
     elif command == 'roundtrip-sb3':
         if len(sys.argv) < 3:
