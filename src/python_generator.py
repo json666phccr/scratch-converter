@@ -998,6 +998,7 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
         self.dragging = None
         self.dragging_offset = (0, 0)
         self.ask_pending = False
+        self.ask_visible = False
         self.ask_question = ''
         self.ask_buffer = ''
         self.ask_composition = ''
@@ -1311,14 +1312,20 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
             self.ask_key_pending = ''
             self.ask_answer = ''
             self.ask_pending = True
+            self.ask_visible = True
+            if self.trace:
+                print("[trace] ask", repr(self.ask_question))
             while alive() and self.ask_pending and self.ask_token == token:
                 self.wait_frame()
             return self.ask_answer
         finally:
             if token and self.ask_token == token:
                 self.ask_pending = False
+                self.ask_visible = False
                 self.ask_question = ''
                 self.ask_composition = ''
+                if self.trace:
+                    print("[trace] ask done", repr(self.ask_answer))
             self.ask_lock.release()
 
     def _ask_rect(self):
@@ -1344,9 +1351,13 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
         self.ask_answer = self.ask_buffer + self.ask_composition
         self.ask_key_pending = ''
         self.ask_pending = False
+        # 点击确认/回车后立刻停止渲染询问框，不等脚本线程调度
+        self.ask_visible = False
+        if self.trace:
+            print("[trace] ask submit", repr(self.ask_answer))
 
     def _draw_ask(self):
-        if not self.ask_pending:
+        if not self.ask_visible or not self.ask_pending:
             return
         rect = self._ask_rect()
         pygame.draw.rect(self.stage_surface, (255, 255, 255), rect, border_radius=6)
@@ -1527,17 +1538,24 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
                 # pygame 2 的文本输入（含中文输入法提交的文本）；
                 # 部分环境只发 KEYDOWN，不去重会重复输入
                 if self.ask_pending:
+                    if self.trace:
+                        print("[trace] ask text", repr(event.text))
                     self._ask_append_text(event.text)
                     self.ask_composition = ''
             elif self._has_text_input and event.type == pygame.TEXTEDITING:
                 # 输入法正在拼写的文本，先显示出来但不计入答案
                 if self.ask_pending:
+                    if self.trace:
+                        print("[trace] ask editing", repr(event.text))
                     self.ask_composition = event.text
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     self.running = False
                     return
                 if self.ask_pending:
+                    if self.trace:
+                        print("[trace] ask key", event.key,
+                              repr(getattr(event, "unicode", "")))
                     if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                         self._submit_ask()
                     elif event.key == pygame.K_BACKSPACE:
@@ -1572,10 +1590,15 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
                 self.keys.discard(self._key_name(event.key))
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 stage_pos = self._window_to_stage(event.pos)
-                if self.ask_pending and self._ask_rect().collidepoint(stage_pos):
-                    # 点击输入框任意位置（包括确认按钮）都提交
-                    self._submit_ask()
-                    continue
+                if self.ask_pending:
+                    if self.trace:
+                        print("[trace] ask click", stage_pos,
+                              self._ask_rect().collidepoint(stage_pos))
+                    if self._ask_rect().collidepoint(stage_pos) \
+                            or self.ask_buffer or self.ask_composition:
+                        # 点击输入框，或已经输入过内容后点击任意位置，都提交
+                        self._submit_ask()
+                        continue
                 self.mouse_down = True
                 self.mouse_x, self.mouse_y = self._screen_to_scratch(event.pos)
                 self._start_drag(event.pos)
