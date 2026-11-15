@@ -2447,6 +2447,84 @@ print("done")
     return True
 
 
+def test_ask_input_box():
+    """询问框：TEXTINPUT 输入、回车/确认按钮提交、可以连续询问"""
+    print("[测试45] 询问框输入")
+
+    blocks = {
+        "b1": block("event_whenflagclicked", "b2", None, top_level=True),
+        "b2": block("sensing_askandwait", "b3", "b1",
+                    {"QUESTION": [1, [10, "q1"]]}),
+        "b3": block("looks_say", "b4", "b2", {"MESSAGE": [3, "a1", [10, ""]]}),
+        "a1": block("sensing_answer", None, "b3"),
+        "b4": block("sensing_askandwait", "b5", "b3",
+                    {"QUESTION": [1, [10, "q2"]]}),
+        "b5": block("looks_say", "b6", "b4", {"MESSAGE": [3, "a2", [10, ""]]}),
+        "a2": block("sensing_answer", None, "b5"),
+        "b6": block("sensing_askandwait", "b7", "b5",
+                    {"QUESTION": [1, [10, "q3"]]}),
+        "b7": block("looks_say", None, "b6", {"MESSAGE": [3, "a3", [10, ""]]}),
+        "a3": block("sensing_answer", None, "b7"),
+    }
+    project = make_project(blocks, name="AskTest")
+    code = generate_python(parse_scratch_project(project))
+    namespace = {}
+    exec(compile(code, "<generated>", "exec"), namespace)
+    pygame = namespace["pygame"]
+    runtime = namespace["ScratchRuntime"](headless=True, audio=False)
+    sprite = namespace["AskTest"]()
+    runtime.add_sprite(sprite)
+    sprite.run()
+    runtime.green_flag()
+
+    import time
+
+    def pump_until(predicate, timeout=5.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            runtime.step()
+            if predicate():
+                return True
+            time.sleep(0.01)
+        return False
+
+    try:
+        assert pump_until(lambda: runtime.ask_pending), "第一次询问没有出现"
+        for ch in "hi":
+            pygame.event.post(pygame.event.Event(pygame.TEXTINPUT, text=ch))
+        pygame.event.post(pygame.event.Event(
+            pygame.KEYDOWN, key=pygame.K_KP_ENTER, unicode="\r", mod=0))
+        assert pump_until(lambda: sprite._say_text == "hi"), \
+            f"小键盘回车提交后回答错误: {sprite._say_text!r}"
+
+        assert pump_until(lambda: runtime.ask_pending), "第二次询问没有出现"
+        assert runtime.ask_buffer == "", "第二次询问应重置输入内容"
+        for ch in "ok":
+            pygame.event.post(pygame.event.Event(pygame.TEXTINPUT, text=ch))
+        bar = runtime._ask_rect()
+        pygame.event.post(pygame.event.Event(
+            pygame.MOUSEBUTTONDOWN, button=1, pos=(bar.x + 20, bar.centery)))
+        assert pump_until(lambda: sprite._say_text == "ok"), \
+            f"点击输入框应提交: {sprite._say_text!r}"
+
+        assert pump_until(lambda: runtime.ask_pending), "第三次询问没有出现"
+        for ch in "up":
+            pygame.event.post(pygame.event.Event(pygame.TEXTINPUT, text=ch))
+        # 模拟输入法吞掉 KEYDOWN，只收到回车松开
+        pygame.event.post(pygame.event.Event(
+            pygame.KEYUP, key=pygame.K_RETURN, unicode="", mod=0))
+        assert pump_until(lambda: sprite._say_text == "up"), \
+            f"回车松开兜底提交失败: {sprite._say_text!r}"
+        assert pump_until(lambda: not runtime.ask_pending), \
+            "第三次询问框应已关闭"
+    finally:
+        runtime.running = False
+        runtime.shutdown()
+
+    print("  [PASS] 询问框输入通过")
+    return True
+
+
 def test_distortion_effects():
     """鱼眼/旋涡/像素化/马赛克：按 scratch-render 的坐标变换实现"""
     print("[测试44] 更多图形特效")
@@ -2594,6 +2672,7 @@ def main():
         test_general_python_break_continue,
         test_general_python_builtins_and_methods,
         test_distortion_effects,
+        test_ask_input_box,
         test_chinese_sprite_instance_name,
     ]
     

@@ -1000,7 +1000,12 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
         self.ask_pending = False
         self.ask_question = ''
         self.ask_buffer = ''
+        self.ask_composition = ''
         self.ask_answer = ''
+        self.ask_token = 0
+        self.ask_lock = threading.Lock()
+        # pygame 2 起文本输入走 TEXTINPUT（支持中文输入法），不再用 KEYDOWN.unicode
+        self._has_text_input = hasattr(pygame, 'TEXTINPUT')
         self.answer = ''
         self.music_tempo = 60.0
         self.music_instrument = 1
@@ -1278,28 +1283,74 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
                    (context is None or context.running)):
                 self.frame_condition.wait(0.1)
 
-    def ask(self, question):
-        """在舞台上显示输入框并等待玩家输入"""
-        self.ask_question = _sc_str(question)
-        self.ask_buffer = ''
-        self.ask_answer = ''
-        self.ask_pending = True
-        while self.running and self.ask_pending:
-            self.wait_frame()
+    def ask(self, question, context=None):
+        """在舞台上显示输入框并等待玩家输入
+
+        同一时刻只允许一个询问：多个脚本同时询问时排队执行，
+        避免后者清空前者的输入状态，导致输入框“卡住”。
+        """
+        def alive():
+            return self.running and (context is None or context.running)
+
+        # 抢询问锁；脚本被停止时也能退出等待
+        while alive():
+            if self.ask_lock.acquire(timeout=0.1):
+                break
+        else:
+            return ''
+        token = 0
+        try:
+            if not alive():
+                return ''
+            self.ask_token += 1
+            token = self.ask_token
+            self.ask_question = _sc_str(question)
+            self.ask_buffer = ''
+            self.ask_composition = ''
+            self.ask_answer = ''
+            self.ask_pending = True
+            while alive() and self.ask_pending and self.ask_token == token:
+                self.wait_frame()
+            return self.ask_answer
+        finally:
+            if token and self.ask_token == token:
+                self.ask_pending = False
+                self.ask_question = ''
+                self.ask_composition = ''
+            self.ask_lock.release()
+
+    def _ask_rect(self):
+        return pygame.Rect(20, self.stage_height - 60,
+                           max(80, self.stage_width - 40), 40)
+
+    def _ask_button_rect(self):
+        rect = self._ask_rect()
+        return pygame.Rect(rect.right - 66, rect.y + 7, 58, 26)
+
+    def _submit_ask(self):
+        """回车/点击确认时提交输入"""
+        self.ask_answer = self.ask_buffer + self.ask_composition
         self.ask_pending = False
-        self.ask_question = ''
-        return self.ask_answer
 
     def _draw_ask(self):
         if not self.ask_pending:
             return
-        rect = pygame.Rect(20, self.stage_height - 60,
-                           max(80, self.stage_width - 40), 40)
+        rect = self._ask_rect()
         pygame.draw.rect(self.stage_surface, (255, 255, 255), rect, border_radius=6)
         pygame.draw.rect(self.stage_surface, (90, 90, 90), rect, 1, border_radius=6)
-        text = self.ask_question + ' ' + self.ask_buffer + '_'
+        text = self.ask_question + ' ' + self.ask_buffer + self.ask_composition + '_'
         surface = self.font.render(text, True, (30, 30, 30))
+        area_width = max(20, rect.width - 90)
+        if surface.get_width() > area_width:
+            # 文字太长时只显示末尾（当前输入的内容）
+            clipped = pygame.Surface((area_width, rect.height - 8), pygame.SRCALPHA)
+            clipped.blit(surface, (area_width - surface.get_width(), 0))
+            surface = clipped
         self.stage_surface.blit(surface, (rect.x + 8, rect.y + 11))
+        button = self._ask_button_rect()
+        pygame.draw.rect(self.stage_surface, (80, 135, 220), button, border_radius=5)
+        label = self.font.render('确认', True, (255, 255, 255))
+        self.stage_surface.blit(label, label.get_rect(center=button.center))
 
     def stop_all_scripts(self):
         for context in list(self.scripts):
@@ -1459,17 +1510,29 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
             if event.type == pygame.QUIT:
                 self.running = False
                 return
+            elif self._has_text_input and event.type == pygame.TEXTINPUT:
+                # pygame 2 的文本输入（含中文输入法提交的文本）
+                if self.ask_pending:
+                    self.ask_buffer += event.text
+                    self.ask_composition = ''
+            elif self._has_text_input and event.type == pygame.TEXTEDITING:
+                # 输入法正在拼写的文本，先显示出来但不计入答案
+                if self.ask_pending:
+                    self.ask_composition = event.text
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     self.running = False
                     return
                 if self.ask_pending:
-                    if event.key == pygame.K_RETURN:
-                        self.ask_answer = self.ask_buffer
-                        self.ask_pending = False
+                    if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                        self._submit_ask()
                     elif event.key == pygame.K_BACKSPACE:
-                        self.ask_buffer = self.ask_buffer[:-1]
-                    elif event.unicode and event.unicode.isprintable():
+                        if self.ask_composition:
+                            self.ask_composition = self.ask_composition[:-1]
+                        else:
+                            self.ask_buffer = self.ask_buffer[:-1]
+                    elif not self._has_text_input and event.unicode \
+                            and event.unicode.isprintable():
                         self.ask_buffer += event.unicode
                     continue
                 key = self._key_name(event.key)
@@ -1484,13 +1547,29 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
                             sprite._running = True
                             self.start_script(func)
             elif event.type == pygame.KEYUP:
+                if self.ask_pending and \
+                        event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                    # 输入法可能吞掉 KEYDOWN，回车松开时再兜底提交
+                    self._submit_ask()
+                    continue
                 self.keys.discard(self._key_name(event.key))
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                stage_pos = self._window_to_stage(event.pos)
+                if self.ask_pending and self._ask_rect().collidepoint(stage_pos):
+                    # 点击输入框任意位置（包括确认按钮）都提交
+                    self._submit_ask()
+                    continue
                 self.mouse_down = True
                 self.mouse_x, self.mouse_y = self._screen_to_scratch(event.pos)
                 self._start_drag(event.pos)
                 self._handle_click(event.pos)
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                if self.ask_pending:
+                    stage_pos = self._window_to_stage(event.pos)
+                    if self._ask_rect().collidepoint(stage_pos):
+                        # 窗口激活时按下事件可能被系统吞掉，松开时再兜底
+                        self._submit_ask()
+                        continue
                 self.mouse_down = False
                 self.dragging = None
             elif event.type == pygame.MOUSEMOTION:
@@ -1945,7 +2024,12 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
         deadline = None if max_seconds is None else time.time() + max_seconds
         try:
             while self.running:
-                self.step()
+                try:
+                    self.step()
+                except Exception:
+                    # 单帧绘制/事件异常不应让整个窗口卡死
+                    import traceback
+                    traceback.print_exc()
                 frames += 1
                 if max_frames is not None and frames >= max_frames:
                     break
@@ -2584,7 +2668,8 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
             return
         self._turn_release()
         try:
-            self.answer = self._runtime.ask(question)
+            context = getattr(self._local, 'context', None)
+            self.answer = self._runtime.ask(question, context)
             self._runtime.answer = self.answer
         finally:
             self._turn_acquire()
