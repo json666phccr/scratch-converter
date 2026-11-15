@@ -29,7 +29,7 @@ from python_parser import (parse_python_code, parse_python_file,
                            python_to_project, PythonParser)
 from general_python import parse_general_project
 
-__version__ = "0.9.6"
+__version__ = "0.9.9"
 
 
 class ScratchConverter:

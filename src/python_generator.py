@@ -24,7 +24,7 @@ class PythonGenerator:
 
     RUNTIME_HELPERS = r'''
 _SCRATCH_LIST_LIMIT = 200000
-_RUNTIME_VERSION = '0.9.6'
+_RUNTIME_VERSION = '0.9.9'
 
 
 def _sc_is_white(value):
@@ -977,7 +977,10 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
         self._create_display(maximize=self.maximize)
         pygame.display.set_caption(
             "Scratch 3.0 Runtime " + _RUNTIME_VERSION
-            + " (ESC 退出，可自由拉伸窗口)")
+            + " (ESC 退出，F1 调试信息，可自由拉伸窗口)")
+        if not self.headless:
+            print("[runtime] Scratch 3 运行时 v" + _RUNTIME_VERSION
+                  + "，按 F1 显示/隐藏调试面板")
         self.pen_layer = pygame.Surface((self.stage_width, self.stage_height),
                                         pygame.SRCALPHA)
         self.clock = pygame.time.Clock()
@@ -1009,6 +1012,8 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
         self.ask_answer = ''
         self.ask_token = 0
         self.ask_lock = threading.Lock()
+        self.debug_overlay = False
+        self._debug_events = []
         # pygame 2 起文本输入走 TEXTINPUT（支持中文输入法），不再用 KEYDOWN.unicode
         self._has_text_input = hasattr(pygame, 'TEXTINPUT')
         self.answer = ''
@@ -1330,8 +1335,8 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
             self.ask_composition = ''
             self.ask_key_pending = ''
             self.ask_answer = ''
-            self.ask_pending = True
             self.ask_visible = True
+            self.ask_pending = True
             if self.trace:
                 print("[trace] ask", repr(self.ask_question))
             while alive() and self.ask_pending and self.ask_token == token:
@@ -1443,9 +1448,14 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
         return name
 
     def _screen_to_scratch(self, pos):
+        """窗口坐标 -> 舞台坐标；超出舞台范围时取边界值（与 Scratch 一致）"""
         x, y = self._window_to_stage(pos)
-        return (int(round(x)) - self.stage_width // 2,
-                self.stage_height // 2 - int(round(y)))
+        scratch_x = int(round(x)) - self.stage_width // 2
+        scratch_y = self.stage_height // 2 - int(round(y))
+        limit_x = self.stage_width // 2
+        limit_y = self.stage_height // 2
+        return (max(-limit_x, min(limit_x, scratch_x)),
+                max(-limit_y, min(limit_y, scratch_y)))
 
     def music_seconds(self, beats):
         tempo = _sc_num(self.music_tempo) or 60.0
@@ -1551,6 +1561,11 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
         if not self.running or pygame is None:
             return
         for event in pygame.event.get():
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_F1:
+                self.debug_overlay = not self.debug_overlay
+                self._debug_events = []
+                continue
+            self._log_event(event)
             if event.type == pygame.QUIT:
                 self.running = False
                 return
@@ -1613,10 +1628,9 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
                 if self.ask_pending:
                     if self.trace:
                         print("[trace] ask click", stage_pos,
-                              self._ask_rect().collidepoint(stage_pos))
-                    if self._ask_rect().collidepoint(stage_pos) \
-                            or self.ask_buffer or self.ask_composition:
-                        # 点击输入框，或已经输入过内容后点击任意位置，都提交
+                              self._ask_button_rect().collidepoint(stage_pos))
+                    if self._ask_button_rect().collidepoint(stage_pos):
+                        # 只有“确认”按钮提交；点击输入框本身不应提交
                         self._submit_ask()
                         continue
                 self.mouse_down = True
@@ -1626,7 +1640,7 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                 if self.ask_pending:
                     stage_pos = self._window_to_stage(event.pos)
-                    if self._ask_rect().collidepoint(stage_pos):
+                    if self._ask_button_rect().collidepoint(stage_pos):
                         # 窗口激活时按下事件可能被系统吞掉，松开时再兜底
                         self._submit_ask()
                         continue
@@ -1647,6 +1661,44 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
             self.frame_condition.notify_all()
         if not self.headless:
             self.clock.tick(self.fps)
+
+    def _log_event(self, event):
+        """记录最近的事件，供 F1 调试面板显示"""
+        if not self.debug_overlay:
+            return
+        if event.type == pygame.KEYDOWN:
+            text = "KEYDOWN %s %r" % (event.key, getattr(event, 'unicode', ''))
+        elif self._has_text_input and event.type == pygame.TEXTINPUT:
+            text = "TEXTINPUT %r" % (event.text,)
+        elif event.type == pygame.MOUSEBUTTONDOWN:
+            text = "MOUSEDOWN %s %s" % (event.button, event.pos)
+        elif event.type == pygame.MOUSEBUTTONUP:
+            text = "MOUSEUP %s %s" % (event.button, event.pos)
+        else:
+            return
+        self._debug_events.append(text)
+        if len(self._debug_events) > 9:
+            del self._debug_events[0]
+
+    def _draw_debug(self):
+        alive = sum(1 for context in self.scripts if context.running)
+        lines = [
+            "v%s frame=%s scripts=%s" % (_RUNTIME_VERSION, self.frame, alive),
+            "ask pending=%s visible=%s token=%s buffer=%r comp=%r" % (
+                self.ask_pending, self.ask_visible, self.ask_token,
+                self.ask_buffer, self.ask_composition),
+            "mouse=(%s,%s) down=%s keys=%s" % (
+                self.mouse_x, self.mouse_y, self.mouse_down,
+                sorted(self.keys)),
+        ] + list(self._debug_events)
+        width = max(self.font.size(line)[0] for line in lines) + 14
+        height = len(lines) * 16 + 10
+        panel = pygame.Surface((width, height), pygame.SRCALPHA)
+        panel.fill((0, 0, 0, 190))
+        self.stage_surface.blit(panel, (6, 6))
+        for index, line in enumerate(lines):
+            surface = self.font.render(line, True, (255, 255, 255))
+            self.stage_surface.blit(surface, (12, 10 + index * 16))
 
     def _update_state(self):
         elapsed = self.elapsed()
@@ -1694,20 +1746,19 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
             if ghost > 0:
                 background = background.copy()
                 background.set_alpha(int(255 * (1 - ghost / 100.0)))
+        # 每帧先铺白底再画背景：背景可能只是 2x2 的空白造型（Scratch 默认背景），
+        # 只 blit 背景无法覆盖整个舞台，上一帧的输入框/文字会残留。
+        self.stage_surface.fill((255, 255, 255))
         if background is not None:
-            if ghost > 0:
-                # 半透明背景需要先铺底色，避免叠到上一帧画面
-                self.stage_surface.fill((255, 255, 255))
             self.stage_surface.blit(background, (0, 0))
-        else:
-            # 与原版 Scratch 一致：没有背景时舞台为白色
-            self.stage_surface.fill((255, 255, 255))
         self.stage_surface.blit(self.pen_layer, (0, 0))
         for sprite in list(self.sprites):
             if sprite.visible and not getattr(sprite, 'is_stage', False):
                 sprite._draw(self.stage_surface, self.font)
         self._draw_monitors()
         self._draw_ask()
+        if self.debug_overlay:
+            self._draw_debug()
 
     def _all_monitors(self):
         return list(MONITORS) + self.dynamic_monitors
@@ -2492,14 +2543,40 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
         self.x = max(-width, min(width, self.x))
         self.y = max(-height, min(height, self.y))
 
+    def _sprite_bounds(self):
+        """当前造型旋转/缩放后的半宽、半高（用于舞台边界约束）"""
+        image = self._costume_surface()
+        if image is None:
+            return max(1.0, 20 * abs(_sc_num(self.size)) / 200.0), \
+                max(1.0, 20 * abs(_sc_num(self.size)) / 200.0)
+        scale = max(1.0, _sc_num(self.size)) / 100.0
+        width = image.get_width() * scale
+        height = image.get_height() * scale
+        angle = math.radians(90 - _sc_num(self.direction))
+        if self.rotation_style in ('left-right', "don't rotate"):
+            angle = 0.0
+        cos_value, sin_value = abs(math.cos(angle)), abs(math.sin(angle))
+        return ((width * cos_value + height * sin_value) / 2.0,
+                (width * sin_value + height * cos_value) / 2.0)
+
     def _apply_fencing(self):
+        """角色不能离开舞台（Scratch 的 Fencing，可用 TurboWarp 高级选项关闭）"""
         if self._runtime is None or not self._runtime.fencing:
             return
-        half = max(1.0, 20 * abs(_sc_num(self.size)) / 100.0)
-        limit_x = max(1.0, self._runtime.stage_width / 2 - half)
-        limit_y = max(1.0, self._runtime.stage_height / 2 - half)
-        self.x = max(-limit_x, min(limit_x, _sc_num(self.x)))
-        self.y = max(-limit_y, min(limit_y, _sc_num(self.y)))
+        half_w, half_h = self._sprite_bounds()
+        stage_w = self._runtime.stage_width
+        stage_h = self._runtime.stage_height
+        if half_w * 2 > stage_w:
+            # 比舞台还宽时居中（与 Scratch 一致）
+            self.x = 0
+        else:
+            limit_x = stage_w / 2 - half_w
+            self.x = max(-limit_x, min(limit_x, _sc_num(self.x)))
+        if half_h * 2 > stage_h:
+            self.y = 0
+        else:
+            limit_y = stage_h / 2 - half_h
+            self.y = max(-limit_y, min(limit_y, _sc_num(self.y)))
 
     def _pen_update(self):
         """画笔落下时，把移动轨迹画到画布上"""

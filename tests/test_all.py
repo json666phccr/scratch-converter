@@ -2509,8 +2509,19 @@ def test_ask_input_box():
         bar = runtime._ask_rect()
         pygame.event.post(pygame.event.Event(
             pygame.MOUSEBUTTONDOWN, button=1, pos=(bar.x + 20, bar.centery)))
+        pygame.event.post(pygame.event.Event(
+            pygame.MOUSEBUTTONUP, button=1, pos=(bar.x + 20, bar.centery)))
+        for _ in range(3):
+            runtime.step()
+            time.sleep(0.01)
+        assert runtime.ask_pending, "点击输入框本身不应提交"
+        assert sprite._say_text != "ok"
+
+        button = runtime._ask_button_rect()
+        pygame.event.post(pygame.event.Event(
+            pygame.MOUSEBUTTONDOWN, button=1, pos=button.center))
         assert pump_until(lambda: sprite._say_text == "ok"), \
-            f"点击输入框应提交: {sprite._say_text!r}"
+            f"点击确认按钮应提交: {sprite._say_text!r}"
 
         assert pump_until(lambda: runtime.ask_pending), "第三次询问没有出现"
         # 只有 TEXTINPUT（输入法上屏）
@@ -2528,6 +2539,148 @@ def test_ask_input_box():
         runtime.shutdown()
 
     print("  [PASS] 询问框输入通过")
+    return True
+
+
+def test_mouse_clamp_and_fencing():
+    """鼠标坐标超出舞台时取边界值；角色不能离开舞台（可关闭）"""
+    print("[测试48] 鼠标边界与角色围栏")
+
+    project = make_project({
+        "b1": block("event_whenflagclicked", None, None, top_level=True),
+    }, name="Fence")
+    code = generate_python(parse_scratch_project(project))
+    namespace = {}
+    exec(compile(code, "<generated>", "exec"), namespace)
+    runtime = namespace["ScratchRuntime"](headless=True, audio=False)
+    sprite = namespace["Fence"]()
+    runtime.add_sprite(sprite)
+    try:
+        # 鼠标超出舞台 -> 取最大/最小值
+        assert runtime._screen_to_scratch((-100, -100)) == (-240, 180)
+        assert runtime._screen_to_scratch((1000, 1000)) == (240, -180)
+        assert runtime._screen_to_scratch((240, 180)) == (0, 0)
+
+        # 角色不能离开舞台（无造型时按 10px 半宽计算）
+        sprite.set_x(999)
+        sprite.set_y(-999)
+        assert sprite.x == 230 and sprite.y == -170, \
+            f"角色应被约束在舞台内: {sprite.x},{sprite.y}"
+
+        sprite.goto_xy(-999, 999)
+        assert sprite.x == -230 and sprite.y == 170, \
+            f"移到坐标也应受约束: {sprite.x},{sprite.y}"
+
+        # 关闭 fencing（TurboWarp 高级选项）后可以离开舞台
+        runtime.fencing = False
+        sprite.set_x(999)
+        assert sprite.x == 999, "关闭 fencing 后不应再限制坐标"
+    finally:
+        runtime.running = False
+        runtime.shutdown()
+
+    print("  [PASS] 鼠标边界与角色围栏通过")
+    return True
+
+
+def test_stage_clear_with_tiny_backdrop():
+    """背景是 2x2 空白造型时，舞台也必须每帧清屏，否则输入框会残留"""
+    print("[测试47] 小尺寸背景每帧清屏")
+
+    project = make_project({
+        "b1": block("event_whenflagclicked", "b2", None, top_level=True),
+        "b2": block("sensing_askandwait", None, "b1",
+                    {"QUESTION": [1, [10, "q"]]}),
+    }, name="TinyBg")
+    code = generate_python(parse_scratch_project(project))
+    namespace = {}
+    exec(compile(code, "<generated>", "exec"), namespace)
+    pygame = namespace["pygame"]
+    runtime = namespace["ScratchRuntime"](headless=True, audio=False)
+    sprite = namespace["TinyBg"]()
+    runtime.add_sprite(sprite)
+    # 模拟 Scratch 默认的 2x2 空白背景
+    runtime.background = pygame.Surface((2, 2), pygame.SRCALPHA)
+
+    import time
+    sprite.run()
+    runtime.green_flag()
+    try:
+        deadline = time.time() + 4
+        while time.time() < deadline and not runtime.ask_pending:
+            runtime.step()
+            time.sleep(0.01)
+        assert runtime.ask_pending, "询问框没有出现"
+        time.sleep(0.05)
+
+        runtime.step()
+        probe = (runtime.stage_width // 2, runtime.stage_height - 60)
+        border = runtime.stage_surface.get_at(probe)
+        assert tuple(border)[:3] == (90, 90, 90), \
+            f"询问框边框应已画出: {border}"
+
+        pygame.event.post(pygame.event.Event(
+            pygame.KEYDOWN, key=pygame.K_RETURN, unicode="\r", mod=0))
+        deadline = time.time() + 4
+        while time.time() < deadline and runtime.ask_pending:
+            runtime.step()
+            time.sleep(0.01)
+        assert not runtime.ask_pending, "回车应提交询问"
+
+        runtime.step()
+        cleared = runtime.stage_surface.get_at(probe)
+        assert tuple(cleared)[:3] == (255, 255, 255), \
+            f"提交后舞台应清屏为白色，不能残留输入框: {cleared}"
+    finally:
+        runtime.running = False
+        runtime.shutdown()
+
+    print("  [PASS] 小尺寸背景每帧清屏通过")
+    return True
+
+
+def test_runtime_debug_overlay():
+    """F1 调试面板：显示询问状态和最近事件"""
+    print("[测试46] 运行时调试面板")
+
+    project = make_project({
+        "b1": block("event_whenflagclicked", None, None, top_level=True),
+    }, name="Dbg")
+    code = generate_python(parse_scratch_project(project))
+    assert "按 F1 显示/隐藏调试面板" in code
+
+    namespace = {}
+    exec(compile(code, "<generated>", "exec"), namespace)
+    pygame = namespace["pygame"]
+    runtime = namespace["ScratchRuntime"](headless=True, audio=False)
+    sprite = namespace["Dbg"]()
+    runtime.add_sprite(sprite)
+    try:
+        pygame.event.post(pygame.event.Event(
+            pygame.KEYDOWN, key=pygame.K_F1, unicode="", mod=0))
+        runtime.step()
+        assert runtime.debug_overlay is True, "F1 应打开调试面板"
+
+        pygame.event.post(pygame.event.Event(
+            pygame.MOUSEBUTTONDOWN, button=1, pos=(10, 10)))
+        pygame.event.post(pygame.event.Event(
+            pygame.KEYDOWN, key=ord('a'), unicode='a', mod=0))
+        runtime.step()
+        joined = " | ".join(runtime._debug_events)
+        assert "MOUSEDOWN" in joined, f"应记录鼠标事件: {joined}"
+        assert "'a'" in joined, f"应记录按键事件: {joined}"
+
+        runtime._draw()  # 面板渲染不能报错
+
+        pygame.event.post(pygame.event.Event(
+            pygame.KEYDOWN, key=pygame.K_F1, unicode="", mod=0))
+        runtime.step()
+        assert runtime.debug_overlay is False, "F1 应关闭调试面板"
+    finally:
+        runtime.running = False
+        runtime.shutdown()
+
+    print("  [PASS] 运行时调试面板通过")
     return True
 
 
@@ -2679,6 +2832,9 @@ def main():
         test_general_python_builtins_and_methods,
         test_distortion_effects,
         test_ask_input_box,
+        test_mouse_clamp_and_fencing,
+        test_stage_clear_with_tiny_backdrop,
+        test_runtime_debug_overlay,
         test_chinese_sprite_instance_name,
     ]
     
