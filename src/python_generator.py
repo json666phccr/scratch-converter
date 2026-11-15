@@ -1072,14 +1072,18 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
         self._view_size = None
         self._view_scaled = None
         if self.headless:
+            self.toolbar_height = 0
             self.screen = pygame.display.set_mode((width, height))
             self.stage_surface = self.screen
             return
+        # 窗口顶部留一条工具栏放绿旗（类似 Scratch），舞台在工具栏下方缩放
+        self.toolbar_height = 34
         try:
             self.screen = pygame.display.set_mode(
-                (width, height), pygame.RESIZABLE)
+                (width, height + self.toolbar_height), pygame.RESIZABLE)
         except pygame.error:
-            self.screen = pygame.display.set_mode((width, height))
+            self.screen = pygame.display.set_mode(
+                (width, height + self.toolbar_height))
         self.stage_surface = pygame.Surface((width, height))
         self._manual_view = True
         if maximize:
@@ -1101,17 +1105,19 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
             pass
 
     def _view_geometry(self):
-        """返回 (缩放比, 黑边偏移, 绘制尺寸)"""
+        """返回 (缩放比, 黑边偏移, 绘制尺寸)；工具栏占用的高度不计入舞台区域"""
         window_width, window_height = self.screen.get_size()
+        toolbar = getattr(self, 'toolbar_height', 0)
         if window_width <= 0 or window_height <= 0:
-            return 1.0, (0, 0), (self.stage_width, self.stage_height)
+            return 1.0, (0, toolbar), (self.stage_width, self.stage_height)
+        available = max(1, window_height - toolbar)
         scale = min(window_width / float(self.stage_width),
-                    window_height / float(self.stage_height))
+                    available / float(self.stage_height))
         draw_width = max(1, int(self.stage_width * scale))
         draw_height = max(1, int(self.stage_height * scale))
         return (draw_width / float(self.stage_width),
                 ((window_width - draw_width) // 2,
-                 (window_height - draw_height) // 2),
+                 toolbar + (available - draw_height) // 2),
                 (draw_width, draw_height))
 
     def _window_to_stage(self, pos):
@@ -1141,7 +1147,29 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
                                              self._view_scaled)
             self.screen.fill((0, 0, 0))
             self.screen.blit(self._view_scaled, offset)
+            self._draw_toolbar()
         pygame.display.flip()
+
+    def _green_flag_rect(self):
+        """绿旗按钮在窗口中的位置（位于顶部工具栏内）"""
+        return pygame.Rect(8, 6, 22, 22)
+
+    def _draw_toolbar(self):
+        """窗口顶部工具栏：只放绿旗按钮，避免和舞台内容重叠"""
+        toolbar = getattr(self, 'toolbar_height', 0)
+        if toolbar <= 0:
+            return
+        width = self.screen.get_width()
+        pygame.draw.rect(self.screen, (245, 245, 245), (0, 0, width, toolbar))
+        pygame.draw.line(self.screen, (200, 200, 200),
+                         (0, toolbar - 1), (width, toolbar - 1))
+        flag = self._green_flag_rect()
+        pygame.draw.rect(self.screen, (255, 255, 255),
+                         flag.inflate(4, 4), border_radius=5)
+        pygame.draw.polygon(self.screen, (60, 170, 90), [
+            (flag.x + 4, flag.bottom - 3), (flag.x + 4, flag.y + 2),
+            (flag.right - 2, flag.y + 2), (flag.right - 2, flag.centery),
+            (flag.x + 4, flag.centery)])
 
     def resize_stage(self, width, height):
         width = max(1, int(width))
@@ -1172,22 +1200,10 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
             pygame.draw.aaline(self.pen_layer, color, (sx, sy), (ex, ey))
 
     def pen_stamp(self, sprite):
-        image = sprite._costume_surface()
-        x = int(self.stage_width / 2 + _sc_num(sprite.x))
-        y = int(self.stage_height / 2 - _sc_num(sprite.y))
-        scale = max(1.0, _sc_num(sprite.size)) / 100.0
-        if image is not None:
-            angle = 90 - _sc_num(sprite.direction)
-            if sprite.rotation_style in ('left-right', "don't rotate"):
-                angle = 0
-            if angle == 0 and scale == 1.0:
-                transformed = image
-            else:
-                transformed = pygame.transform.rotozoom(image, angle, scale)
-            if sprite.rotation_style == 'left-right' \
-                    and math.cos(math.radians(_sc_num(sprite.direction))) < 0:
-                transformed = pygame.transform.flip(transformed, True, False)
-            self.pen_layer.blit(transformed, transformed.get_rect(center=(x, y)))
+        # 图章使用角色当前外观：颜色/亮度/透明度/形状特效都会一起盖上去
+        transformed, rect, x, y, scale, _direction = sprite._rendered_image()
+        if transformed is not None:
+            self.pen_layer.blit(transformed, rect)
         else:
             pygame.draw.circle(self.pen_layer, sprite._placeholder_color(),
                                (x, y), max(6, int(20 * scale)))
@@ -1513,10 +1529,11 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
     def _handle_click(self, pos):
         if self.trace:
             print("[trace] click", pos)
-        stage_pos = self._window_to_stage(pos)
-        if self._green_flag_rect().collidepoint(stage_pos):
+        if self._green_flag_rect().collidepoint(pos):
+            # 绿旗在窗口顶部工具栏里，用窗口坐标判断
             self.green_flag()
             return
+        stage_pos = self._window_to_stage(pos)
         x, y = self._screen_to_scratch(pos)
         for sprite in reversed(list(self.sprites)):
             if not sprite.visible:
@@ -1680,27 +1697,14 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
                 self.stage_surface.fill((255, 255, 255))
             self.stage_surface.blit(background, (0, 0))
         else:
-            self.stage_surface.fill((247, 247, 247))
+            # 与原版 Scratch 一致：没有背景时舞台为白色
+            self.stage_surface.fill((255, 255, 255))
         self.stage_surface.blit(self.pen_layer, (0, 0))
         for sprite in list(self.sprites):
             if sprite.visible and not getattr(sprite, 'is_stage', False):
                 sprite._draw(self.stage_surface, self.font)
         self._draw_monitors()
         self._draw_ask()
-        # 绿旗按钮最后画：避免被说话气泡/角色挡住，保证始终可见可点
-        self._draw_green_flag()
-
-    def _green_flag_rect(self):
-        return pygame.Rect(4, 4, 24, 24)
-
-    def _draw_green_flag(self):
-        rect = self._green_flag_rect()
-        pygame.draw.rect(self.stage_surface, (255, 255, 255),
-                         rect.inflate(4, 4), border_radius=5)
-        pygame.draw.polygon(self.stage_surface, (60, 170, 90), [
-            (rect.x + 4, rect.bottom - 3), (rect.x + 4, rect.y + 2),
-            (rect.right - 2, rect.y + 2), (rect.right - 2, rect.centery),
-            (rect.x + 4, rect.centery)])
 
     def _all_monitors(self):
         return list(MONITORS) + self.dynamic_monitors
@@ -3065,7 +3069,12 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
             pass
         return image
 
-    def _draw(self, screen, font):
+    def _rendered_image(self):
+        """当前外观（含颜色/亮度/形状特效、旋转、缩放、旋转中心）
+
+        返回 (surface, rect, x, y, scale, direction)；没有造型时 surface 为 None。
+        图章（stamp）复用同一份结果，保证图章与画面一致。
+        """
         image = self._costume_surface()
         runtime = self._runtime
         use_interp = runtime is not None and runtime.interpolation and getattr(self, '_render_x', None) is not None
@@ -3078,53 +3087,59 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
         scale = max(1.0, draw_size) / 100.0
         x = int(stage_width / 2 + draw_x)
         y = int(stage_height / 2 - draw_y)
-        if image is not None:
-            angle = 90 - draw_direction
-            if self.rotation_style in ('left-right', "don't rotate"):
-                angle = 0
-            color_effect = _sc_num(self._effects.get('color', 0))
-            brightness = _sc_num(self._effects.get('brightness', 0))
-            ghost = max(0.0, min(100.0, _sc_num(self._effects.get('ghost', 0))))
-            # 颜色/亮度特效很耗CPU，按(造型Surface, 特效值)缓存；特效值不变时直接复用
-            base = image
-            if color_effect and self._runtime is not None:
-                base = self._color_effect_image(image, color_effect)
-            if brightness and self._runtime is not None:
-                base = self._brightness_image(base, brightness)
-            # 鱼眼/旋涡/像素化/马赛克作用在造型上，再参与旋转与缩放
-            if self._runtime is not None:
-                base = self._distortion_image(base)
-            # 无旋转/无缩放时直接复用缓存的Surface，避免每帧rotozoom拷贝
-            if angle == 0 and scale == 1.0:
-                transformed = base
-                fresh = False
-            else:
-                transformed = pygame.transform.rotozoom(base, angle, scale)
-                fresh = True
-            if self.rotation_style == 'left-right' and math.cos(math.radians(draw_direction)) < 0:
-                transformed = pygame.transform.flip(transformed, True, False)
-                fresh = True
-            # 幽灵特效需要修改Surface，不能污染缓存
-            if ghost > 0:
-                if not fresh:
-                    transformed = transformed.copy()
-                transformed.set_alpha(int(255 * (1 - ghost / 100.0)))
-            rect = transformed.get_rect(center=(x, y))
-            info = self._costume_info()
-            center_x = info.get('rotationCenterX')
-            center_y = info.get('rotationCenterY')
-            center_x = image.get_width() / 2 if center_x is None else _sc_num(center_x)
-            center_y = image.get_height() / 2 if center_y is None else _sc_num(center_y)
-            if angle == 0:
-                # Scratch的position对应旋转中心，旋转中心坐标以图片左上角为原点(y向下)
-                rect.center = (x - int((center_x - image.get_width() / 2) * scale),
-                               y - int((center_y - image.get_height() / 2) * scale))
+        if image is None:
+            return None, None, x, y, scale, draw_direction
+        angle = 90 - draw_direction
+        if self.rotation_style in ('left-right', "don't rotate"):
+            angle = 0
+        color_effect = _sc_num(self._effects.get('color', 0))
+        brightness = _sc_num(self._effects.get('brightness', 0))
+        ghost = max(0.0, min(100.0, _sc_num(self._effects.get('ghost', 0))))
+        # 颜色/亮度特效很耗CPU，按(造型Surface, 特效值)缓存；特效值不变时直接复用
+        base = image
+        if color_effect and runtime is not None:
+            base = self._color_effect_image(image, color_effect)
+        if brightness and runtime is not None:
+            base = self._brightness_image(base, brightness)
+        # 鱼眼/旋涡/像素化/马赛克作用在造型上，再参与旋转与缩放
+        if runtime is not None:
+            base = self._distortion_image(base)
+        # 无旋转/无缩放时直接复用缓存的Surface，避免每帧rotozoom拷贝
+        if angle == 0 and scale == 1.0:
+            transformed = base
+            fresh = False
+        else:
+            transformed = pygame.transform.rotozoom(base, angle, scale)
+            fresh = True
+        if self.rotation_style == 'left-right' and math.cos(math.radians(draw_direction)) < 0:
+            transformed = pygame.transform.flip(transformed, True, False)
+            fresh = True
+        # 幽灵特效需要修改Surface，不能污染缓存
+        if ghost > 0:
+            if not fresh:
+                transformed = transformed.copy()
+            transformed.set_alpha(int(255 * (1 - ghost / 100.0)))
+        rect = transformed.get_rect(center=(x, y))
+        info = self._costume_info()
+        center_x = info.get('rotationCenterX')
+        center_y = info.get('rotationCenterY')
+        center_x = image.get_width() / 2 if center_x is None else _sc_num(center_x)
+        center_y = image.get_height() / 2 if center_y is None else _sc_num(center_y)
+        if angle == 0:
+            # Scratch的position对应旋转中心，旋转中心坐标以图片左上角为原点(y向下)
+            rect.center = (x - int((center_x - image.get_width() / 2) * scale),
+                           y - int((center_y - image.get_height() / 2) * scale))
+        return transformed, rect, x, y, scale, draw_direction
+
+    def _draw(self, screen, font):
+        transformed, rect, x, y, scale, direction = self._rendered_image()
+        if transformed is not None:
             screen.blit(transformed, rect)
         else:
             radius = max(6, int(20 * scale))
             pygame.draw.circle(screen, self._placeholder_color(), (x, y), radius)
-            end = (x + int(math.sin(math.radians(draw_direction)) * radius),
-                   y - int(math.cos(math.radians(draw_direction)) * radius))
+            end = (x + int(math.sin(math.radians(direction)) * radius),
+                   y - int(math.cos(math.radians(direction)) * radius))
             pygame.draw.line(screen, (40, 40, 40), (x, y), end, 2)
             rect = pygame.Rect(x - radius, y - radius, radius * 2, radius * 2)
         self._screen_rect = rect
