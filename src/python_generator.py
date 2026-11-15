@@ -1514,7 +1514,7 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
         if self.trace:
             print("[trace] click", pos)
         stage_pos = self._window_to_stage(pos)
-        if stage_pos[0] < 28 and stage_pos[1] < 28:
+        if self._green_flag_rect().collidepoint(stage_pos):
             self.green_flag()
             return
         x, y = self._screen_to_scratch(pos)
@@ -1682,13 +1682,25 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
         else:
             self.stage_surface.fill((247, 247, 247))
         self.stage_surface.blit(self.pen_layer, (0, 0))
-        pygame.draw.polygon(self.stage_surface, (60, 170, 90),
-                            [(8, 22), (8, 6), (22, 6), (22, 12), (8, 12)])
         for sprite in list(self.sprites):
             if sprite.visible and not getattr(sprite, 'is_stage', False):
                 sprite._draw(self.stage_surface, self.font)
         self._draw_monitors()
         self._draw_ask()
+        # 绿旗按钮最后画：避免被说话气泡/角色挡住，保证始终可见可点
+        self._draw_green_flag()
+
+    def _green_flag_rect(self):
+        return pygame.Rect(4, 4, 24, 24)
+
+    def _draw_green_flag(self):
+        rect = self._green_flag_rect()
+        pygame.draw.rect(self.stage_surface, (255, 255, 255),
+                         rect.inflate(4, 4), border_radius=5)
+        pygame.draw.polygon(self.stage_surface, (60, 170, 90), [
+            (rect.x + 4, rect.bottom - 3), (rect.x + 4, rect.y + 2),
+            (rect.right - 2, rect.y + 2), (rect.right - 2, rect.centery),
+            (rect.x + 4, rect.centery)])
 
     def _all_monitors(self):
         return list(MONITORS) + self.dynamic_monitors
