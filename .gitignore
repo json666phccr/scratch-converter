@@ -18,6 +18,18 @@ env/
 # 临时/调试产物
 *.log
 *.tmp
+# 根目录的临时调试脚本与产物（正式测试在 tests/ 下）
+/debug_*.py
+/debug_*.txt
+/test_debug*.py
+/test_import.py
+/test_interp_quick.py
+/test_lexer_quick.py
+/test_output.py
+/test_project.json
+/test_sac_interpreter.py
+/test_simple.py
+/test_step_by_step.py
 
 # 本地示例项目（含用户自己的 sb3/py 与导出素材，不上传）
 /example/

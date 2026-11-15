@@ -24,27 +24,29 @@ from typing import Optional
 from ir import ProjectIR, SpriteIR
 from scratch_parser import load_scratch_file, parse_scratch_project
 from scratch_writer import write_scratch_project, save_scratch_file
-from python_generator import generate_python, save_python
+from python_generator import generate_python, save_python, generate_modules
 from python_parser import (parse_python_code, parse_python_file,
                            python_to_project, PythonParser)
 from general_python import parse_general_project
 
-__version__ = "0.9.9"
+__version__ = "0.9.18"
 
 
 class ScratchConverter:
     """Scratch 3.0 双向转换器"""
 
-    def scratch_to_python(self, sb3_path: str, py_path: Optional[str] = None) -> str:
+    def scratch_to_python(self, sb3_path: str, py_path: Optional[str] = None,
+                          split: bool = False) -> str:
         """
         将Scratch项目(.sb3)转换为Python代码
 
         Args:
             sb3_path: .sb3文件路径
             py_path: 输出.py文件路径(可选)
+            split: 是否生成模块化多文件（入口 + 运行时 + 每个角色一个模块）
 
         Returns:
-            生成的Python代码字符串
+            生成的Python代码字符串（split 时为入口文件内容）
         """
         print(f"[Scratch -> Python] 正在转换: {sb3_path}")
 
@@ -62,17 +64,34 @@ class ScratchConverter:
             print(f"  TurboWarp高级选项: {ir.runtime_options}")
 
         # 3. 生成Python代码
-        python_code = generate_python(ir)
+        if split:
+            stem = (os.path.splitext(os.path.basename(py_path))[0]
+                    if py_path else 'scratch')
+            python_code, extra_files = generate_modules(ir, stem)
+            if py_path:
+                base_dir = os.path.dirname(os.path.abspath(py_path))
+                for name, code in extra_files.items():
+                    with open(os.path.join(base_dir, name), 'w', encoding='utf-8') as f:
+                        f.write(code)
+        else:
+            python_code = generate_python(ir)
 
         # 4. 保存到文件
         if py_path:
             with open(py_path, 'w', encoding='utf-8') as f:
                 f.write(python_code)
             print(f"  Python代码已保存: {py_path}")
+            if split:
+                print(f"  模块化输出: 另生成 {len(extra_files)} 个模块文件（运行时 + 角色）")
             # 提取造型/声音资源，供pygame运行时加载
             self._extract_assets(sb3_path, py_path)
 
-        print(f"[转换完成] Python代码共 {len(python_code.splitlines())} 行")
+        total_lines = len(python_code.splitlines())
+        if split:
+            total_lines += sum(len(code.splitlines()) for code in extra_files.values())
+        print(f"[转换完成] Python代码共 {total_lines} 行")
+        if not split and total_lines > 3000:
+            print("  [提示] 代码较长，可使用 --split 生成模块化多文件，便于阅读和调试")
         return python_code
 
     @staticmethod
@@ -307,7 +326,7 @@ def main():
         print("Scratch 3.0 <-> Python 双向转换器")
         print()
         print("用法:")
-        print("  python converter.py scratch2py <input.sb3> [output.py]")
+        print("  python converter.py scratch2py <input.sb3> [output.py] [--split]")
         print("  python converter.py py2scratch <input.py> [output.sb3] [--mode dsl|general|auto]")
         print("  python converter.py roundtrip-sb3 <input.sb3> [output.sb3]")
         print("  python converter.py roundtrip-py <input.py> [output.py]")
@@ -317,12 +336,15 @@ def main():
     command = sys.argv[1]
 
     if command == 'scratch2py':
-        if len(sys.argv) < 3:
-            print("用法: python converter.py scratch2py <input.sb3> [output.py]")
+        args = sys.argv[2:]
+        split = '--split' in args
+        args = [item for item in args if item != '--split']
+        if not args:
+            print("用法: python converter.py scratch2py <input.sb3> [output.py] [--split]")
             sys.exit(1)
-        input_path = sys.argv[2]
-        output_path = sys.argv[3] if len(sys.argv) > 3 else input_path.replace('.sb3', '.py').replace('.json', '.py')
-        converter.scratch_to_python(input_path, output_path)
+        input_path = args[0]
+        output_path = args[1] if len(args) > 1 else input_path.replace('.sb3', '.py').replace('.json', '.py')
+        converter.scratch_to_python(input_path, output_path, split=split)
 
     elif command == 'py2scratch':
         args = sys.argv[2:]

@@ -177,6 +177,11 @@ class PythonParser:
                 is_scratch_sprite = True
                 break
 
+        self._condition_hats = {}
+        for item in node.body:
+            if isinstance(item, ast.FunctionDef) and item.name == 'run':
+                self._collect_condition_hats(item)
+
         for item in node.body:
             if isinstance(item, ast.FunctionDef):
                 if item.name == '__init__':
@@ -207,7 +212,8 @@ class PythonParser:
         '_say_text', '_say_until', '_say_kind', '_is_clone',
         '_render_x', '_render_y', '_render_direction', '_render_size',
         '_pen_down', '_pen_alpha', '_pen_hsv', '_pen_size', '_pen_last',
-        '_effects', '_sound_effects',
+        '_effects', '_sound_effects', '_conditions',
+        '_stretch_x', '_stretch_y', '_text_state',
     }
 
     def _parse_init(self, node: ast.FunctionDef):
@@ -234,6 +240,32 @@ class PythonParser:
                     if isinstance(func, ast.Attribute):
                         if func.attr == '__init__':
                             pass  # super().__init__()
+
+    def _collect_condition_hats(self, node: ast.FunctionDef):
+        """从 run() 里恢复“当计时器/响度 > 值”帽子的阈值"""
+        for stmt in node.body:
+            if not isinstance(stmt, ast.Expr) or not isinstance(stmt.value, ast.Call):
+                continue
+            call = stmt.value
+            func = call.func
+            if not (isinstance(func, ast.Attribute)
+                    and func.attr == '_register_greater_than'
+                    and len(call.args) >= 3):
+                continue
+            menu = self._eval_expr(call.args[0])
+            limit = 10
+            if isinstance(call.args[1], ast.Lambda):
+                value = self._eval_expr(call.args[1].body)
+                if isinstance(value, (int, float)):
+                    limit = value
+            method = call.args[2]
+            if isinstance(method, ast.Attribute):
+                name = method.attr
+            elif isinstance(method, ast.Name):
+                name = method.id
+            else:
+                continue
+            self._condition_hats[name] = (str(menu).lower(), limit)
 
     def _parse_run_method(self, node: ast.FunctionDef):
         """解析run方法"""
@@ -278,6 +310,21 @@ class PythonParser:
             if match:
                 msg = match.group(1)
             stmt = Statement(type=BlockType.WHEN_BROADCAST_RECEIVED, value=make_string(msg))
+        elif func_name.startswith('when_backdrop_'):
+            backdrop = func_name[len('when_backdrop_'):]
+            doc = ast.get_docstring(node) or ''
+            match = re.search(r"当背景换成'(.*)'时", doc)
+            if match:
+                backdrop = match.group(1)
+            stmt = Statement(type=BlockType.WHEN_BACKDROP_SWITCHES,
+                             extra={'backdrop': backdrop})
+        elif func_name.startswith(('when_timer_greater_than',
+                                   'when_loudness_greater_than')):
+            menu, limit = self._condition_hats.get(
+                func_name, ('timer' if 'timer' in func_name else 'loudness', 10))
+            stmt = Statement(type=BlockType.WHEN_GREATER_THAN,
+                             extra={'menu': 'TIMER' if menu == 'timer' else 'LOUDNESS'},
+                             value=make_number(limit))
         else:
             return
 

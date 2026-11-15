@@ -22,6 +22,7 @@ BLOCK_TYPE_TO_OPCODE: Dict[BlockType, str] = {
     BlockType.WHEN_THIS_SPRITE_CLICKED: 'event_whenthisspriteclicked',
     BlockType.WHEN_BACKDROP_SWITCHES: 'event_whenbackdropswitchesto',
     BlockType.WHEN_BROADCAST_RECEIVED: 'event_whenbroadcastreceived',
+    BlockType.WHEN_GREATER_THAN: 'event_whengreaterthan',
 
     BlockType.MOVE_STEPS: 'motion_movesteps',
     BlockType.TURN_RIGHT: 'motion_turnright',
@@ -316,7 +317,7 @@ class ScratchWriter:
             if not isinstance(stmt, Statement) or id(stmt) in seen:
                 return
             seen.add(id(stmt))
-            if stmt.type == BlockType.EXTENSION:
+            if stmt.type in (BlockType.EXTENSION, BlockType.EXTENSION_HAT):
                 add(stmt.extra.get('namespace'))
             for field in ('value', 'condition', 'target', 'expr'):
                 walk_expr(getattr(stmt, field, None))
@@ -465,13 +466,26 @@ class ScratchWriter:
 
         elif stmt.type in (BlockType.WHEN_THIS_SPRITE_CLICKED,
                            BlockType.START_AS_CLONE,
-                           BlockType.WHEN_BACKDROP_SWITCHES,
-                           BlockType.WHEN_GREATER_THAN,
                            BlockType.WHEN_LOUDNESS,
                            BlockType.WHEN_TIMER):
             block_data["topLevel"] = True
             block_data["x"] = 50
             block_data["y"] = 50
+
+        elif stmt.type == BlockType.WHEN_BACKDROP_SWITCHES:
+            block_data["topLevel"] = True
+            block_data["x"] = 50
+            block_data["y"] = 50
+            block_data["fields"]["BACKDROP"] = [
+                stmt.extra.get('backdrop', 'backdrop1'), None]
+
+        elif stmt.type == BlockType.WHEN_GREATER_THAN:
+            block_data["topLevel"] = True
+            block_data["x"] = 50
+            block_data["y"] = 50
+            block_data["fields"]["WHENGREATERTHANMENU"] = [
+                stmt.extra.get('menu', 'TIMER'), None]
+            block_data["inputs"]["VALUE"] = self.write_number_input(stmt.value, 10)
 
         elif stmt.type == BlockType.MOVE_STEPS:
             block_data["inputs"]["STEPS"] = self.write_number_input(stmt.value, 10)
@@ -775,8 +789,13 @@ class ScratchWriter:
             block_data["inputs"]["CLONE_OPTION"] = self.write_menu_input(
                 "control_create_clone_of_menu", "CLONE_OPTION", target, block_id)
 
-        elif stmt.type == BlockType.EXTENSION:
+        elif stmt.type in (BlockType.EXTENSION, BlockType.EXTENSION_HAT):
             block_data["opcode"] = stmt.extra.get('opcode', 'unknown')
+            if stmt.type == BlockType.EXTENSION_HAT:
+                # 扩展帽子是脚本开头，必须标记顶层并给坐标
+                block_data["topLevel"] = True
+                block_data["x"] = 50
+                block_data["y"] = 50
             for name, value in stmt.extra.get('inputs', []):
                 block_data["inputs"][name] = self.write_any_input(value)
             for name, value in stmt.extra.get('fields', {}).items():

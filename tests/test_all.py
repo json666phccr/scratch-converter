@@ -17,7 +17,7 @@ from ir import (
 )
 from scratch_parser import parse_scratch_project
 from scratch_writer import write_scratch_project
-from python_generator import generate_python
+from python_generator import generate_python, generate_modules
 from python_parser import parse_python_code, python_to_project
 
 
@@ -2781,6 +2781,1190 @@ def test_chinese_sprite_instance_name():
     return True
 
 
+def test_timer_greater_than_hat():
+    """当计时器 > 值 帽子事件：条件由假变真时触发一次，重复为真不重复触发"""
+    print("[测试49] 当计时器大于设定值")
+
+    project = make_project({
+        "b1": block("event_whengreaterthan", "b2", None, top_level=True,
+                    inputs={"VALUE": [1, [4, "0.05"]]},
+                    fields={"WHENGREATERTHANMENU": ["TIMER", None]}),
+        "b2": block("data_changevariableby", None, "b1",
+                    inputs={"VALUE": [1, [4, "1"]]},
+                    fields={"VARIABLE": ["hits", "v1"]}),
+    }, name="TimerHat")
+    project["targets"][0]["variables"] = {"v1": ["hits", 0]}
+
+    ir = parse_scratch_project(project)
+    code = generate_python(ir)
+    assert "_register_greater_than('timer'" in code, "应生成计时器帽子注册"
+
+    # 往返：Scratch -> Python -> Scratch 保留菜单和阈值
+    written = write_scratch_project(ir)
+    hats = [b for b in written["targets"][-1]["blocks"].values()
+            if isinstance(b, dict) and b.get("opcode") == "event_whengreaterthan"]
+    assert hats, "往返后应保留当计时器大于帽子"
+    assert hats[0]["fields"]["WHENGREATERTHANMENU"][0] == "TIMER"
+    assert hats[0]["inputs"].get("VALUE"), "应写入阈值输入"
+
+    namespace = {}
+    exec(compile(code, "<generated>", "exec"), namespace)
+    runtime = namespace["ScratchRuntime"](headless=True, audio=False)
+    sprite = namespace["TimerHat"]()
+    runtime.add_sprite(sprite)
+    sprite.run()
+    runtime.green_flag()
+    try:
+        import time
+        deadline = time.time() + 5
+        while time.time() < deadline and sprite.hits == 0:
+            runtime.step()
+            time.sleep(0.01)
+        assert sprite.hits >= 1, "计时器超过阈值后脚本应运行"
+
+        for _ in range(10):
+            runtime.step()
+            time.sleep(0.01)
+        assert sprite.hits == 1, \
+            f"条件持续为真时不应重复触发: {sprite.hits}"
+
+        # 重置计时器 -> 条件变假，再次超过阈值时应重新触发
+        runtime.reset_timer()
+        sprite.hits = 0
+        deadline = time.time() + 5
+        while time.time() < deadline and sprite.hits == 0:
+            runtime.step()
+            time.sleep(0.01)
+        assert sprite.hits >= 1, "重置计时器后应再次触发"
+    finally:
+        runtime.running = False
+        runtime.shutdown()
+
+    print("  [PASS] 当计时器大于设定值通过")
+    return True
+
+
+def test_backdrop_hat_roundtrip():
+    """当背景换成 帽子事件在往返中保留背景名"""
+    print("[测试50] 背景帽子事件往返")
+
+    project = make_project({
+        "b1": block("event_whenbackdropswitchesto", None, None, top_level=True,
+                    fields={"BACKDROP": ["夜景", None]}),
+    }, name="BackdropHat")
+    ir = parse_scratch_project(project)
+    hat = next(s for s in ir.sprites[0].statements
+               if s.type == BlockType.WHEN_BACKDROP_SWITCHES)
+    assert hat.extra.get('backdrop') == '夜景'
+
+    written = write_scratch_project(ir)
+    backdrop_fields = [b["fields"]["BACKDROP"][0]
+                       for b in written["targets"][-1]["blocks"].values()
+                       if isinstance(b, dict) and b.get("opcode")
+                       == "event_whenbackdropswitchesto"]
+    assert backdrop_fields == ["夜景"], f"写回应保留背景名: {backdrop_fields}"
+
+    code = generate_python(ir)
+    restored = python_to_project(parse_python_code(code, "BackdropHat"))
+    restored_hat = next(s for s in restored.sprites[0].statements
+                        if s.type == BlockType.WHEN_BACKDROP_SWITCHES)
+    assert restored_hat.extra.get('backdrop') == '夜景', \
+        f"Python往返后背景名丢失: {restored_hat.extra}"
+
+    print("  [PASS] 背景帽子事件往返通过")
+    return True
+
+
+def test_pitch_sound_resampling():
+    """音高特效真正改变音调：rate = 2^(pitch/120)，且结果会缓存"""
+    print("[测试51] 音高变调")
+
+    project = make_project({
+        "b1": block("event_whenflagclicked", None, None, top_level=True),
+    }, name="Pitch")
+    code = generate_python(parse_scratch_project(project))
+    namespace = {}
+    exec(compile(code, "<generated>", "exec"), namespace)
+    pygame = namespace["pygame"]
+    runtime = namespace["ScratchRuntime"](headless=True, audio=False)
+    sprite = namespace["Pitch"]()
+    runtime.add_sprite(sprite)
+
+    import array as array_module
+    previous_driver = os.environ.get('SDL_AUDIODRIVER')
+    os.environ['SDL_AUDIODRIVER'] = 'dummy'
+    try:
+        if pygame.mixer.get_init() is None:
+            pygame.mixer.init(frequency=22050, size=-16, channels=1)
+    except Exception:
+        print("  [PASS] 音高变调（当前环境无音频设备，跳过校验）")
+        return True
+
+    try:
+        frequency, _size, channels = pygame.mixer.get_init()
+        total = frequency
+        samples = array_module.array('h')
+        for index in range(total):
+            samples.append(int(10000 * math.sin(2 * math.pi * 440 * index / frequency)))
+        sound = pygame.mixer.Sound(buffer=samples.tobytes())
+
+        assert runtime._pitched_sound(sound, 'tone', 0) is sound, \
+            "音高为 0 时应复用原 Sound"
+        base = sound.get_length()
+        higher = runtime._pitched_sound(sound, 'tone', 120)
+        assert higher is not sound, "音高 +120 应生成变调副本"
+        assert abs(higher.get_length() - base / 2) < 0.1, \
+            f"高八度时长应减半: {base} -> {higher.get_length()}"
+        assert runtime._pitched_sound(sound, 'tone', 120) is higher, \
+            "同一音高应命中缓存"
+        lower = runtime._pitched_sound(sound, 'tone', -120)
+        assert abs(lower.get_length() - base * 2) < 0.2, \
+            f"低八度时长应加倍: {base} -> {lower.get_length()}"
+    finally:
+        pygame.mixer.quit()
+        if previous_driver is None:
+            os.environ.pop('SDL_AUDIODRIVER', None)
+        else:
+            os.environ['SDL_AUDIODRIVER'] = previous_driver
+        runtime.running = False
+        runtime.shutdown()
+
+    print("  [PASS] 音高变调通过")
+    return True
+
+
+def test_text2speech_extension():
+    """text2speech：朗读调用与嗓音/语言切换"""
+    print("[测试52] 文字朗读扩展")
+
+    project = make_project({
+        "b1": block("event_whenflagclicked", "b2", None, top_level=True),
+        "b2": block("text2speech_speakAndWait", None, "b1",
+                    inputs={"WORDS": [1, [10, "你好"]]}),
+    }, name="TTS")
+    project["extensions"] = ["text2speech"]
+
+    code = generate_python(parse_scratch_project(project))
+    assert "register_extension('text2speech'" in code
+    assert "'text2speech_speakAndWait'" in code
+
+    namespace = {}
+    exec(compile(code, "<generated>", "exec"), namespace)
+    runtime = namespace["ScratchRuntime"](headless=True, audio=False)
+    sprite = namespace["TTS"]()
+    runtime.add_sprite(sprite)
+    spoken = []
+    runtime._speak_blocking = spoken.append
+    try:
+        assert runtime.tts_voice == 'alto' and runtime.tts_language == 'English'
+        sprite.extension('text2speech', 'text2speech_speakAndWait',
+                         {'WORDS': '你好'}, {})
+        assert spoken == ['你好'], f"朗读内容不正确: {spoken}"
+
+        sprite.extension('text2speech', 'text2speech_setVoice', {},
+                         {'VOICE': 'giant'})
+        assert runtime.tts_voice == 'giant'
+        sprite.extension('text2speech', 'text2speech_setLanguage', {},
+                         {'LANGUAGE': '简体中文'})
+        assert runtime.tts_language == '简体中文'
+    finally:
+        runtime.running = False
+        runtime.shutdown()
+
+    print("  [PASS] 文字朗读扩展通过")
+    return True
+
+
+def test_stretch_extension():
+    """角色拉伸：设置/增加 x、y 拉伸，并作用到渲染与舞台围栏"""
+    print("[测试53] 角色拉伸扩展")
+
+    project = make_project({
+        "b1": block("event_whenflagclicked", "b2", None, top_level=True),
+        "b2": block("stretch_setStretchX", None, "b1",
+                    inputs={"X": [1, [4, "150"]]}),
+    }, name="Stretch")
+    project["extensions"] = ["stretch"]
+    code = generate_python(parse_scratch_project(project))
+    assert "register_extension('stretch'" in code
+    assert "self.extension('stretch', 'stretch_setStretchX'" in code
+
+    namespace = {}
+    exec(compile(code, "<generated>", "exec"), namespace)
+    pygame = namespace["pygame"]
+    runtime = namespace["ScratchRuntime"](headless=True, audio=False)
+    sprite = namespace["Stretch"]()
+    runtime.add_sprite(sprite)
+    try:
+        sprite.extension('stretch', 'stretch_setStretchX', {'X': 200}, {})
+        assert sprite._stretch_x == 200
+        assert sprite.extension('stretch', 'stretch_getX', {}, {}) == 200
+        sprite.extension('stretch', 'stretch_changeStretchY', {'DY': 50}, {})
+        assert sprite._stretch_y == 150
+        sprite.extension('stretch', 'stretch_setStretch', {'X': 50, 'Y': 25}, {})
+        assert (sprite._stretch_x, sprite._stretch_y) == (50, 25)
+        assert sprite.extension('stretch', 'stretch_getY', {}, {}) == 25
+
+        surface = pygame.Surface((40, 20), pygame.SRCALPHA)
+        surface.fill((255, 0, 0, 255))
+        sprite._costume_surface = lambda: surface
+        sprite._stretch_x = 200
+        sprite._stretch_y = 100
+        image, _rect, _x, _y, _scale, _direction = sprite._rendered_image()
+        assert image.get_width() == 80 and image.get_height() == 20, \
+            f"拉伸后尺寸应为 80x20: {image.get_size()}"
+        half_w, half_h = sprite._sprite_bounds()
+        assert abs(half_w - 40) < 2 and abs(half_h - 10) < 2, \
+            f"围栏半宽/半高应包含拉伸: {half_w},{half_h}"
+
+        # 克隆体继承拉伸
+        clone = sprite._make_clone()
+        assert clone is not None
+        assert clone._stretch_x == 200 and clone._stretch_y == 100
+    finally:
+        runtime.running = False
+        runtime.shutdown()
+
+    print("  [PASS] 角色拉伸扩展通过")
+    return True
+
+
+def test_animated_text_extension():
+    """艺术字：显示文字、样式、宽度换行、打字动画与清除"""
+    print("[测试54] 艺术字扩展")
+
+    import time
+
+    project = make_project({
+        "b1": block("event_whenflagclicked", "b2", None, top_level=True),
+        "b2": block("text_setText", "b3", "b1",
+                    inputs={"TEXT": [1, [10, "Hello"]]}),
+        "b3": block("text_setWidthInput", None, "b2",
+                    inputs={"WIDTH": [1, [4, "120"]], "ALIGN": [1, "m1"]}),
+        "m1": block("text_menu_twAlign", None, None,
+                    fields={"twAlign": ["left", None]}),
+    }, name="ArtText")
+    project["targets"][0]["blocks"]["m1"]["shadow"] = True
+    project["extensions"] = ["text"]
+    code = generate_python(parse_scratch_project(project))
+    assert "register_extension('text'" in code
+    assert "self.extension('text', 'text_setText'" in code
+    assert "'ALIGN': 'left'" in code, "菜单 shadow 块应解析成菜单文本"
+
+    namespace = {}
+    exec(compile(code, "<generated>", "exec"), namespace)
+    pygame = namespace["pygame"]
+    runtime = namespace["ScratchRuntime"](headless=True, audio=False)
+    sprite = namespace["ArtText"]()
+    runtime.add_sprite(sprite)
+    try:
+        sprite.extension('text', 'text_setText', {'TEXT': 'Hello'}, {})
+        assert sprite._text_active()
+        assert sprite._text_displayed() == 'Hello'
+        image, _cx, _cy = sprite._text_image()
+        assert image.get_width() > 10 and image.get_height() > 10
+        assert pygame.mask.from_surface(image).count() > 0, "文字应被渲染出来"
+
+        sprite.extension('text', 'text_setFont', {}, {'FONT': 'Serif'})
+        assert sprite._text_attribute('font') == 'Serif'
+        sprite.extension('text', 'text_setColor', {}, {'COLOR': '#ff0000'})
+        assert sprite._text_attribute('color') == '#ff0000'
+        sprite.extension('text', 'text_setAlignment', {}, {'ALIGN': 'left'})
+        assert sprite._text_attribute('alignment') == 'left'
+        sprite.extension('text', 'text_setOutlineWidth', {'WIDTH': 2}, {})
+        assert sprite._text_attribute('outline width') == 2
+
+        # 宽度限制会换行
+        sprite.extension('text', 'text_setText',
+                         {'TEXT': 'Hello world this is a long line'}, {})
+        sprite.extension('text', 'text_setWidthValue', {'WIDTH': 60}, {})
+        assert sprite._text_count_lines(True) > 1, "窄宽度下应自动换行"
+
+        # 打字动画：延迟很小，等待显示完整文本
+        text = 'Hello world this is a long line'
+        sprite.extension('text', 'text_setTypeDelay', {'NUM': 0.01}, {})
+        sprite.extension('text', 'text_startAnimate', {}, {'ANIMATE': 'type'})
+        deadline = time.time() + 5
+        while time.time() < deadline and sprite._text_displayed() != text:
+            time.sleep(0.01)
+        assert sprite._text_displayed() == text, \
+            f"打字动画应显示完整文本: {sprite._text_displayed()!r}"
+        assert sprite._text_is_animating() is False
+
+        # 清除文字
+        sprite.extension('text', 'text_clearText', {}, {})
+        assert not sprite._text_active()
+        assert sprite._text_image() is None
+    finally:
+        runtime.running = False
+        runtime.shutdown()
+
+    print("  [PASS] 艺术字扩展通过")
+    return True
+
+
+def test_json_extension():
+    """TurboWarp JSON 扩展：解析、对象/数组操作、路径、分析、列表读写"""
+    print("[测试55] JSON 扩展")
+
+    project = make_project({
+        "b1": block("event_whenflagclicked", "b2", None, top_level=True),
+        "b2": block("skyhigh173JSON_json_get", None, "b1",
+                    inputs={"item": [1, [10, "key"]],
+                            "json": [1, [10, '{"key":"value"}']]}),
+    }, name="Json")
+    project["targets"][0]["lists"] = {"l1": ["mylist", ["a", "b"]]}
+    project["targets"][0]["blocks"]["b3"] = block(
+        "skyhigh173JSON_json_vm_getlist", None, "b2", inputs={"list": [1, "m1"]})
+    project["targets"][0]["blocks"]["b2"]["next"] = "b3"
+    project["targets"][0]["blocks"]["m1"] = block(
+        "skyhigh173JSON_menu_get_list", None, None,
+        fields={"get_list": ["l1", None]})
+    project["targets"][0]["blocks"]["m1"]["shadow"] = True
+    project["extensions"] = ["skyhigh173JSON"]
+
+    code = generate_python(parse_scratch_project(project))
+    assert "register_extension('skyhigh173JSON'" in code
+    assert "self.extension('skyhigh173JSON', 'skyhigh173JSON_json_get'" in code
+    assert "'list': 'mylist'" in code, "列表ID菜单应解析成列表名"
+
+    namespace = {}
+    exec(compile(code, "<generated>", "exec"), namespace)
+    runtime = namespace["ScratchRuntime"](headless=True, audio=False)
+    sprite = namespace["Json"]()
+    runtime.add_sprite(sprite)
+
+    def call(opcode, inputs=None, fields=None):
+        return sprite.extension('skyhigh173JSON', opcode, inputs or {}, fields or {})
+
+    try:
+        # 通用工具
+        assert call('skyhigh173JSON_json_is_valid', {'json': '{"a":1}'}) is True
+        assert call('skyhigh173JSON_json_is_valid', {'json': 'nope'}) is False
+        assert call('skyhigh173JSON_json_is', {'json': '[1,2]'},
+                    {'types': 'Array'}) is True
+        assert call('skyhigh173JSON_json_is', {'json': '{"a":1}'},
+                    {'types': 'Array'}) is False
+        assert call('skyhigh173JSON_json_new', {}, {'json': 'Array'}) == '[]'
+        assert call('skyhigh173JSON_json_minify', {'json': ' {"a" : 1 } '}) == '{"a":1}'
+        assert call('skyhigh173JSON_json_length', {'json': '[1,2,3]'}) == 3
+        assert call('skyhigh173JSON_json_get_all',
+                    {'json': '{"a":1,"b":2}'}, {'Stype': 'keys'}) == '["a","b"]'
+        assert call('skyhigh173JSON_json_get_all',
+                    {'json': '{"a":1,"b":2}'}, {'Stype': 'values'}) == '[1,2]'
+        assert call('skyhigh173JSON_json_equal',
+                    {'json1': '{"a":0,"b":1}', 'json2': '{"b":1,"a":0}'},
+                    {'equal': '='}) is True
+        assert call('skyhigh173JSON_json_flip',
+                    {'json': '{"a":"b"}'}) == '{"b":"a"}'
+        assert call('skyhigh173JSON_json_has_key',
+                    {'json': '{"a":1}', 'key': 'a'}) is True
+        assert call('skyhigh173JSON_json_has_value',
+                    {'json': '["x","y"]', 'value': 'y'}) is True
+
+        # 对象读写与路径
+        assert call('skyhigh173JSON_json_get',
+                    {'item': 'b', 'json': '{"a":1,"b":{"c":2}}'}) == '{"c":2}'
+        assert call('skyhigh173JSON_json_set',
+                    {'item': 'b', 'value': '5', 'json': '{"a":1}'}) == '{"a":1,"b":"5"}'
+        assert call('skyhigh173JSON_json_delete',
+                    {'item': 'a', 'json': '{"a":1,"b":2}'}) == '{"b":2}'
+        path_json = '{"key":{"inner":[true,false]}}'
+        assert call('skyhigh173JSON_json_get_path',
+                    {'path': '["key","inner",1]', 'json': path_json}) is True
+        assert call('skyhigh173JSON_json_set_path',
+                    {'path': '["key","inner",1]', 'json': path_json,
+                     'data': 'x'}) == '{"key":{"inner":["x",false]}}'
+
+        # 数组操作
+        assert call('skyhigh173JSON_json_array_get',
+                    {'item': 2, 'json': '["a","b","c"]'}) == 'b'
+        assert call('skyhigh173JSON_json_array_get',
+                    {'item': -1, 'json': '["a","b","c"]'}) == 'c'
+        assert call('skyhigh173JSON_json_array_push',
+                    {'item': 'c', 'json': '["a","b"]'}) == '["a","b","c"]'
+        assert call('skyhigh173JSON_json_array_insert',
+                    {'item': 'x', 'pos': 2, 'json': '["a","b"]'}) == '["a","x","b"]'
+        assert call('skyhigh173JSON_json_array_set',
+                    {'item': 'x', 'pos': 2, 'json': '["a","b"]'}) == '["a","x"]'
+        assert call('skyhigh173JSON_json_array_delete',
+                    {'item': 1, 'json': '["a","b"]'}) == '["b"]'
+        assert call('skyhigh173JSON_json_array_remove_all',
+                    {'item': 'a', 'json': '["a","b","a"]'}) == '["b"]'
+        assert call('skyhigh173JSON_json_array_itemH',
+                    {'item': 'b', 'json': '["a","b"]'}) == 2
+        assert call('skyhigh173JSON_json_array_from',
+                    {'json': 'abcd'}) == '["a","b","c","d"]'
+        assert call('skyhigh173JSON_json_array_fromto',
+                    {'json': '[1,2,3,4]', 'item': 2, 'item2': 3}) == '[2,3]'
+        assert call('skyhigh173JSON_json_array_reverse',
+                    {'json': '[1,2]'}) == '[2,1]'
+        assert call('skyhigh173JSON_json_array_flat',
+                    {'json': '[[1],2,[3,4],[5,[6]]]', 'depth': 1}) == '[1,2,3,4,5,[6]]'
+        assert call('skyhigh173JSON_json_array_concat',
+                    {'json': '[1]', 'json2': '[2]'}) == '[1,2]'
+        assert call('skyhigh173JSON_json_array_filter',
+                    {'key': 'id', 'json': '[{"id":12},{"x":1}]'}) == '[12,null]'
+        assert call('skyhigh173JSON_json_array_setlen',
+                    {'json': '[1,2,3]', 'len': 2}) == '[1,2]'
+        assert call('skyhigh173JSON_json_array_filter',
+                    {'key': 'id', 'json': '[{"id":1}]'}) == '[1]'
+        assert call('skyhigh173JSON_json_merge',
+                    {'json1': '{"a":1}', 'json2': '{"b":2}'}) == '{"a":1,"b":2}'
+        assert call('skyhigh173JSON_json_array_create',
+                    {'text': 'a,b,c', 'd': ','}) == '["a","b","c"]'
+        assert call('skyhigh173JSON_json_array_join',
+                    {'json': '["a","b"]', 'd': '-'}) == 'a-b'
+        assert call('skyhigh173JSON_json_array_sort',
+                    {'list': '[3,1,2]'}, {'order': 'ascending'}) == '[1,2,3]'
+        assert call('skyhigh173JSON_json_array_textfilter',
+                    {'list': '["apple","banana","orange"]',
+                     'text': 'e'}, {'options': 'includes', 'type': 'Array'}) \
+            == '["apple","orange"]'
+
+        # 数据分析
+        numbers = '[17,1,2017,0,120,14]'
+        assert call('skyhigh173JSON_json_array_analysis',
+                    {'list': numbers}, {'analysis': 'sum'}) == 2169
+        assert call('skyhigh173JSON_json_array_analysis',
+                    {'list': numbers}, {'analysis': 'minimum'}) == 0
+        assert call('skyhigh173JSON_json_array_analysis',
+                    {'list': numbers}, {'analysis': 'maximum'}) == 2017
+        assert call('skyhigh173JSON_json_array_analysis',
+                    {'list': '[1,2,3]'}, {'analysis': 'average'}) == 2
+
+        # 列表读写
+        assert call('skyhigh173JSON_json_vm_getlist', {'list': 'mylist'}) == '["a","b"]'
+        call('skyhigh173JSON_json_vm_setlist',
+             {'list': 'mylist', 'json': '[1,{"x":2}]'})
+        assert sprite.mylist == [1, '{"x":2}']
+    finally:
+        runtime.running = False
+        runtime.shutdown()
+
+    print("  [PASS] JSON 扩展通过")
+    return True
+
+
+def test_split_modules_output():
+    """模块化多文件输出：入口 + 运行时 + 每个角色独立模块，且能实际运行"""
+    print("[测试56] 模块化多文件输出")
+
+    import tempfile
+    import shutil
+    import subprocess
+
+    project = make_project({
+        "b1": block("event_whenflagclicked", None, None, top_level=True),
+    }, name="First")
+    second = json.loads(json.dumps(project["targets"][0]))
+    second["name"] = "Second"
+    second["blocks"] = {
+        "b1": block("event_whenflagclicked", None, None, top_level=True)}
+    project["targets"].append(second)
+
+    ir = parse_scratch_project(project)
+    entry, files = generate_modules(ir, "demo")
+
+    assert "from demo_runtime import ScratchRuntime" in entry
+    assert "from demo_sprite_01_First import First" in entry
+    assert "from demo_sprite_02_Second import Second" in entry
+    assert "demo_runtime.py" in files
+    assert len([name for name in files if "_sprite_" in name]) == 2
+
+    runtime_lines = len(files["demo_runtime.py"].splitlines())
+    sprite_lines = [len(code.splitlines()) for name, code in files.items()
+                    if "_sprite_" in name]
+    assert runtime_lines > 1000, "运行时是独立模块"
+    assert all(lines < runtime_lines / 2 for lines in sprite_lines), \
+        f"角色模块应远小于运行时: {sprite_lines} vs {runtime_lines}"
+
+    directory = tempfile.mkdtemp()
+    try:
+        for name, code in files.items():
+            with open(os.path.join(directory, name), "w", encoding="utf-8") as f:
+                f.write(code)
+        entry_path = os.path.join(directory, "demo.py")
+        with open(entry_path, "w", encoding="utf-8") as f:
+            f.write(entry)
+        result = subprocess.run(
+            [sys.executable, entry_path, "--headless", "--frames", "1",
+             "--no-audio", "--windowed"],
+            capture_output=True, text=True, timeout=120)
+        assert result.returncode == 0, result.stderr
+        assert "Traceback" not in result.stderr, result.stderr
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+    print("  [PASS] 模块化多文件输出通过")
+    return True
+
+
+def test_general_python_extended_syntax():
+    """通用模式第二批语法：sorted/reversed/enumerate(start)、random、time.sleep、
+    条件表达式、round 位数、pow、f-string 格式、列表 copy/extend"""
+    print("[测试57] 通用Python扩展语法")
+    from general_python import parse_general_project
+
+    code = '''
+import math
+import random
+import time
+
+nums = [3, 1, 2]
+nums.sort()
+nums.extend([9, 10])
+copy_nums = nums.copy()
+sorted_copy = sorted(nums)
+reversed_copy = reversed(nums)
+
+for n in sorted(nums, reverse=True):
+    print(n)
+for i, n in enumerate(nums, 1):
+    print(i, n)
+for n in reversed(nums):
+    print(n)
+
+x = 10 if len(nums) > 3 else 0
+y = round(3.14159, 2)
+z = random.randint(1, 6)
+r = random.random()
+u = random.uniform(1, 2)
+c = random.choice(nums)
+p = pow(2, 10)
+f = math.fabs(-3)
+time.sleep(0.01)
+print(f"{y:.2f}")
+'''
+    project = parse_general_project(code, 'Syntax2')
+    assert not project.warnings, f"不应有未支持特性: {project.warnings}"
+
+    data = write_scratch_project(project)
+    opcodes = {}
+    for target in data['targets']:
+        for block in target['blocks'].values():
+            opcodes[block['opcode']] = opcodes.get(block['opcode'], 0) + 1
+    for expected in ('operator_random', 'control_wait', 'operator_round',
+                     'operator_mathop', 'data_addtolist',
+                     'data_deletealloflist', 'control_repeat'):
+        assert expected in opcodes, f"缺少积木: {expected}"
+
+    print("  [PASS] 通用Python扩展语法通过")
+    return True
+
+
+def test_dunder_variables_and_tw_stage_size():
+    """双下划线变量不会被 name mangling 破坏；TurboWarp width 选项生效"""
+    print("[测试58] 双下划线变量与舞台尺寸")
+
+    import time
+
+    project = make_project({
+        "b1": block("event_whenflagclicked", "b2", None, top_level=True),
+        "b2": block("data_changevariableby", None, "b1",
+                    inputs={"VALUE": [1, [4, "1"]]},
+                    fields={"VARIABLE": ["__计数", "v1"]}),
+    }, name="Dunder")
+    project["targets"][0]["variables"] = {"v1": ["__计数", 0]}
+    project["targets"][0]["comments"] = {"c1": {
+        "blockId": None, "x": 0, "y": 0, "width": 200, "height": 100,
+        "minimized": False,
+        "text": 'Configuration for TurboWarp\n{"width":640} // _twconfig_'}}
+
+    code = generate_python(parse_scratch_project(project))
+    assert "parser.set_defaults(stage_size='640x360')" in code, \
+        "TurboWarp width 选项应转换为舞台尺寸"
+    assert "self.var__计数" in code, "双下划线变量应加前缀避免 name mangling"
+    assert "self.__计数" not in code
+
+    namespace = {}
+    exec(compile(code, "<generated>", "exec"), namespace)
+    runtime = namespace["ScratchRuntime"](headless=True, audio=False)
+    sprite = namespace["Dunder"]()
+    runtime.add_sprite(sprite)
+    sprite.run()
+    runtime.green_flag()
+    try:
+        deadline = time.time() + 3
+        while time.time() < deadline and getattr(sprite, "var__计数", 0) < 1:
+            runtime.step()
+            time.sleep(0.01)
+        assert getattr(sprite, "var__计数", 0) == 1, \
+            "双下划线变量应能正常读写"
+    finally:
+        runtime.running = False
+        runtime.shutdown()
+
+    print("  [PASS] 双下划线变量与舞台尺寸通过")
+    return True
+
+
+def test_pen_performance_paths():
+    """画笔优化：空图层跳过合成、颜色缓存、透明线段不绘制"""
+    print("[测试59] 画笔性能优化")
+
+    project = make_project({
+        "b1": block("event_whenflagclicked", None, None, top_level=True),
+    }, name="Pen")
+    code = generate_python(parse_scratch_project(project))
+    namespace = {}
+    exec(compile(code, "<generated>", "exec"), namespace)
+    pygame = namespace["pygame"]
+    runtime = namespace["ScratchRuntime"](headless=True, audio=False)
+    try:
+        assert runtime._pen_used is False, "初始画笔图层应为空"
+        probe = (runtime.stage_width // 2, runtime.stage_height // 2)
+        # 画过东西却不标记 used 时，合成应跳过画笔层
+        runtime.pen_layer.fill((255, 0, 0, 255))
+        runtime._draw()
+        assert tuple(runtime.stage_surface.get_at(probe))[:3] == (255, 255, 255), \
+            "画笔图层为空时应跳过合成"
+        runtime._pen_used = True
+        runtime._draw()
+        assert tuple(runtime.stage_surface.get_at(probe))[:3] == (255, 0, 0), \
+            "有内容时应正常合成画笔层"
+
+        runtime.pen_clear()
+        assert runtime._pen_used is False
+        assert tuple(runtime.pen_layer.get_at(probe))[3] == 0
+
+        color_a = runtime.pen_color(0, 100, 100, 0)
+        color_b = runtime.pen_color(0, 100, 100, 0)
+        assert color_a is color_b, "相同画笔颜色应命中缓存"
+
+        # 透明度 100 的线段不会绘制，也不会标记图层
+        runtime.pen_draw_segment((0, 0), (50, 0),
+                                 runtime.pen_color(0, 100, 100, 100), 10)
+        assert runtime._pen_used is False
+        assert tuple(runtime.pen_layer.get_at(probe))[3] == 0, \
+            "完全透明的线段不应留下像素"
+
+        runtime.pen_draw_segment((-50, 0), (50, 0), (0, 0, 255, 255), 8)
+        assert runtime._pen_used is True
+        assert tuple(runtime.pen_layer.get_at(probe))[3] > 0
+    finally:
+        runtime.running = False
+        runtime.shutdown()
+
+    print("  [PASS] 画笔性能优化通过")
+    return True
+
+
+def test_tween_extension():
+    """Tween 补间扩展：缓动计算、变量/坐标/属性补间"""
+    print("[测试60] Tween 补间扩展")
+
+    import time
+
+    project = make_project({
+        "b1": block("event_whenflagclicked", "b2", None, top_level=True),
+        "b2": block("jeremygamerTweening_tweenVariable", "b3", "b1",
+                    inputs={"VALUE": [1, [4, "100"]],
+                            "SEC": [1, [4, "0.12"]],
+                            "MODE": [1, [10, "linear"]],
+                            "DIRECTION": [1, [10, "in"]]},
+                    fields={"VAR": ["var1", None]}),
+        "b3": block("jeremygamerTweening_tweenProperty", None, "b2",
+                    inputs={"VALUE": [1, [4, "50"]],
+                            "SEC": [1, [4, "0"]],
+                            "MODE": [1, [10, "linear"]],
+                            "DIRECTION": [1, [10, "in"]]},
+                    fields={"PROPERTY": ["x position", None]}),
+    }, name="Tween")
+    project["targets"][0]["variables"] = {"var1": ["score", 0]}
+    project["extensions"] = ["jeremygamerTweening"]
+
+    code = generate_python(parse_scratch_project(project))
+    assert "'VAR': 'score'" in code, "Tween 变量ID应转换为变量名"
+    assert "jeremygamerTweening" in code
+
+    namespace = {}
+    exec(compile(code, "<generated>", "exec"), namespace)
+    runtime = namespace["ScratchRuntime"](headless=True, audio=False)
+    sprite = namespace["Tween"]()
+    runtime.add_sprite(sprite)
+    try:
+        def call(opcode, inputs=None, fields=None):
+            return sprite.extension('jeremygamerTweening', opcode,
+                                    inputs or {}, fields or {})
+
+        assert abs(call('jeremygamerTweening_tweenValue',
+                        {'MODE': 'linear', 'DIRECTION': 'in',
+                         'START': 0, 'END': 100, 'AMOUNT': 25}) - 25) < 1e-6
+        assert abs(call('jeremygamerTweening_tweenValue',
+                        {'MODE': 'quad', 'DIRECTION': 'out',
+                         'START': 0, 'END': 100, 'AMOUNT': 50}) - 75) < 1e-6
+        sine = call('jeremygamerTweening_tweenValue',
+                    {'MODE': 'sine', 'DIRECTION': 'in',
+                     'START': 0, 'END': 100, 'AMOUNT': 50})
+        assert abs(sine - 29.2893) < 0.01
+        assert abs(call('jeremygamerTweening_tweenValue',
+                        {'MODE': 'nope', 'DIRECTION': 'in',
+                         'START': 10, 'END': 20, 'AMOUNT': 50}) - 15) < 1e-6
+
+        sprite.run()
+        runtime.green_flag()
+        for _ in range(50):
+            runtime.step()
+            time.sleep(0.005)
+        assert abs(sprite.score - 100) < 1e-6, "变量补间应到达目标值"
+        assert abs(sprite.x - 50) < 1e-6, "坐标补间应到达目标值"
+
+        call('jeremygamerTweening_tweenXY',
+             {'X': -30, 'Y': 40, 'SEC': 0, 'MODE': 'linear', 'DIRECTION': 'in'})
+        assert abs(sprite.x + 30) < 1e-6 and abs(sprite.y - 40) < 1e-6
+    finally:
+        runtime.running = False
+        runtime.shutdown()
+
+    print("  [PASS] Tween 补间扩展通过")
+    return True
+
+
+def test_clones_plus_extension():
+    """Clones+ 扩展：带变量克隆、克隆帽子、变量/属性读写与删除"""
+    print("[测试61] Clones+ 克隆+ 扩展")
+
+    import time
+
+    project = make_project({
+        "b1": block("event_whenflagclicked", "b2", None, top_level=True),
+        "b2": block("lmsclonesplus_createCloneOfMyselfWithVar", None, "b1",
+                    fields={"INPUTA": ["vid", None],
+                            "INPUTB": ["7", None]}),
+        "h1": block("lmsclonesplus_whenCloneStartsWithVar", "h2", None,
+                    top_level=True,
+                    fields={"INPUTA": ["vid", None],
+                            "INPUTB": ["7", None]}),
+        "h2": block("data_setvariableto", None, "h1",
+                    inputs={"VALUE": [1, [10, "yes"]]},
+                    fields={"VARIABLE": ["hat", "hatid"]}),
+    }, name="CloneSprite")
+    project["targets"][0]["variables"] = {
+        "vid": ["id", 0], "hatid": ["hat", 0],
+    }
+    project["extensions"] = ["lmsclonesplus"]
+
+    parsed = parse_scratch_project(project)
+    code = generate_python(parsed)
+    assert "'INPUTA': 'id'" in code, "克隆变量ID应转换为变量名"
+    assert "_register_extension_hat('lmsclonesplus'" in code
+
+    written = write_scratch_project(parse_scratch_project(project))
+    opcodes = [item.get("opcode") for target in written["targets"]
+               for item in target["blocks"].values()]
+    assert "lmsclonesplus_whenCloneStartsWithVar" in opcodes, "帽子块应能写回sb3"
+    assert "lmsclonesplus" in written.get("extensions", [])
+
+    namespace = {}
+    exec(compile(code, "<generated>", "exec"), namespace)
+    runtime = namespace["ScratchRuntime"](headless=True, audio=False)
+    sprite = namespace["CloneSprite"]()
+    runtime.add_sprite(sprite)
+    try:
+        def call(opcode, inputs=None, fields=None):
+            return sprite.extension('lmsclonesplus', opcode,
+                                    inputs or {}, fields or {})
+
+        sprite.run()
+        runtime.green_flag()
+        for _ in range(15):
+            runtime.step()
+            time.sleep(0.004)
+
+        clones = [item for item in runtime.sprites
+                  if getattr(item, '_is_clone', False)]
+        assert len(clones) == 1, "应创建一个克隆体"
+        clone = clones[0]
+        assert str(clone.id) == '7', "克隆体应带上指定变量值"
+        assert clone.hat == 'yes', "带变量克隆帽子应在新克隆体上触发"
+
+        assert call('lmsclonesplus_cloneCount') == 1
+        assert call('lmsclonesplus_spriteCloneCount',
+                    {'INPUT': 'CloneSprite'}) == 1
+        assert call('lmsclonesplus_cloneExists',
+                    {'INPUTA': 'id', 'INPUTB': 7}) is True
+        assert str(call('lmsclonesplus_getVariableOfClone',
+                        {'INPUTA': 'id', 'INPUTB': 'id',
+                         'INPUTC': 7})) == '7'
+        assert call('lmsclonesplus_getThingOfClone',
+                    {'INPUTA': 'x position', 'INPUTB': 'id',
+                     'INPUTC': 7}) == clone.x
+        assert call('lmsclonesplus_getVariableOfMainSprite',
+                    {'INPUT': 'hat'}) == 0
+
+        call('lmsclonesplus_setVariableOfClone',
+             {'INPUTA': 'hat', 'INPUTB': 'done',
+              'INPUTC': 'id', 'INPUTD': 7})
+        assert clone.hat == 'done'
+        call('lmsclonesplus_setVariableOfMainSprite',
+             {'INPUTA': 'hat', 'INPUTB': 'main'})
+        assert sprite.hat == 'main'
+        assert call('lmsclonesplus_isClone') is False
+
+        call('lmsclonesplus_deleteCloneWithVar',
+             {'INPUTA': 'id', 'INPUTB': 7})
+        assert not [item for item in runtime.sprites
+                    if getattr(item, '_is_clone', False)], "克隆体应被删除"
+        assert call('lmsclonesplus_cloneCount') == 0
+    finally:
+        runtime.running = False
+        runtime.shutdown()
+
+    print("  [PASS] Clones+ 克隆+ 扩展通过")
+    return True
+
+
+def test_looks_plus_extension():
+    """Looks+ 扩展：跨角色显示/图层/特效/造型信息/快照"""
+    print("[测试62] Looks+ 外观+ 扩展")
+
+    import tempfile
+
+    project = make_project({
+        "b1": block("event_whenflagclicked", "b2", None, top_level=True),
+        "b2": block("lmsLooksPlus_showSprite", None, "b1",
+                    inputs={"TARGET": [1, "m1"]}),
+        "m1": block("lmsLooksPlus_menu_spriteMenu", None, None,
+                    fields={"spriteMenu": ["B", None]}),
+    }, name="A")
+    project["targets"][0]["blocks"]["m1"]["shadow"] = True
+    sprite_a = project["targets"][0]
+    sprite_a["costumes"] = [{
+        "name": "png1", "md5ext": "abc.png", "dataFormat": "png",
+        "rotationCenterX": 16, "rotationCenterY": 10,
+    }]
+    sprite_b = json.loads(json.dumps(sprite_a))
+    sprite_b["name"] = "B"
+    sprite_b["variables"] = {}
+    sprite_b["costumes"] = [{
+        "name": "svg1", "md5ext": "svg1.svg", "dataFormat": "svg",
+        "rotationCenterX": 5, "rotationCenterY": 6,
+    }]
+    project["targets"].append(sprite_b)
+    project["extensions"] = ["lmsLooksPlus"]
+
+    code = generate_python(parse_scratch_project(project))
+    assert "'TARGET': 'B'" in code, "菜单shadow积木应解析成角色名"
+    namespace = {}
+    exec(compile(code, "<generated>", "exec"), namespace)
+
+    assets = tempfile.mkdtemp()
+    runtime = namespace["ScratchRuntime"](headless=True, audio=False,
+                                          assets_dir=assets)
+    sprite_a_obj = namespace["A"]()
+    sprite_b_obj = namespace["B"]()
+    runtime.add_sprite(sprite_a_obj)
+    runtime.add_sprite(sprite_b_obj)
+
+    try:
+        import pygame
+        pygame.image.save(pygame.Surface((32, 20), pygame.SRCALPHA),
+                          os.path.join(assets, "abc.png"))
+        with open(os.path.join(assets, "svg1.svg"), "w", encoding="utf-8") as handle:
+            handle.write('<svg xmlns="http://www.w3.org/2000/svg" '
+                         'fill="#FCB1E3"><rect width="10" height="10"/></svg>')
+
+        def call(opcode, inputs=None, fields=None):
+            return sprite_a_obj.extension('lmsLooksPlus', opcode,
+                                          inputs or {}, fields or {})
+
+        assert call('lmsLooksPlus_spriteLayerNumber',
+                    {'TARGET': 'A'}) == 1
+        assert call('lmsLooksPlus_spriteLayerNumber',
+                    {'TARGET': 'B'}) == 2
+        call('lmsLooksPlus_hideSprite', {'TARGET': 'B'})
+        assert sprite_b_obj.visible is False
+        assert call('lmsLooksPlus_spriteVisible',
+                    {'TARGET': 'B'}) is False
+        call('lmsLooksPlus_showSprite', {'TARGET': 'B'})
+        assert sprite_b_obj.visible is True
+
+        call('lmsLooksPlus_setLayerTo',
+             {'TARGET': 'B', 'LAYER': 1})
+        assert call('lmsLooksPlus_spriteLayerNumber',
+                    {'TARGET': 'B'}) == 1
+        assert call('lmsLooksPlus_spriteLayerNumber',
+                    {'TARGET': 'A'}) == 2
+
+        sprite_b_obj.set_effect('ghost', 40)
+        assert call('lmsLooksPlus_effectValue',
+                    {'TARGET': 'B', 'EFFECT': 'ghost'}) == 40
+        assert call('lmsLooksPlus_targetCostumeNumber',
+                    {'TARGET': 'B'}) == 1
+        assert call('lmsLooksPlus_costumeAttribute',
+                    {'COSTUME': 'png1'}, {'ATTRIBUTE': 'width'}) == 32
+        assert call('lmsLooksPlus_costumeAttribute',
+                    {'COSTUME': 'png1'}, {'ATTRIBUTE': 'height'}) == 20
+        assert call('lmsLooksPlus_costumeAttribute',
+                    {'COSTUME': 'png1'}, {'ATTRIBUTE': 'format'}) == 'png'
+        assert call('lmsLooksPlus_costumeAttribute',
+                    {'COSTUME': 'png1'},
+                    {'ATTRIBUTE': 'rotationCenterX'}) == 16
+
+        assert call('lmsLooksPlus_replaceColors',
+                    {'COLOR1': '#FCB1E3', 'COLOR2': '#000000',
+                     'SVG': '<svg fill="#FCB1E3"/>'}) == \
+            '<svg fill="#000000"/>'
+        assert call('lmsLooksPlus_colorHex',
+                    {'COLOR': '#FFD983'}) == '#FFD983'
+
+        content = call('lmsLooksPlus_costumeContent',
+                       {'CONTENT': 'content', 'COSTUME': 1, 'TARGET': 'B'})
+        assert 'FCB1E3' in content
+        data_uri = call('lmsLooksPlus_costumeContent',
+                        {'CONTENT': 'dataURI', 'COSTUME': 1, 'TARGET': 'B'})
+        assert data_uri.startswith('data:image/svg+xml;base64,')
+
+        sprite_b_obj.extension(
+            'lmsLooksPlus', 'lmsLooksPlus_replaceCostumeContent',
+            {'COSTUME': 1, 'CONTENT': '<svg fill="#123456"/>'}, {})
+        replaced = call('lmsLooksPlus_costumeContent',
+                        {'CONTENT': 'content', 'COSTUME': 1, 'TARGET': 'B'})
+        assert '#123456' in replaced, "替换后的造型内容应可读取"
+        sprite_b_obj.extension(
+            'lmsLooksPlus', 'lmsLooksPlus_restoreCostumeContent',
+            {'COSTUME': 1}, {})
+        restored = call('lmsLooksPlus_costumeContent',
+                        {'CONTENT': 'content', 'COSTUME': 1, 'TARGET': 'B'})
+        assert 'FCB1E3' in restored, "恢复后应回到原始SVG内容"
+
+        snapshot = call('lmsLooksPlus_snapshotStage')
+        assert snapshot.startswith('data:image/png;base64,')
+        assert len(snapshot) > 100
+    finally:
+        runtime.running = False
+        runtime.shutdown()
+
+    print("  [PASS] Looks+ 外观+ 扩展通过")
+    return True
+
+
+def test_more_events_extension():
+    """More Events 扩展：forever/每隔帧/值变化/按键帽子与广播传数据"""
+    print("[测试63] More Events 更多事件扩展")
+
+    import time
+
+    project = make_project({
+        "b1": block("event_whenflagclicked", "b2", None, top_level=True),
+        "b2": block("data_setvariableto", None, "b1",
+                    inputs={"VALUE": [1, [10, "a"]]},
+                    fields={"VARIABLE": ["watch", "wid"]}),
+        "h1": block("lmsMoreEvents_forever", "h1b", None, top_level=True),
+        "h1b": block("data_changevariableby", None, "h1",
+                     inputs={"VALUE": [1, [4, "1"]]},
+                     fields={"VARIABLE": ["counter", "cid"]}),
+        "h2": block("lmsMoreEvents_everyDuration", "h2b", None,
+                    top_level=True,
+                    inputs={"DURATION": [1, [4, "2"]]}),
+        "h2b": block("data_changevariableby", None, "h2",
+                     inputs={"VALUE": [1, [4, "1"]]},
+                     fields={"VARIABLE": ["every", "eid"]}),
+        "h3": block("lmsMoreEvents_whenValueChanged", "h3b", None,
+                    top_level=True,
+                    inputs={"INPUT": [3, "v3"]}),
+        "h3b": block("data_changevariableby", None, "h3",
+                     inputs={"VALUE": [1, [4, "1"]]},
+                     fields={"VARIABLE": ["changed", "chid"]}),
+        "v3": block("data_variable", None, "h3",
+                    fields={"VARIABLE": ["watch", "wid"]}),
+        "h4": block("lmsMoreEvents_whenKeyAction", "h4b", None,
+                    top_level=True,
+                    inputs={"KEY_OPTION": [1, "km"],
+                            "ACTION": [1, [10, "hit"]]}),
+        "km": block("lmsMoreEvents_menu_keyboardButtons", None, None,
+                    fields={"keyboardButtons": ["space", None]}),
+        "h4b": block("data_changevariableby", None, "h4",
+                     inputs={"VALUE": [1, [4, "1"]]},
+                     fields={"VARIABLE": ["hits", "hid"]}),
+        "h5": block("event_whenbroadcastreceived", "h5b", None,
+                    top_level=True,
+                    fields={"BROADCAST_OPTION": ["msg", "msgid"]}),
+        "h5b": block("data_setvariableto", None, "h5",
+                     inputs={"VALUE": [3, "d1"]},
+                     fields={"VARIABLE": ["received", "rid"]}),
+        "d1": block("lmsMoreEvents_receivedData", None, "h5b"),
+        "h6": block("lmsMoreEvents_whileTrueFalse", "h6b", None,
+                    top_level=True,
+                    inputs={"CONDITION": [2, "c6"]},
+                    fields={"STATE": ["true", None]}),
+        "c6": block("operator_equals", None, "h6",
+                    inputs={"OPERAND1": [3, "g6"],
+                            "OPERAND2": [1, [10, "1"]]}),
+        "g6": block("data_variable", None, "c6",
+                    fields={"VARIABLE": ["gate", "gid"]}),
+        "h6b": block("data_changevariableby", None, "h6",
+                     inputs={"VALUE": [1, [4, "1"]]},
+                     fields={"VARIABLE": ["loops", "lid2"]}),
+        "h7": block("lmsMoreEvents_whenStopClicked", "h7b", None,
+                    top_level=True),
+        "h7b": block("data_changevariableby", None, "h7",
+                     inputs={"VALUE": [1, [4, "1"]]},
+                     fields={"VARIABLE": ["stopped", "sid"]}),
+    }, name="Events")
+    project["targets"][0]["blocks"]["km"]["shadow"] = True
+    project["targets"][0]["variables"] = {
+        "wid": ["watch", 'a'], "cid": ["counter", 0],
+        "eid": ["every", 0], "chid": ["changed", 0],
+        "hid": ["hits", 0], "rid": ["received", ''],
+        "gid": ["gate", 1], "lid2": ["loops", 0], "sid": ["stopped", 0],
+    }
+    project["extensions"] = ["lmsMoreEvents"]
+
+    code = generate_python(parse_scratch_project(project))
+    assert "self._register_extension_hat('lmsMoreEvents'" in code
+    assert "when_forever" in code and "every_frames" in code
+
+    namespace = {}
+    exec(compile(code, "<generated>", "exec"), namespace)
+    runtime = namespace["ScratchRuntime"](headless=True, audio=False)
+    sprite = namespace["Events"]()
+    runtime.add_sprite(sprite)
+    try:
+        sprite.run()
+        runtime.green_flag()
+        for _ in range(18):
+            runtime.step()
+            time.sleep(0.003)
+        assert sprite.counter >= 5, "forever 帽子应反复执行"
+        assert sprite.every >= 3, "每隔N帧帽子应触发"
+        assert sprite.changed == 0, "值没变时不应触发"
+
+        sprite.watch = 'b'
+        for _ in range(3):
+            runtime.step()
+            time.sleep(0.003)
+        assert sprite.changed >= 1, "值变化帽子应触发"
+
+        runtime.keys.add('space')
+        runtime.step()
+        time.sleep(0.005)
+        assert sprite.hits == 1, "按键按下帽子应触发一次"
+        runtime.keys.discard('space')
+        runtime.step()
+        runtime.keys.add('space')
+        runtime.step()
+        time.sleep(0.005)
+        assert sprite.hits == 2, "再次按下应再次触发"
+
+        sprite.extension('lmsMoreEvents', 'lmsMoreEvents_broadcastData',
+                         {'BROADCAST_OPTION': 'msg', 'DATA': 'hello'}, {})
+        for _ in range(5):
+            runtime.step()
+            time.sleep(0.003)
+        assert sprite.received == 'hello', "广播应把数据传给接收脚本"
+
+        assert sprite.loops > 0, "while 帽子应在条件为真时反复运行"
+        sprite.gate = 0
+        for _ in range(4):
+            runtime.step()
+            time.sleep(0.003)
+        stopped_at = sprite.loops
+        for _ in range(4):
+            runtime.step()
+            time.sleep(0.003)
+        assert sprite.loops == stopped_at, "条件变假后 while 脚本应停止"
+
+        runtime.stop_clicked()
+        for _ in range(5):
+            runtime.step()
+            time.sleep(0.003)
+        assert sprite.stopped >= 1, "点击停止按钮应触发停止帽子"
+    finally:
+        runtime.running = False
+        runtime.shutdown()
+
+    print("  [PASS] More Events 更多事件扩展通过")
+    return True
+
+
+def test_temporary_variables_extension():
+    """Temporary Variables 扩展：线程变量/运行时变量/循环与旧版变量"""
+    print("[测试64] Temporary Variables 临时变量扩展")
+
+    import time
+
+    project = make_project({
+        "b1": block("event_whenflagclicked", "b2", None, top_level=True),
+        "b2": block("lmsTempVars2_forEachThreadVariable", None, "b1",
+                    inputs={"VAR": [1, [10, "i"]],
+                            "NUM": [1, [4, "3"]],
+                            "SUBSTACK": [2, "b3"]}),
+        "b3": block("data_addtolist", None, "b2",
+                    inputs={"ITEM": [3, "e1"]},
+                    fields={"LIST": ["values", "lid"]}),
+        "e1": block("lmsTempVars2_getThreadVariable", None, "b3",
+                    inputs={"VAR": [1, [10, "i"]]}),
+    }, name="Temp")
+    project["targets"][0]["lists"] = {"lid": ["values", []]}
+    project["extensions"] = ["lmsTempVars2"]
+
+    code = generate_python(parse_scratch_project(project))
+    assert "_ext_temp_index" in code, "循环积木应生成Python for循环"
+    assert "lmsTempVars2_getThreadVariable" in code
+
+    namespace = {}
+    exec(compile(code, "<generated>", "exec"), namespace)
+    runtime = namespace["ScratchRuntime"](headless=True, audio=False)
+    sprite = namespace["Temp"]()
+    runtime.add_sprite(sprite)
+    try:
+        def call(opcode, inputs=None, fields=None):
+            return sprite.extension('lmsTempVars2', opcode,
+                                    inputs or {}, fields or {})
+
+        sprite.run()
+        runtime.green_flag()
+        for _ in range(15):
+            runtime.step()
+            time.sleep(0.003)
+        assert sprite.values == [1, 2, 3], "for 循环应把线程变量逐个写入列表"
+
+        call('lmsTempVars2_setThreadVariable',
+             {'VAR': 'x', 'STRING': '5'})
+        assert call('lmsTempVars2_getThreadVariable', {'VAR': 'x'}) == '5'
+        call('lmsTempVars2_changeThreadVariable', {'VAR': 'x', 'NUM': 2})
+        assert call('lmsTempVars2_getThreadVariable', {'VAR': 'x'}) == 7
+        assert call('lmsTempVars2_threadVariableExists',
+                    {'VAR': 'x'}) is True
+
+        call('lmsTempVars2_setRuntimeVariable',
+             {'VAR': 'r', 'STRING': '4'})
+        call('lmsTempVars2_changeRuntimeVariable',
+             {'VAR': 'r', 'NUM': 3})
+        assert call('lmsTempVars2_getRuntimeVariable', {'VAR': 'r'}) == 7
+        assert call('lmsTempVars2_runtimeVariableExists',
+                    {'VAR': 'r'}) is True
+        assert call('lmsTempVars2_listRuntimeVariables') == 'r'
+        call('lmsTempVars2_deleteRuntimeVariable', {'VAR': 'r'})
+        assert call('lmsTempVars2_runtimeVariableExists',
+                    {'VAR': 'r'}) is False
+
+        call('lmsTempVars2_setRuntimeVariable',
+             {'VAR': 'reset', 'STRING': '1'})
+        runtime.green_flag()
+        assert call('lmsTempVars2_getRuntimeVariable',
+                    {'VAR': 'reset'}) == '', "绿旗应清空运行时变量"
+
+        legacy = lambda opcode, inputs=None: sprite.extension(
+            'lmstempvars', opcode, inputs or {}, {})
+        legacy('lmstempvars_setVariableTo',
+               {'INPUTA': 'v', 'INPUTB': '3'})
+        legacy('lmstempvars_changeVariableBy',
+               {'INPUTA': 'v', 'INPUTB': '2'})
+        assert legacy('lmstempvars_getVariable', {'INPUT': 'v'}) == 5
+        assert legacy('lmstempvars_listVariables') == 'v'
+        legacy('lmstempvars_deleteAllVariables')
+        assert legacy('lmstempvars_getVariable', {'INPUT': 'v'}) == ''
+    finally:
+        runtime.running = False
+        runtime.shutdown()
+
+    print("  [PASS] Temporary Variables 临时变量扩展通过")
+    return True
+
+
 def main():
     """运行所有测试"""
     print("=" * 60)
@@ -2836,6 +4020,22 @@ def main():
         test_stage_clear_with_tiny_backdrop,
         test_runtime_debug_overlay,
         test_chinese_sprite_instance_name,
+        test_timer_greater_than_hat,
+        test_backdrop_hat_roundtrip,
+        test_pitch_sound_resampling,
+        test_text2speech_extension,
+        test_stretch_extension,
+        test_animated_text_extension,
+        test_json_extension,
+        test_split_modules_output,
+        test_general_python_extended_syntax,
+        test_dunder_variables_and_tw_stage_size,
+        test_pen_performance_paths,
+        test_tween_extension,
+        test_clones_plus_extension,
+        test_looks_plus_extension,
+        test_more_events_extension,
+        test_temporary_variables_extension,
     ]
     
     passed = 0

@@ -11,12 +11,16 @@ Scratch DSL（``ScratchSprite`` 类、``when_green_flag``、``self.move()`` 等�
 - ``if/elif/else``、``while``、``for ... in range(...)``、``for ... in 列表``、
   ``for ... in 字符串``、``for i, v in enumerate(...)``
 - ``break`` / ``continue``（循环标志变量 + 条件包裹）
-- 列表字面量、``append/insert/clear/pop/remove/index/count/reverse/sort``、下标读写
+- 列表字面量、``append/insert/clear/pop/remove/index/count/reverse/sort``、
+  ``extend/copy``、``sorted(...)`` / ``reversed(...)``、下标读写
 - ``print`` -> 说话；``input`` -> 询问并等待
-- ``len``、``str/int/float``、``abs/round``、``min/max/sum``、``**``、``math`` 常量与函数
-- ``"分隔符".join(列表)``、元组交换赋值 ``a, b = b, a``
+- ``len``、``str/int/float``、``abs/round(x, n)``、``min/max/sum``、``pow``、``**``
+- ``math`` 常量与函数（``sqrt/floor/ceil/sin/cos/...``、``fabs``、``pow``）
+- ``random.randint/random/uniform/random/choice``、``time.sleep``
+- 条件表达式 ``a if cond else b``、``"分隔符".join(列表)``、``f"{x:.2f}"``
+- 元组交换赋值 ``a, b = b, a``、``enumerate(列表, start)``
 
-不支持：类、异常、生成器、装饰器、多返回值、``match``、``sorted``、
+不支持：类、异常、生成器、装饰器、多返回值、``match``、
 大部分字符串方法（``upper/lower/replace/split`` 等），会记入转换报告，
 而不是静默丢失。
 """
@@ -24,12 +28,13 @@ Scratch DSL（``ScratchSprite`` 类、``when_green_flag``、``self.move()`` 等�
 import ast
 import hashlib
 import math
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from ir import (
     BlockType, ExprType, Expr, Statement, ProjectIR, SpriteIR,
     make_number, make_string, make_boolean, make_variable,
-    make_binary_op, make_list_access,
+    make_binary_op, make_list_access, make_random,
 
 )
 from python_parser import PythonParser
@@ -313,8 +318,24 @@ class GeneralPythonParser(PythonParser):
                     and isinstance(node.func.value, ast.Name) \
                     and node.func.attr in ('append', 'insert', 'pop', 'remove',
                                            'clear', 'sort', 'reverse', 'index',
-                                           'count'):
+                                           'count', 'extend', 'copy'):
                 self._list_vars.add(node.func.value.id)
+            elif isinstance(node, ast.Assign) and len(node.targets) == 1 \
+                    and isinstance(node.targets[0], ast.Name):
+                target = node.targets[0].id
+                value = node.value
+                if isinstance(value, ast.Call) \
+                        and isinstance(value.func, ast.Attribute) \
+                        and value.func.attr in ('copy', 'extend') \
+                        and isinstance(value.func.value, ast.Name):
+                    self._list_vars.add(target)
+                    self._list_vars.add(value.func.value.id)
+                elif isinstance(value, ast.Call) \
+                        and isinstance(value.func, ast.Name) \
+                        and value.func.id in ('sorted', 'reversed') \
+                        and value.args and isinstance(value.args[0], ast.Name):
+                    self._list_vars.add(target)
+                    self._list_vars.add(value.args[0].id)
             elif isinstance(node, ast.For) and isinstance(node.target, ast.Name) \
                     and isinstance(node.iter, ast.Name):
                 self._list_vars.add(node.iter.id)
@@ -522,37 +543,56 @@ class GeneralPythonParser(PythonParser):
                 return None
             return self._parse_range_loop(var, iterable.args, node.body)
 
-        # for i, v in enumerate(<列表/字符串/字面量>)
+        # for i, v in enumerate(<列表/字符串/字面量>, start)
         if isinstance(iterable, ast.Call) and isinstance(iterable.func, ast.Name) \
                 and iterable.func.id == 'enumerate':
             if enumerate_var is None:
                 self.warn('for 元组目标 enumerate')
                 return None
-            if len(iterable.args) != 1:
+            if not 1 <= len(iterable.args) <= 2:
                 self.warn('enumerate 参数数量')
                 return None
+            start = (self._parse_expr_to_ir(iterable.args[1])
+                     if len(iterable.args) == 2 else None)
             inner = iterable.args[0]
             if isinstance(inner, ast.Constant) and isinstance(inner.value, str):
                 return self._parse_string_loop(
-                    var, make_string(inner.value), node.body, enumerate_var)
+                    var, make_string(inner.value), node.body, enumerate_var,
+                    start)
             if isinstance(inner, ast.Name):
                 if self._is_list(inner.id):
                     return self._parse_list_loop(
-                        var, inner.id, node.body, enumerate_var)
+                        var, inner.id, node.body, enumerate_var, start)
                 return self._parse_string_loop(
-                    var, make_variable(inner.id), node.body, enumerate_var)
+                    var, make_variable(inner.id), node.body, enumerate_var,
+                    start)
             if isinstance(inner, ast.List):
                 list_name = self._literal_list(inner)
                 if list_name is None:
                     return None
                 return self._parse_list_loop(
-                    var, list_name, node.body, enumerate_var)
+                    var, list_name, node.body, enumerate_var, start)
+            if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name) \
+                    and inner.func.id in ('sorted', 'reversed'):
+                list_name = self._prepare_sorted_iterable(inner)
+                if list_name is None:
+                    return None
+                return self._parse_list_loop(
+                    var, list_name, node.body, enumerate_var, start)
             self.warn('enumerate 其它可迭代对象')
             return None
 
         if enumerate_var is not None:
             self.warn('for 元组目标')
             return None
+
+        # for x in sorted(...) / reversed(...)
+        if isinstance(iterable, ast.Call) and isinstance(iterable.func, ast.Name) \
+                and iterable.func.id in ('sorted', 'reversed'):
+            list_name = self._prepare_sorted_iterable(iterable)
+            if list_name is None:
+                return None
+            return self._parse_list_loop(var, list_name, node.body)
 
         # for x in <list_name>
         if isinstance(iterable, ast.Name):
@@ -588,6 +628,99 @@ class GeneralPythonParser(PythonParser):
         self.sprite.lists[list_name] = values
         self._list_vars.add(list_name)
         return list_name
+
+    def _copy_list_statements(self, source: str, target: str) -> List[Statement]:
+        """把 source 列表逐项复制到 target（target 先清空）"""
+        self.sprite.lists.setdefault(target, [])
+        self._list_vars.add(target)
+        cursor = self._new_temp()
+        loop = Statement(
+            type=BlockType.REPEAT,
+            value=Expr(ExprType.LENGTH_OF_LIST, name=source))
+        loop.body = [
+            Statement(type=BlockType.ADD_TO_LIST,
+                      value=make_list_access(source, make_binary_op(
+                          '+', make_variable(cursor), make_number(1))),
+                      extra={'name': target}),
+            Statement(type=BlockType.CHANGE_VARIABLE, extra={'name': cursor},
+                      value=make_number(1)),
+        ]
+        return [
+            Statement(type=BlockType.DELETE_ALL_FROM_LIST, extra={'name': target}),
+            Statement(type=BlockType.SET_VARIABLE, extra={'name': cursor},
+                      value=make_number(0)),
+            loop,
+        ]
+
+    def _sorted_reverse(self, node: ast.Call) -> Optional[bool]:
+        """读取 sorted(..., reverse=True/False)；不支持的参数返回 None"""
+        reverse = False
+        for keyword in node.keywords:
+            if keyword.arg == 'reverse':
+                if isinstance(keyword.value, ast.Constant):
+                    reverse = bool(keyword.value.value)
+                else:
+                    return None
+            else:
+                self.warn(f'sorted 参数 {keyword.arg}')
+                return None
+        return reverse
+
+    def _prepare_sorted_iterable(self, node: ast.Call) -> Optional[str]:
+        """sorted(...)/reversed(...) -> 一个隐藏列表（副本已排序/反转）"""
+        if not node.args:
+            self.warn(f'内置函数 {node.func.id}')
+            return None
+        inner = node.args[0]
+        if isinstance(inner, ast.Name) and self._is_list(inner.id):
+            source = inner.id
+        elif isinstance(inner, ast.List):
+            source = self._literal_list(inner)
+            if source is None:
+                return None
+        elif isinstance(inner, ast.Constant) and isinstance(inner.value, str):
+            self._loop_serial += 1
+            source = f'__py_iterlit_{self._loop_serial}'
+            self.sprite.lists[source] = list(inner.value)
+            self._list_vars.add(source)
+        elif isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name) \
+                and inner.func.id in ('sorted', 'reversed'):
+            source = self._prepare_sorted_iterable(inner)
+            if source is None:
+                return None
+        else:
+            self.warn(f'内置函数 {node.func.id}')
+            return None
+
+        self._loop_serial += 1
+        target = f'__py_iter_{self._loop_serial}'
+        self._pending.extend(self._copy_list_statements(source, target))
+
+        if node.func.id == 'sorted':
+            reverse = self._sorted_reverse(node)
+            if reverse is None:
+                self.warn('sorted reverse 参数')
+                reverse = False
+            method = 'sort'
+        else:
+            if len(node.args) > 1:
+                self.warn('reversed 参数数量')
+            method = 'reverse'
+            reverse = False
+
+        call = ast.Call(
+            func=ast.Attribute(value=ast.Name(id=target), attr=method),
+            args=[], keywords=[])
+        ast.fix_missing_locations(call)
+        self._parse_list_method(target, call, want_value=False)
+
+        if reverse:
+            flip = ast.Call(
+                func=ast.Attribute(value=ast.Name(id=target), attr='reverse'),
+                args=[], keywords=[])
+            ast.fix_missing_locations(flip)
+            self._parse_list_method(target, flip, want_value=False)
+        return target
 
     def _parse_range_loop(self, var: str, args: List[ast.expr],
                           body: List[ast.stmt]) -> Optional[Statement]:
@@ -663,7 +796,8 @@ class GeneralPythonParser(PythonParser):
 
     def _parse_list_loop(self, var: str, list_name: str,
                          body: List[ast.stmt],
-                         enumerate_var: Optional[str] = None) -> Statement:
+                         enumerate_var: Optional[str] = None,
+                         enumerate_start: Optional[Expr] = None) -> Statement:
         context = self._new_loop_context()
         parsed_body = self._parse_loop_body(body, context)
         index_var = f'__py_idx_{self._loop_serial}'
@@ -673,9 +807,12 @@ class GeneralPythonParser(PythonParser):
         prefix: List[Statement] = []
         if enumerate_var is not None:
             # Python 的 enumerate 下标从 0 开始，内部计数器正好也是 0 起始
+            value: Expr = make_variable(index_var)
+            if enumerate_start is not None:
+                value = make_binary_op('+', value, enumerate_start)
             prefix.append(Statement(type=BlockType.SET_VARIABLE,
                                     extra={'name': enumerate_var},
-                                    value=make_variable(index_var)))
+                                    value=value))
         first = Statement(
             type=BlockType.SET_VARIABLE, extra={'name': var},
             value=make_list_access(
@@ -720,7 +857,8 @@ class GeneralPythonParser(PythonParser):
 
     def _parse_string_loop(self, var: str, string_expr: Expr,
                            body: List[ast.stmt],
-                           enumerate_var: Optional[str] = None) -> Statement:
+                           enumerate_var: Optional[str] = None,
+                           enumerate_start: Optional[Expr] = None) -> Statement:
         """for ch in "abc"：用“第 n 个字符”积木按索引遍历字符串"""
         context = self._new_loop_context()
         parsed_body = self._parse_loop_body(body, context)
@@ -732,9 +870,12 @@ class GeneralPythonParser(PythonParser):
 
         prefix: List[Statement] = []
         if enumerate_var is not None:
+            value: Expr = make_variable(counter)
+            if enumerate_start is not None:
+                value = make_binary_op('+', value, enumerate_start)
             prefix.append(Statement(type=BlockType.SET_VARIABLE,
                                     extra={'name': enumerate_var},
-                                    value=make_variable(counter)))
+                                    value=value))
         prefix.append(Statement(
             type=BlockType.SET_VARIABLE, extra={'name': var},
             value=Expr(ExprType.LETTER_OF,
@@ -826,28 +967,25 @@ class GeneralPythonParser(PythonParser):
         # 列表按值拷贝：alias = old_list（Python 语义是复制，不是别名）
         if isinstance(target, ast.Name) and isinstance(node.value, ast.Name) \
                 and self._is_list(node.value.id) and node.value.id != target.id:
-            source = node.value.id
-            self.sprite.lists.setdefault(target.id, [])
-            self._list_vars.add(target.id)
-            cursor = self._new_temp()
-            loop = Statement(
-                type=BlockType.REPEAT,
-                value=Expr(ExprType.LENGTH_OF_LIST, name=source))
-            loop.body = [
-                Statement(type=BlockType.ADD_TO_LIST,
-                          value=make_list_access(source, make_binary_op(
-                              '+', make_variable(cursor), make_number(1))),
-                          extra={'name': target.id}),
-                Statement(type=BlockType.CHANGE_VARIABLE,
-                          extra={'name': cursor}, value=make_number(1)),
-            ]
-            return self._chain_list([
-                Statement(type=BlockType.DELETE_ALL_FROM_LIST,
-                          extra={'name': target.id}),
-                Statement(type=BlockType.SET_VARIABLE,
-                          extra={'name': cursor}, value=make_number(0)),
-                loop,
-            ])
+            return self._chain_list(
+                self._copy_list_statements(node.value.id, target.id))
+
+        # b = a.copy() / b = sorted(a) / b = reversed(a)
+        if isinstance(target, ast.Name) and isinstance(node.value, ast.Call):
+            value = node.value
+            if isinstance(value.func, ast.Attribute) \
+                    and value.func.attr == 'copy' \
+                    and isinstance(value.func.value, ast.Name) \
+                    and self._is_list(value.func.value.id):
+                return self._chain_list(
+                    self._copy_list_statements(value.func.value.id, target.id))
+            if isinstance(value.func, ast.Name) \
+                    and value.func.id in ('sorted', 'reversed'):
+                prepared = self._prepare_sorted_iterable(value)
+                if prepared is None:
+                    return None
+                return self._chain_list(
+                    self._copy_list_statements(prepared, target.id))
 
         # 列表字面量：nums = [1, 2, 3]
         if isinstance(target, ast.Name) and isinstance(node.value, ast.List):
@@ -1290,6 +1428,33 @@ class GeneralPythonParser(PythonParser):
             if func.attr == 'clear':
                 return Statement(type=BlockType.DELETE_ALL_FROM_LIST,
                                  extra={'name': list_name})
+            if func.attr == 'extend' and call.args:
+                source = None
+                argument = call.args[0]
+                if isinstance(argument, ast.Name) and self._is_list(argument.id):
+                    source = argument.id
+                elif isinstance(argument, ast.List):
+                    source = self._literal_list(argument)
+                if source is None:
+                    self.warn('列表方法 extend')
+                    return None
+                cursor = self._new_temp()
+                loop = Statement(
+                    type=BlockType.REPEAT,
+                    value=Expr(ExprType.LENGTH_OF_LIST, name=source))
+                loop.body = [
+                    Statement(type=BlockType.ADD_TO_LIST,
+                              value=make_list_access(source, make_binary_op(
+                                  '+', make_variable(cursor), make_number(1))),
+                              extra={'name': list_name}),
+                    Statement(type=BlockType.CHANGE_VARIABLE,
+                              extra={'name': cursor}, value=make_number(1)),
+                ]
+                return self._chain_list([
+                    Statement(type=BlockType.SET_VARIABLE,
+                              extra={'name': cursor}, value=make_number(0)),
+                    loop,
+                ])
             if func.attr in ('pop', 'index', 'count', 'remove',
                              'reverse', 'sort'):
                 self._parse_list_method(list_name, call, want_value=False)
@@ -1311,6 +1476,12 @@ class GeneralPythonParser(PythonParser):
                 'startswith', 'endswith', 'format'):
             self.warn(f'字符串方法 {func.attr}')
             return None
+
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) \
+                and func.value.id == 'time' and func.attr == 'sleep':
+            seconds = self._parse_expr_to_ir(call.args[0]) \
+                if call.args else make_number(1)
+            return Statement(type=BlockType.WAIT, value=seconds)
 
         if func_name == 'print':
             return Statement(type=BlockType.SAY, value=self._print_value(call.args))
@@ -1349,6 +1520,9 @@ class GeneralPythonParser(PythonParser):
     def _parse_expr_to_ir(self, node: ast.AST) -> Expr:
         if isinstance(node, ast.JoinedStr):
             return self._joined_str(node)
+
+        if isinstance(node, ast.IfExp):
+            return self._if_expr(node)
 
         if isinstance(node, ast.BinOp):
             if isinstance(node.op, ast.Pow):
@@ -1401,16 +1575,42 @@ class GeneralPythonParser(PythonParser):
 
         return super()._parse_expr_to_ir(node)
 
+    def _if_expr(self, node: ast.IfExp) -> Expr:
+        """a if cond else b -> 临时变量 + 如果/否则（两条分支都会先求值）"""
+        condition = self._parse_expr_to_ir(node.test)
+        else_value = self._parse_expr_to_ir(node.orelse)
+        then_value = self._parse_expr_to_ir(node.body)
+        flag = self._new_temp()
+        temp = self._new_temp()
+        if self._is_string_expr(node.body) or self._is_string_expr(node.orelse):
+            self._string_vars.add(temp)
+        branch = Statement(type=BlockType.IF, condition=make_variable(flag))
+        branch.body = [Statement(type=BlockType.SET_VARIABLE,
+                                 extra={'name': temp}, value=then_value)]
+        self._pending.extend([
+            Statement(type=BlockType.SET_VARIABLE, extra={'name': flag},
+                      value=condition),
+            Statement(type=BlockType.SET_VARIABLE, extra={'name': temp},
+                      value=else_value),
+            branch,
+        ])
+        return make_variable(temp)
+
     def _joined_str(self, node: ast.JoinedStr) -> Expr:
-        """f-string -> 连接积木（忽略格式说明）"""
+        """f-string -> 连接积木（支持 .Nf 格式说明）"""
         parts: List[Expr] = []
         for value in node.values:
             if isinstance(value, ast.Constant):
                 parts.append(make_string(str(value.value)))
             elif isinstance(value, ast.FormattedValue):
+                expr = self._parse_expr_to_ir(value.value)
                 if value.format_spec is not None:
-                    self.warn('f-string 格式说明')
-                parts.append(self._parse_expr_to_ir(value.value))
+                    formatted = self._format_expr(expr, value.format_spec)
+                    if formatted is None:
+                        self.warn('f-string 格式说明')
+                    else:
+                        expr = formatted
+                parts.append(expr)
             else:
                 self.warn('f-string')
         if not parts:
@@ -1419,6 +1619,27 @@ class GeneralPythonParser(PythonParser):
         for part in parts[1:]:
             result = Expr(ExprType.JOIN, left=result, right=part)
         return result
+
+    def _format_expr(self, expr: Expr, spec_node: ast.AST) -> Optional[Expr]:
+        """f-string 格式说明 -> Scratch 表达式
+
+        只支持 ``:.Nf``：四舍五入到 N 位小数（Scratch 会省略末尾的 0）。
+        """
+        spec = ''
+        if isinstance(spec_node, ast.JoinedStr) \
+                and all(isinstance(item, ast.Constant) for item in spec_node.values):
+            spec = ''.join(str(item.value) for item in spec_node.values)
+        matched = re.fullmatch(r'\.(\d+)f', spec)
+        if matched:
+            factor = 10 ** int(matched.group(1))
+            return make_binary_op(
+                '/', Expr(ExprType.ROUND,
+                          right=make_binary_op('*', expr,
+                                               make_number(factor))),
+                make_number(factor))
+        if spec in ('', 'd', 's'):
+            return expr
+        return None
 
     def _compare_node(self, operator: ast.cmpop, left_node: ast.expr,
                       right_node: ast.expr) -> Expr:
@@ -1502,6 +1723,72 @@ class GeneralPythonParser(PythonParser):
 
         if func_name == 'sum':
             return self._sum_expr(node.args)
+
+        # time.sleep(n) -> 等待 n 秒
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) \
+                and func.value.id == 'time' and func.attr == 'sleep':
+            seconds = self._parse_expr_to_ir(node.args[0]) \
+                if node.args else make_number(1)
+            self._pending.append(Statement(type=BlockType.WAIT, value=seconds))
+            return make_string('')
+
+        # random 模块
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) \
+                and func.value.id == 'random':
+            if func.attr == 'random':
+                return make_random(make_number(0), make_number(1))
+            if func.attr == 'randint' and len(node.args) >= 2:
+                return make_random(self._parse_expr_to_ir(node.args[0]),
+                                   self._parse_expr_to_ir(node.args[1]))
+            if func.attr == 'uniform' and len(node.args) >= 2:
+                low = self._parse_expr_to_ir(node.args[0])
+                high = self._parse_expr_to_ir(node.args[1])
+                span = make_binary_op('-', high, low)
+                return make_binary_op(
+                    '+', low,
+                    make_binary_op('*', make_random(make_number(0),
+                                                    make_number(1)), span))
+            if func.attr == 'choice' and node.args:
+                target = node.args[0]
+                if isinstance(target, ast.Name) and self._is_list(target.id):
+                    return make_list_access(target.id, make_string('random'))
+                if isinstance(target, ast.Constant) \
+                        and isinstance(target.value, str) and target.value:
+                    index = make_random(make_number(1),
+                                        make_number(len(target.value)))
+                    return Expr(ExprType.LETTER_OF, left=index,
+                                right=make_string(target.value))
+            self.warn(f'random.{func.attr}')
+            return make_string('')
+
+        # pow(a, b) / math.pow(a, b) / math.fabs(x)
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) \
+                and func.value.id == 'math':
+            if func.attr == 'pow' and len(node.args) >= 2:
+                return self._power(self._parse_expr_to_ir(node.args[0]),
+                                   node.args[1])
+            if func.attr == 'fabs' and node.args:
+                return Expr(ExprType.ABS,
+                            right=self._parse_expr_to_ir(node.args[0]))
+        if func_name == 'pow' and len(node.args) >= 2:
+            return self._power(self._parse_expr_to_ir(node.args[0]),
+                               node.args[1])
+
+        # round(x, n) -> round(x * 10^n) / 10^n
+        if func_name == 'round' and len(node.args) >= 2:
+            digits = self._const_int(node.args[1])
+            value = self._parse_expr_to_ir(node.args[0])
+            if digits is None:
+                self.warn('round 动态位数')
+                return value
+            if digits == 0:
+                return Expr(ExprType.ROUND, right=value)
+            factor = 10 ** digits
+            return make_binary_op(
+                '/', Expr(ExprType.ROUND,
+                          right=make_binary_op('*', value,
+                                               make_number(factor))),
+                make_number(factor))
 
         if func_name in ('sorted', 'reversed', 'open'):
             self.warn(f'内置函数 {func_name}')

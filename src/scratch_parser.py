@@ -169,6 +169,29 @@ HAT_OPCODES = {
     'control_start_as_clone',
 }
 
+# 扩展帽子块（不是标准HAT_OPCODES，但同样可以开启一段脚本）
+EXTENSION_HAT_OPCODES = {
+    # Clones+
+    'lmsclonesplus_whenclonestartswithvar',
+    # More Events
+    'lmsmoreevents_whenstopclicked',
+    'lmsmoreevents_forever',
+    'lmsmoreevents_whentruefalse',
+    'lmsmoreevents_whiletruefalse',
+    'lmsmoreevents_whenvaluechanged',
+    'lmsmoreevents_everyduration',
+    'lmsmoreevents_whenkeyaction',
+    'lmsmoreevents_whilekeypressed',
+    'lmsmoreevents_beforesave',
+    'lmsmoreevents_aftersave',
+}
+
+# 这些扩展的动态菜单保存的是变量ID，需要还原成变量名
+VARIABLE_MENU_EXTENSIONS = {'lmsclonesplus', 'jeremygamertweening'}
+VARIABLE_MENU_FIELDS = {
+    'INPUT', 'INPUTA', 'INPUTB', 'INPUTC', 'INPUTD', 'VAR',
+}
+
 # 表达式类操作码(不是语句，在输入中作为值使用)
 EXPRESSION_OPCODES = {
     'operator_add', 'operator_subtract', 'operator_multiply', 'operator_divide',
@@ -231,6 +254,8 @@ class ScratchParser:
         self.raw_blocks: Dict[str, ScratchBlockRaw] = {}
         self.unsupported: Dict[str, int] = {}
         self.extensions = set()
+        self.list_id_names: Dict[str, str] = {}
+        self.variable_id_names: Dict[str, str] = {}
 
     def _extension_namespace(self, opcode: str) -> Optional[str]:
         prefix = opcode.split('_', 1)[0]
@@ -238,11 +263,47 @@ class ScratchParser:
 
     def _parse_extension_inputs(self, raw: ScratchBlockRaw):
         inputs = []
+        namespace = (self._extension_namespace(raw.opcode) or '').lower()
+        map_variables = namespace in VARIABLE_MENU_EXTENSIONS
         for name, value in raw.inputs.items():
             if name == 'SUBSTACK':
                 continue
-            inputs.append((name, self.parse_input(raw, name, '')))
-        fields = {name: item[0] for name, item in raw.fields.items() if item}
+            expr = None
+            # 菜单shadow积木（包括 looks_costume 这类特殊菜单）直接取字段文本，
+            # 否则会被当成未知表达式块而丢失。
+            input_data = raw.inputs.get(name)
+            if isinstance(input_data, list) and len(input_data) >= 2:
+                ref = input_data[1]
+                block = self.raw_blocks.get(ref) if isinstance(ref, str) else None
+                if block is not None and (
+                        'menu' in block.opcode.lower()
+                        or block.opcode in ('looks_costume', 'looks_backdrops',
+                                            'sound_sounds_menu')):
+                    text = self._menu_text_from_block(block, name)
+                    if text is not None:
+                        expr = make_string(text)
+            if expr is None:
+                expr = self.parse_input(raw, name, '')
+            if name == 'list' and 'json_vm_' in raw.opcode \
+                    and expr.type == ExprType.STRING \
+                    and str(expr.value) in self.list_id_names:
+                # JSON 扩展的 get_list 菜单保存的是列表ID，转换成名字
+                expr = make_string(self.list_id_names[str(expr.value)])
+            elif map_variables and name in VARIABLE_MENU_FIELDS \
+                    and expr.type == ExprType.STRING \
+                    and str(expr.value) in self.variable_id_names:
+                # Clones+/Tween 的变量菜单保存的是变量ID
+                expr = make_string(self.variable_id_names[str(expr.value)])
+            inputs.append((name, expr))
+        fields = {}
+        for name, item in raw.fields.items():
+            if not item:
+                continue
+            value = item[0]
+            if map_variables and name in VARIABLE_MENU_FIELDS \
+                    and str(value) in self.variable_id_names:
+                value = self.variable_id_names[str(value)]
+            fields[name] = value
         return inputs, fields
 
     def _warn_unsupported(self, opcode: str):
@@ -287,6 +348,17 @@ class ScratchParser:
         project.monitors = json_data.get('monitors', [])
         self.extensions = set(json_data.get('extensions', []) or [])
         self.unsupported = {}
+        # 扩展菜单里有时保存的是列表ID（如 JSON 扩展的“列表”菜单）
+        self.list_id_names = {}
+        # Clones+/Tween 的动态变量菜单保存变量ID，转换时需要还原成名字
+        self.variable_id_names = {}
+        for target_data in json_data.get('targets', []):
+            for list_id, list_data in (target_data.get('lists') or {}).items():
+                if isinstance(list_data, list) and len(list_data) >= 2:
+                    self.list_id_names[list_id] = str(list_data[0])
+            for var_id, var_data in (target_data.get('variables') or {}).items():
+                if isinstance(var_data, list) and len(var_data) >= 1:
+                    self.variable_id_names[str(var_id)] = str(var_data[0])
         project.runtime_options = self._parse_turbowarp_options(json_data)
 
         for target_data in json_data.get('targets', []):
@@ -350,7 +422,9 @@ class ScratchParser:
         # 只处理以事件帽块开头的脚本和自制积木定义，
         # 其余没有被事件触发的“孤儿积木”直接忽略。
         for raw in top_level_blocks:
-            if raw.opcode not in HAT_OPCODES and raw.opcode != 'procedures_definition':
+            if raw.opcode not in HAT_OPCODES \
+                    and raw.opcode != 'procedures_definition' \
+                    and raw.opcode.lower() not in EXTENSION_HAT_OPCODES:
                 continue
             stmt = self.parse_statement_chain(raw)
             if stmt:
@@ -392,13 +466,17 @@ class ScratchParser:
 
         namespace = self._extension_namespace(opcode)
         if namespace and opcode not in OPCODE_TO_BLOCK_TYPE:
-            stmt = Statement(type=BlockType.EXTENSION, extra={
+            block_type = BlockType.EXTENSION_HAT \
+                if opcode.lower() in EXTENSION_HAT_OPCODES \
+                else BlockType.EXTENSION
+            stmt = Statement(type=block_type, extra={
                 'namespace': namespace,
                 'opcode': opcode,
             })
             stmt.extra['inputs'], stmt.extra['fields'] = \
                 self._parse_extension_inputs(raw)
-            stmt.body = self.parse_substack(raw, 'SUBSTACK')
+            if block_type == BlockType.EXTENSION:
+                stmt.body = self.parse_substack(raw, 'SUBSTACK')
             return stmt
 
         block_type = OPCODE_TO_BLOCK_TYPE.get(opcode, BlockType.UNKNOWN)
@@ -1089,6 +1167,12 @@ class ScratchParser:
                     except (TypeError, ValueError):
                         return make_string(str(field[0]))
             return make_number(0)
+
+        # 扩展菜单shadow块（如 text_menu_twAlign）：直接取字段里的菜单文本
+        if '_menu_' in opcode or opcode.endswith('_menu'):
+            for field in raw.fields.values():
+                if field:
+                    return make_string(field[0])
 
         namespace = self._extension_namespace(opcode)
         if namespace and opcode not in OPCODE_TO_BLOCK_TYPE:

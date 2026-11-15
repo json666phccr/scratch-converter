@@ -36,6 +36,11 @@ def sanitize_name(name: str, prefix: str = "") -> str:
     if sanitized[0].isdigit():
         sanitized = (prefix or "n") + sanitized
 
+    # 双下划线开头会在类内部被 Python 改名（name mangling），
+    # self.__x 会变成 self._类名__x，读写对不上；统一加前缀避开
+    if sanitized.startswith('__'):
+        sanitized = (prefix or 'v') + sanitized
+
     # 避免Python关键字
     python_keywords = {
         'False', 'None', 'True', 'and', 'as', 'assert', 'async', 'await',
@@ -234,6 +239,7 @@ class BlockType(Enum):
 
     # TurboWarp扩展
     EXTENSION = auto()
+    EXTENSION_HAT = auto()
 
     # 特殊
     COMMENT = auto()
@@ -828,6 +834,7 @@ class SpriteIR:
             BlockType.WHEN_THIS_SPRITE_CLICKED, BlockType.WHEN_BROADCAST_RECEIVED,
             BlockType.WHEN_BACKDROP_SWITCHES, BlockType.WHEN_GREATER_THAN,
             BlockType.WHEN_LOUDNESS, BlockType.WHEN_TIMER,
+            BlockType.EXTENSION_HAT,
         }
         return [s for s in self.statements if s.type in event_types]
 
