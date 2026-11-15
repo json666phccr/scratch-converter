@@ -1001,6 +1001,7 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
         self.ask_question = ''
         self.ask_buffer = ''
         self.ask_composition = ''
+        self.ask_key_pending = ''
         self.ask_answer = ''
         self.ask_token = 0
         self.ask_lock = threading.Lock()
@@ -1307,6 +1308,7 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
             self.ask_question = _sc_str(question)
             self.ask_buffer = ''
             self.ask_composition = ''
+            self.ask_key_pending = ''
             self.ask_answer = ''
             self.ask_pending = True
             while alive() and self.ask_pending and self.ask_token == token:
@@ -1327,9 +1329,20 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
         rect = self._ask_rect()
         return pygame.Rect(rect.right - 66, rect.y + 7, 58, 26)
 
+    def _ask_append_text(self, text):
+        """TEXTINPUT 兜底：KEYDOWN 已经加入过的字符不重复添加"""
+        pending = self.ask_key_pending
+        for ch in text:
+            if pending.startswith(ch):
+                pending = pending[1:]
+            else:
+                self.ask_buffer += ch
+        self.ask_key_pending = pending
+
     def _submit_ask(self):
         """回车/点击确认时提交输入"""
         self.ask_answer = self.ask_buffer + self.ask_composition
+        self.ask_key_pending = ''
         self.ask_pending = False
 
     def _draw_ask(self):
@@ -1511,9 +1524,10 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
                 self.running = False
                 return
             elif self._has_text_input and event.type == pygame.TEXTINPUT:
-                # pygame 2 的文本输入（含中文输入法提交的文本）
+                # pygame 2 的文本输入（含中文输入法提交的文本）；
+                # 部分环境只发 KEYDOWN，不去重会重复输入
                 if self.ask_pending:
-                    self.ask_buffer += event.text
+                    self._ask_append_text(event.text)
                     self.ask_composition = ''
             elif self._has_text_input and event.type == pygame.TEXTEDITING:
                 # 输入法正在拼写的文本，先显示出来但不计入答案
@@ -1531,9 +1545,12 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
                             self.ask_composition = self.ask_composition[:-1]
                         else:
                             self.ask_buffer = self.ask_buffer[:-1]
-                    elif not self._has_text_input and event.unicode \
-                            and event.unicode.isprintable():
+                        self.ask_key_pending = ''
+                    elif event.unicode and event.unicode.isprintable():
+                        # 始终接受 KEYDOWN 文本：有些环境不会发 TEXTINPUT
                         self.ask_buffer += event.unicode
+                        if self._has_text_input:
+                            self.ask_key_pending += event.unicode
                     continue
                 key = self._key_name(event.key)
                 if key:

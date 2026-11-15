@@ -2490,7 +2490,10 @@ def test_ask_input_box():
 
     try:
         assert pump_until(lambda: runtime.ask_pending), "第一次询问没有出现"
+        # KEYDOWN 与 TEXTINPUT 同时到达时不能重复输入
         for ch in "hi":
+            pygame.event.post(pygame.event.Event(
+                pygame.KEYDOWN, key=ord(ch), unicode=ch, mod=0))
             pygame.event.post(pygame.event.Event(pygame.TEXTINPUT, text=ch))
         pygame.event.post(pygame.event.Event(
             pygame.KEYDOWN, key=pygame.K_KP_ENTER, unicode="\r", mod=0))
@@ -2499,8 +2502,10 @@ def test_ask_input_box():
 
         assert pump_until(lambda: runtime.ask_pending), "第二次询问没有出现"
         assert runtime.ask_buffer == "", "第二次询问应重置输入内容"
+        # 只有 KEYDOWN（部分环境不发 TEXTINPUT）也必须能输入
         for ch in "ok":
-            pygame.event.post(pygame.event.Event(pygame.TEXTINPUT, text=ch))
+            pygame.event.post(pygame.event.Event(
+                pygame.KEYDOWN, key=ord(ch), unicode=ch, mod=0))
         bar = runtime._ask_rect()
         pygame.event.post(pygame.event.Event(
             pygame.MOUSEBUTTONDOWN, button=1, pos=(bar.x + 20, bar.centery)))
@@ -2508,6 +2513,7 @@ def test_ask_input_box():
             f"点击输入框应提交: {sprite._say_text!r}"
 
         assert pump_until(lambda: runtime.ask_pending), "第三次询问没有出现"
+        # 只有 TEXTINPUT（输入法上屏）
         for ch in "up":
             pygame.event.post(pygame.event.Event(pygame.TEXTINPUT, text=ch))
         # 模拟输入法吞掉 KEYDOWN，只收到回车松开
