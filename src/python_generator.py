@@ -24,6 +24,7 @@ class PythonGenerator:
 
     RUNTIME_HELPERS = r'''
 _SCRATCH_LIST_LIMIT = 200000
+_RUNTIME_VERSION = '0.9.6'
 
 
 def _sc_is_white(value):
@@ -974,7 +975,9 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
         pygame.display.init()
         pygame.font.init()
         self._create_display(maximize=self.maximize)
-        pygame.display.set_caption("Scratch 3.0 Runtime (ESC 退出，可自由拉伸窗口)")
+        pygame.display.set_caption(
+            "Scratch 3.0 Runtime " + _RUNTIME_VERSION
+            + " (ESC 退出，可自由拉伸窗口)")
         self.pen_layer = pygame.Surface((self.stage_width, self.stage_height),
                                         pygame.SRCALPHA)
         self.clock = pygame.time.Clock()
