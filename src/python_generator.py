@@ -1551,6 +1551,7 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
                 background = stage._color_effect_image(background, color)
             if brightness:
                 background = stage._brightness_image(background, brightness)
+            background = stage._distortion_image(background)
             if ghost > 0:
                 background = background.copy()
                 background.set_alpha(int(255 * (1 - ghost / 100.0)))
@@ -2807,6 +2808,126 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
             cache[key] = surface
         return surface
 
+    def _distortion_image(self, image):
+        """鱼眼/旋涡/像素化/马赛克：按(造型Surface, 特效值)缓存结果"""
+        effects = self._effects
+        mosaic = _sc_num(effects.get('mosaic', 0))
+        pixelate = _sc_num(effects.get('pixelate', 0))
+        whirl = _sc_num(effects.get('whirl', 0))
+        fisheye = _sc_num(effects.get('fisheye', 0))
+        if abs(mosaic) < 1e-3 and abs(pixelate) < 1e-3 \
+                and abs(whirl) < 1e-3 and abs(fisheye) < 1e-3:
+            return image
+        cache = getattr(self, '_distortion_cache', None)
+        if cache is None:
+            cache = self._distortion_cache = {}
+        key = (id(image), round(mosaic, 2), round(pixelate, 2),
+               round(whirl, 2), round(fisheye, 2))
+        surface = cache.get(key)
+        if surface is None:
+            surface = self._distort_surface(
+                image, mosaic, pixelate, whirl, fisheye)
+            if len(cache) >= 6:
+                cache.clear()
+            cache[key] = surface
+        return surface
+
+    def _distort_surface(self, image, mosaic, pixelate, whirl, fisheye):
+        """复刻 scratch-render 的 EffectTransform：马赛克→像素化→旋涡→鱼眼"""
+        width, height = image.get_size()
+        if width <= 0 or height <= 0:
+            return image
+        try:
+            import numpy
+        except ImportError:
+            return self._distort_fallback(image, mosaic, pixelate)
+        try:
+            xs = (numpy.arange(width, dtype=numpy.float32) + 0.5) / width
+            ys = (numpy.arange(height, dtype=numpy.float32) + 0.5) / height
+            u = numpy.repeat(xs[:, None], height, axis=1)
+            v = numpy.repeat(ys[None, :], width, axis=0)
+
+            if abs(mosaic) > 1e-3:
+                tiles = max(1.0, min(
+                    float(round((abs(mosaic) + 10.0) / 10.0)), 512.0))
+                u = numpy.mod(u * tiles, 1.0)
+                v = numpy.mod(v * tiles, 1.0)
+
+            if abs(pixelate) > 1e-3:
+                block = max(abs(pixelate) / 10.0, 1e-3)
+                columns = max(1.0, width / block)
+                rows = max(1.0, height / block)
+                u = (numpy.floor(u * columns) + 0.5) / columns
+                v = (numpy.floor(v * rows) + 0.5) / rows
+
+            if abs(whirl) > 1e-3:
+                angle = -whirl * math.pi / 180.0
+                offset_x = u - 0.5
+                offset_y = v - 0.5
+                radius = numpy.sqrt(offset_x * offset_x + offset_y * offset_y)
+                factor = numpy.maximum(1.0 - radius / 0.5, 0.0)
+                actual = angle * factor * factor
+                cos_value = numpy.cos(actual)
+                sin_value = numpy.sin(actual)
+                u = cos_value * offset_x + sin_value * offset_y + 0.5
+                v = -sin_value * offset_x + cos_value * offset_y + 0.5
+
+            if abs(fisheye) > 1e-3:
+                power = max(0.0, (fisheye + 100.0) / 100.0)
+                vec_x = (u - 0.5) / 0.5
+                vec_y = (v - 0.5) / 0.5
+                length = numpy.sqrt(vec_x * vec_x + vec_y * vec_y)
+                safe = numpy.where(length < 1e-6, 1.0, length)
+                r = numpy.power(numpy.minimum(length, 1.0), power) \
+                    * numpy.maximum(1.0, length)
+                u = 0.5 + r * (vec_x / safe) * 0.5
+                v = 0.5 + r * (vec_y / safe) * 0.5
+
+            x_index = numpy.clip(
+                numpy.floor(u * width).astype(numpy.int32), 0, width - 1)
+            y_index = numpy.clip(
+                numpy.floor(v * height).astype(numpy.int32), 0, height - 1)
+            source = pygame.surfarray.pixels3d(image)
+            source_alpha = pygame.surfarray.pixels_alpha(image)
+            sampled = source[x_index, y_index]
+            sampled_alpha = source_alpha[x_index, y_index]
+            result = pygame.Surface((width, height), pygame.SRCALPHA)
+            target = pygame.surfarray.pixels3d(result)
+            target[:, :, :] = sampled
+            target_alpha = pygame.surfarray.pixels_alpha(result)
+            target_alpha[:, :] = sampled_alpha
+            del source, source_alpha, target, target_alpha
+            return result
+        except Exception:
+            return self._distort_fallback(image, mosaic, pixelate)
+
+    def _distort_fallback(self, image, mosaic, pixelate):
+        """没有 numpy 时用 pygame 缩放/平铺近似像素化与马赛克"""
+        try:
+            width, height = image.get_size()
+            if abs(mosaic) > 0.5:
+                tiles = int(max(1, min(
+                    round((abs(mosaic) + 10.0) / 10.0), 128)))
+                if tiles > 1:
+                    tile = pygame.transform.scale(
+                        image, (max(1, width // tiles),
+                                max(1, height // tiles)))
+                    result = pygame.Surface((width, height), pygame.SRCALPHA)
+                    tile_width, tile_height = tile.get_size()
+                    for y in range(0, height, tile_height):
+                        for x in range(0, width, tile_width):
+                            result.blit(tile, (x, y))
+                    return result
+            if abs(pixelate) > 0.5:
+                block = max(1, int(abs(pixelate) / 10.0))
+                small = pygame.transform.scale(
+                    image, (max(1, width // block),
+                            max(1, height // block)))
+                return pygame.transform.scale(small, (width, height))
+        except Exception:
+            pass
+        return image
+
     def _draw(self, screen, font):
         image = self._costume_surface()
         runtime = self._runtime
@@ -2833,6 +2954,9 @@ def _extension_music(runtime, sprite, opcode, inputs, fields):
                 base = self._color_effect_image(image, color_effect)
             if brightness and self._runtime is not None:
                 base = self._brightness_image(base, brightness)
+            # 鱼眼/旋涡/像素化/马赛克作用在造型上，再参与旋转与缩放
+            if self._runtime is not None:
+                base = self._distortion_image(base)
             # 无旋转/无缩放时直接复用缓存的Surface，避免每帧rotozoom拷贝
             if angle == 0 and scale == 1.0:
                 transformed = base

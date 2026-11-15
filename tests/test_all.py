@@ -2078,6 +2078,13 @@ def test_effects_monitors_and_mask_touching():
         sprite.clear_effects()
         runtime._draw()
 
+        # 形状类特效（像素化）应能正常绘制
+        sprite.set_effect('PIXELATE', 50)
+        runtime._draw()
+        assert runtime.screen.get_at((240, 180)).r > 200, "像素化后中心仍应为红色"
+        sprite.clear_effects()
+        runtime._draw()
+
         # 像素级碰撞：两者矩形有重叠但不接触时应为False
         assert runtime.touching(sprite, "Other") is True, "相邻造型应发生碰撞"
         neighbor.x = 100
@@ -2440,6 +2447,79 @@ print("done")
     return True
 
 
+def test_distortion_effects():
+    """鱼眼/旋涡/像素化/马赛克：按 scratch-render 的坐标变换实现"""
+    print("[测试44] 更多图形特效")
+
+    project = make_project({
+        "b1": block("event_whenflagclicked", None, None, top_level=True),
+    }, name="Fx2")
+    code = generate_python(parse_scratch_project(project))
+    namespace = {}
+    exec(compile(code, "<generated>", "exec"), namespace)
+    pygame = namespace["pygame"]
+    runtime = namespace["ScratchRuntime"](headless=True, audio=False)
+    sprite = namespace["Fx2"]()
+    runtime.add_sprite(sprite)
+    try:
+        gradient = pygame.Surface((80, 80), pygame.SRCALPHA)
+        for x in range(80):
+            for y in range(80):
+                gradient.set_at((x, y),
+                                (x * 3 % 256, y * 3 % 256, (x + y) % 256, 255))
+        original = pygame.image.tobytes(gradient, 'RGBA')
+
+        # 没有特效时不产生新Surface
+        assert sprite._distortion_image(gradient) is gradient
+
+        # 像素化：每 10 像素一个块，块内取值一致
+        sprite.set_effect('PIXELATE', 100)
+        pixelated = sprite._distortion_image(gradient)
+        assert pixelated.get_at((3, 3)) == pixelated.get_at((7, 7)), \
+            "同一像素块内颜色应一致"
+        assert pixelated.get_at((3, 3)) != gradient.get_at((3, 3)), \
+            "像素化应改变取样位置"
+
+        # 马赛克：值 10 对应 2x2 平铺
+        sprite.clear_effects()
+        sprite.set_effect('MOSAIC', 10)
+        mosaic = sprite._distortion_image(gradient)
+        assert mosaic.get_at((5, 5)) == mosaic.get_at((45, 5)), \
+            "马赛克应在水平方向重复"
+        assert mosaic.get_at((5, 5)) == mosaic.get_at((5, 45)), \
+            "马赛克应在垂直方向重复"
+
+        # 旋涡与鱼眼：无 numpy 时允许跳过（返回原图）
+        try:
+            import numpy  # noqa: F401
+            has_numpy = True
+        except ImportError:
+            has_numpy = False
+
+        sprite.clear_effects()
+        sprite.set_effect('WHIRL', 100)
+        whirled = sprite._distortion_image(gradient)
+        if has_numpy:
+            assert pygame.image.tobytes(whirled, 'RGBA') != original, \
+                "旋涡特效应改变图像"
+
+        sprite.clear_effects()
+        sprite.set_effect('FISHEYE', 100)
+        fisheye = sprite._distortion_image(gradient)
+        if has_numpy:
+            assert pygame.image.tobytes(fisheye, 'RGBA') != original, \
+                "鱼眼特效应改变图像"
+
+        # 缩放等值（0）时恢复原图
+        sprite.clear_effects()
+        assert sprite._distortion_image(gradient) is gradient
+    finally:
+        runtime.shutdown()
+
+    print("  [PASS] 更多图形特效通过")
+    return True
+
+
 def test_chinese_sprite_instance_name():
     """中文角色名 lower() 后与类名相同，不能被 main() 的局部变量遮蔽"""
     print("[测试43] 中文角色名的实例命名")
@@ -2513,6 +2593,7 @@ def main():
         test_general_python_more_syntax,
         test_general_python_break_continue,
         test_general_python_builtins_and_methods,
+        test_distortion_effects,
         test_chinese_sprite_instance_name,
     ]
     
