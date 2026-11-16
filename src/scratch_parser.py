@@ -184,6 +184,9 @@ EXTENSION_HAT_OPCODES = {
     'lmsmoreevents_whilekeypressed',
     'lmsmoreevents_beforesave',
     'lmsmoreevents_aftersave',
+    # Clipboard
+    'clipboard_whencopied',
+    'clipboard_whenpasted',
 }
 
 # 这些扩展的动态菜单保存的是变量ID，需要还原成变量名
@@ -256,6 +259,60 @@ class ScratchParser:
         self.extensions = set()
         self.list_id_names: Dict[str, str] = {}
         self.variable_id_names: Dict[str, str] = {}
+        # 变量/列表 -> 生成属性名（仅在局部与全局同名等冲突时才不同）
+        self.global_var_names: Dict[str, str] = {}
+        self.global_var_ids: Dict[str, str] = {}
+        self.global_list_names: Dict[str, str] = {}
+        self.global_list_ids: Dict[str, str] = {}
+        self.current_var_names: Dict[str, str] = {}
+        self.current_var_ids: Dict[str, str] = {}
+        self.current_list_names: Dict[str, str] = {}
+        self.current_list_ids: Dict[str, str] = {}
+
+    @staticmethod
+    def _unique_attr(base: str, used: set, prefix: str) -> str:
+        """为冲突的变量/列表生成唯一属性名"""
+        if base not in used:
+            return base
+        candidate = f"{prefix}_{base}"
+        index = 2
+        while candidate in used:
+            candidate = f"{prefix}_{base}_{index}"
+            index += 1
+        return candidate
+
+    @staticmethod
+    def _field_pair(raw: ScratchBlockRaw, field_name: str,
+                    default_name: str):
+        """取出 [名字, ID] 形式的字段，兼容只有名字的旧格式"""
+        field = raw.fields.get(field_name, [])
+        name = str(field[0]) if field else default_name
+        item_id = str(field[1]) if len(field) > 1 and field[1] else ''
+        return name, item_id
+
+    def _variable_attr(self, name: str, variable_id: str = '') -> str:
+        key = str(variable_id or '')
+        if key and key in self.global_var_ids:
+            return self.global_var_ids[key]
+        if key and key in self.current_var_ids:
+            return self.current_var_ids[key]
+        if name in self.current_var_names:
+            return self.current_var_names[name]
+        if name in self.global_var_names:
+            return self.global_var_names[name]
+        return sanitize_name(name, 'var')
+
+    def _list_attr(self, name: str, list_id: str = '') -> str:
+        key = str(list_id or '')
+        if key and key in self.global_list_ids:
+            return self.global_list_ids[key]
+        if key and key in self.current_list_ids:
+            return self.current_list_ids[key]
+        if name in self.current_list_names:
+            return self.current_list_names[name]
+        if name in self.global_list_names:
+            return self.global_list_names[name]
+        return sanitize_name(name, 'lst')
 
     def _extension_namespace(self, opcode: str) -> Optional[str]:
         prefix = opcode.split('_', 1)[0]
@@ -341,6 +398,38 @@ class ScratchParser:
                     return data
         return {}
 
+    def _prepare_global_names(self, json_data: Dict):
+        """预先计算舞台变量的Python属性名
+
+        舞台变量就是Scratch全局变量。正常情况下属性名就是清洗后的变量名；
+        只有多个名字清洗后撞车时才加前缀，保证GLOBALS键唯一。
+        """
+        self.global_var_names = {}
+        self.global_var_ids = {}
+        self.global_list_names = {}
+        self.global_list_ids = {}
+        stage = next((target for target in json_data.get('targets', [])
+                      if target.get('isStage')), None)
+        if stage is None:
+            return
+        used = set()
+        for var_id, var_data in (stage.get('variables') or {}).items():
+            if not isinstance(var_data, list) or not var_data:
+                continue
+            name = str(var_data[0])
+            attr = self._unique_attr(sanitize_name(name, 'var'), used, 'global')
+            used.add(attr)
+            self.global_var_names[name] = attr
+            self.global_var_ids[str(var_id)] = attr
+        for list_id, list_data in (stage.get('lists') or {}).items():
+            if not isinstance(list_data, list) or not list_data:
+                continue
+            name = str(list_data[0])
+            attr = self._unique_attr(sanitize_name(name, 'lst'), used, 'global')
+            used.add(attr)
+            self.global_list_names[name] = attr
+            self.global_list_ids[str(list_id)] = attr
+
     def parse_project(self, json_data: Dict) -> ProjectIR:
         """解析整个Scratch项目"""
         project = ProjectIR()
@@ -359,6 +448,7 @@ class ScratchParser:
             for var_id, var_data in (target_data.get('variables') or {}).items():
                 if isinstance(var_data, list) and len(var_data) >= 1:
                     self.variable_id_names[str(var_id)] = str(var_data[0])
+        self._prepare_global_names(json_data)
         project.runtime_options = self._parse_turbowarp_options(json_data)
 
         for target_data in json_data.get('targets', []):
@@ -382,6 +472,37 @@ class ScratchParser:
             draggable=data.get('draggable', False),
             rotation_style=data.get('rotationStyle', 'all around'),
         )
+
+        # 变量/列表属性名：舞台用预计算的全局映射，角色本地变量可与全局重名，
+        # 重名时给本地变量加前缀，引用按变量ID区分，保证读写到正确的变量。
+        if sprite.is_stage:
+            sprite.variable_attrs = dict(self.global_var_names)
+            sprite.variable_id_attrs = dict(self.global_var_ids)
+            sprite.list_attrs = dict(self.global_list_names)
+            sprite.list_id_attrs = dict(self.global_list_ids)
+        else:
+            used = set(self.global_var_ids.values()) \
+                | set(self.global_list_ids.values())
+            for var_id, var_data in data.get('variables', {}).items():
+                if not isinstance(var_data, list) or not var_data:
+                    continue
+                name = str(var_data[0])
+                attr = self._unique_attr(sanitize_name(name, 'var'), used, 'local')
+                used.add(attr)
+                sprite.variable_attrs[name] = attr
+                sprite.variable_id_attrs[str(var_id)] = attr
+            for list_id, list_data in data.get('lists', {}).items():
+                if not isinstance(list_data, list) or not list_data:
+                    continue
+                name = str(list_data[0])
+                attr = self._unique_attr(sanitize_name(name, 'lst'), used, 'local')
+                used.add(attr)
+                sprite.list_attrs[name] = attr
+                sprite.list_id_attrs[str(list_id)] = attr
+        self.current_var_names = sprite.variable_attrs
+        self.current_var_ids = sprite.variable_id_attrs
+        self.current_list_names = sprite.list_attrs
+        self.current_list_ids = sprite.list_id_attrs
 
         # 解析变量
         for var_id, var_data in data.get('variables', {}).items():
@@ -685,8 +806,9 @@ class ScratchParser:
             stmt.body = self.parse_substack(raw, 'SUBSTACK')
 
         elif block_type == BlockType.FOR_EACH:
-            var_field = raw.fields.get('VARIABLE', [])
-            stmt.extra['name'] = var_field[0] if var_field else 'item'
+            var_name, var_id = self._field_pair(raw, 'VARIABLE', 'item')
+            stmt.extra['name'] = var_name
+            stmt.extra['attr'] = self._variable_attr(var_name, var_id)
             stmt.value = self.parse_input(raw, 'VALUE', '')
             stmt.body = self.parse_substack(raw, 'SUBSTACK')
 
@@ -718,62 +840,71 @@ class ScratchParser:
             pass
 
         elif block_type == BlockType.SET_VARIABLE:
-            var_field = raw.fields.get('VARIABLE', [])
-            var_name = var_field[0] if var_field else 'var'
-            var_id = var_field[1] if len(var_field) > 1 else ''
+            var_name, var_id = self._field_pair(raw, 'VARIABLE', 'var')
             stmt.extra['name'] = var_name
             stmt.extra['id'] = var_id
+            stmt.extra['attr'] = self._variable_attr(var_name, var_id)
             stmt.value = self.parse_input(raw, 'VALUE', 0)
 
         elif block_type == BlockType.CHANGE_VARIABLE:
-            var_field = raw.fields.get('VARIABLE', [])
-            var_name = var_field[0] if var_field else 'var'
-            var_id = var_field[1] if len(var_field) > 1 else ''
+            var_name, var_id = self._field_pair(raw, 'VARIABLE', 'var')
             stmt.extra['name'] = var_name
             stmt.extra['id'] = var_id
+            stmt.extra['attr'] = self._variable_attr(var_name, var_id)
             stmt.value = self.parse_input(raw, 'VALUE', 1)
 
         elif block_type == BlockType.SHOW_VARIABLE:
-            var_field = raw.fields.get('VARIABLE', [])
-            stmt.extra['name'] = var_field[0] if var_field else 'var'
+            var_name, var_id = self._field_pair(raw, 'VARIABLE', 'var')
+            stmt.extra['name'] = var_name
+            stmt.extra['id'] = var_id
+            stmt.extra['attr'] = self._variable_attr(var_name, var_id)
 
         elif block_type == BlockType.HIDE_VARIABLE:
-            var_field = raw.fields.get('VARIABLE', [])
-            stmt.extra['name'] = var_field[0] if var_field else 'var'
+            var_name, var_id = self._field_pair(raw, 'VARIABLE', 'var')
+            stmt.extra['name'] = var_name
+            stmt.extra['id'] = var_id
+            stmt.extra['attr'] = self._variable_attr(var_name, var_id)
 
         elif block_type == BlockType.ADD_TO_LIST:
-            list_field = raw.fields.get('LIST', [])
-            stmt.extra['name'] = list_field[0] if list_field else 'list'
+            list_name, list_id = self._field_pair(raw, 'LIST', 'list')
+            stmt.extra['name'] = list_name
+            stmt.extra['attr'] = self._list_attr(list_name, list_id)
             stmt.value = self.parse_input(raw, 'ITEM', '')
 
         elif block_type == BlockType.DELETE_FROM_LIST:
-            list_field = raw.fields.get('LIST', [])
-            stmt.extra['name'] = list_field[0] if list_field else 'list'
+            list_name, list_id = self._field_pair(raw, 'LIST', 'list')
+            stmt.extra['name'] = list_name
+            stmt.extra['attr'] = self._list_attr(list_name, list_id)
             stmt.value = self.parse_input(raw, 'INDEX', 1)
 
         elif block_type == BlockType.DELETE_ALL_FROM_LIST:
-            list_field = raw.fields.get('LIST', [])
-            stmt.extra['name'] = list_field[0] if list_field else 'list'
+            list_name, list_id = self._field_pair(raw, 'LIST', 'list')
+            stmt.extra['name'] = list_name
+            stmt.extra['attr'] = self._list_attr(list_name, list_id)
 
         elif block_type == BlockType.INSERT_IN_LIST:
-            list_field = raw.fields.get('LIST', [])
-            stmt.extra['name'] = list_field[0] if list_field else 'list'
+            list_name, list_id = self._field_pair(raw, 'LIST', 'list')
+            stmt.extra['name'] = list_name
+            stmt.extra['attr'] = self._list_attr(list_name, list_id)
             stmt.extra['item'] = self.parse_input(raw, 'ITEM', '')
             stmt.value = self.parse_input(raw, 'INDEX', 1)
 
         elif block_type == BlockType.REPLACE_IN_LIST:
-            list_field = raw.fields.get('LIST', [])
-            stmt.extra['name'] = list_field[0] if list_field else 'list'
+            list_name, list_id = self._field_pair(raw, 'LIST', 'list')
+            stmt.extra['name'] = list_name
+            stmt.extra['attr'] = self._list_attr(list_name, list_id)
             stmt.extra['item'] = self.parse_input(raw, 'ITEM', '')
             stmt.value = self.parse_input(raw, 'INDEX', 1)
 
         elif block_type == BlockType.SHOW_LIST:
-            list_field = raw.fields.get('LIST', [])
-            stmt.extra['name'] = list_field[0] if list_field else 'list'
+            list_name, list_id = self._field_pair(raw, 'LIST', 'list')
+            stmt.extra['name'] = list_name
+            stmt.extra['attr'] = self._list_attr(list_name, list_id)
 
         elif block_type == BlockType.HIDE_LIST:
-            list_field = raw.fields.get('LIST', [])
-            stmt.extra['name'] = list_field[0] if list_field else 'list'
+            list_name, list_id = self._field_pair(raw, 'LIST', 'list')
+            stmt.extra['name'] = list_name
+            stmt.extra['attr'] = self._list_attr(list_name, list_id)
 
         elif block_type == BlockType.BROADCAST:
             msg = self.parse_input(raw, 'BROADCAST_INPUT', '')
@@ -981,10 +1112,17 @@ class ScratchParser:
         if isinstance(value, list) and value:
             code = value[0] if isinstance(value[0], int) else None
             if code == 12:
-                return make_variable(value[1] if len(value) > 1 else '')
+                name = value[1] if len(value) > 1 else ''
+                item_id = str(value[2]) if len(value) > 2 else ''
+                expr = make_variable(name)
+                expr.extra['attr'] = self._variable_attr(str(name), item_id)
+                return expr
             if code == 13:
-                return Expr(ExprType.LIST_ACCESS,
-                            name=value[1] if len(value) > 1 else '')
+                name = value[1] if len(value) > 1 else ''
+                item_id = str(value[2]) if len(value) > 2 else ''
+                expr = Expr(ExprType.LIST_ACCESS, name=name)
+                expr.extra['attr'] = self._list_attr(str(name), item_id)
+                return expr
             if code == 11:
                 # Scratch官方格式：[11, 广播名, 广播ID]，取第2项而不是ID
                 return make_string(value[1] if len(value) > 1 else '')
@@ -1284,37 +1422,43 @@ class ScratchParser:
             return Expr(type=expr_type, name=op_name, right=num)
 
         elif opcode == 'data_variable':
-            var_field = raw.fields.get('VARIABLE', [])
-            var_name = var_field[0] if var_field else 'var'
-            return make_variable(var_name)
+            var_name, var_id = self._field_pair(raw, 'VARIABLE', 'var')
+            expr = make_variable(var_name)
+            expr.extra['attr'] = self._variable_attr(var_name, var_id)
+            return expr
 
         elif opcode == 'data_listcontents':
-            list_field = raw.fields.get('LIST', [])
-            list_name = list_field[0] if list_field else 'list'
-            return Expr(ExprType.LIST_ACCESS, name=list_name)
+            list_name, list_id = self._field_pair(raw, 'LIST', 'list')
+            expr = Expr(ExprType.LIST_ACCESS, name=list_name)
+            expr.extra['attr'] = self._list_attr(list_name, list_id)
+            return expr
 
         elif opcode == 'data_itemoflist':
-            list_field = raw.fields.get('LIST', [])
-            list_name = list_field[0] if list_field else 'list'
+            list_name, list_id = self._field_pair(raw, 'LIST', 'list')
             index = self.parse_input(raw, 'INDEX', 1)
-            return make_list_access(list_name, index)
+            expr = make_list_access(list_name, index)
+            expr.extra['attr'] = self._list_attr(list_name, list_id)
+            return expr
 
         elif opcode == 'data_itemnumoflist':
-            list_field = raw.fields.get('LIST', [])
-            list_name = list_field[0] if list_field else 'list'
+            list_name, list_id = self._field_pair(raw, 'LIST', 'list')
             item = self.parse_input(raw, 'ITEM', '')
-            return Expr(ExprType.ITEM_NUMBER_OF_LIST, name=list_name, left=item)
+            expr = Expr(ExprType.ITEM_NUMBER_OF_LIST, name=list_name, left=item)
+            expr.extra['attr'] = self._list_attr(list_name, list_id)
+            return expr
 
         elif opcode == 'data_lengthoflist':
-            list_field = raw.fields.get('LIST', [])
-            list_name = list_field[0] if list_field else 'list'
-            return make_list_length(list_name)
+            list_name, list_id = self._field_pair(raw, 'LIST', 'list')
+            expr = make_list_length(list_name)
+            expr.extra['attr'] = self._list_attr(list_name, list_id)
+            return expr
 
         elif opcode == 'data_listcontainsitem':
-            list_field = raw.fields.get('LIST', [])
-            list_name = list_field[0] if list_field else 'list'
+            list_name, list_id = self._field_pair(raw, 'LIST', 'list')
             item = self.parse_input(raw, 'ITEM', '')
-            return make_list_contains(list_name, item)
+            expr = make_list_contains(list_name, item)
+            expr.extra['attr'] = self._list_attr(list_name, list_id)
+            return expr
 
         elif opcode == 'sensing_answer':
             return Expr(ExprType.ANSWER)

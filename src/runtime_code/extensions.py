@@ -2007,4 +2007,586 @@ def _extension_temp_vars(runtime, sprite, opcode, inputs, fields):
     if key.endswith('listvariables'):
         return ','.join(runtime.ext_legacy_vars.keys())
 
+    return 0
+
+
+# ===================== List Tools (lmsListTools) =====================
+
+def _ext_list_object(sprite, name):
+    """按扩展语义查找列表：先舞台全局，再角色本地。"""
+    text = _sc_str(name)
+    runtime = getattr(sprite, '_runtime', None)
+    if runtime is not None and runtime.stage_sprite is not None:
+        stage = runtime.stage_sprite
+        attr = getattr(type(stage), 'LIST_ATTRS', {}).get(text)
+        if attr and isinstance(GLOBALS.get(attr), list):
+            return GLOBALS[attr]
+    attr = getattr(type(sprite), 'LIST_ATTRS', {}).get(text)
+    if attr:
+        value = getattr(sprite, attr, None)
+        if isinstance(value, list):
+            return value
+    if runtime is not None:
+        data, key = runtime._find_list(sprite, text)
+        if data is not None:
+            return data[key]
+    return None
+
+
+def _ext_same_value(a, b):
+    """尽可能贴近JS的严格相等：类型不同就不相等。"""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return a is b
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return float(a) == float(b)
+    return type(a) is type(b) and a == b
+
+
+def _extension_list_tools(runtime, sprite, opcode, inputs, fields):
+    """lmsListTools：列表排序、拼接、查找、数组转换"""
+    key = str(opcode).lower().replace('_', '')
+    list_name = _ext_input(inputs, fields, 'LIST', 'list', default='')
+    values = _ext_list_object(sprite, list_name)
+
+    if key.endswith('deleteitems'):
+        if values is None:
+            return 0
+        first = int(_sc_num(_ext_input(inputs, fields, 'NUM1', 'num1', default=1)))
+        last = int(_sc_num(_ext_input(inputs, fields, 'NUM2', 'num2', default=1)))
+        if first > last:
+            first, last = last, first
+        start = max(0, first - 1)
+        end = max(start, last)
+        del values[start:end]
+        return 0
+
+    if key.endswith('deleteallofitem'):
+        if values is None:
+            return 0
+        target = _ext_input(inputs, fields, 'ITEM', 'item', default='')
+        values[:] = [item for item in values
+                     if not _ext_same_value(item, target)]
+        return 0
+
+    if key.endswith('replaceallofitem'):
+        if values is None:
+            return 0
+        old = _ext_input(inputs, fields, 'ITEM1', 'item1', default='')
+        new = _ext_input(inputs, fields, 'ITEM2', 'item2', default='')
+        for index, item in enumerate(values):
+            if _ext_same_value(item, old):
+                values[index] = new
+        return 0
+
+    if key.endswith('repeatlist'):
+        if values is None:
+            return 0
+        source = _ext_list_object(
+            sprite, _ext_input(inputs, fields, 'LIST1', 'list1', default=''))
+        if source is None:
+            return 0
+        count = max(0, int(_sc_num(
+            _ext_input(inputs, fields, 'NUM', 'num', default=1))))
+        values.extend(list(source) * count)
+        return 0
+
+    if key.endswith('getlistjoin'):
+        if values is None:
+            return ''
+        separator = _sc_str(_ext_input(inputs, fields, 'STRING', 'string',
+                                       default=''))
+        return separator.join(_sc_str(item) for item in values)
+
+    if key.endswith('timesitemappears'):
+        if values is None:
+            return 0
+        target = _ext_input(inputs, fields, 'ITEM', 'item', default='')
+        return sum(1 for item in values if _sc_eq(item, target))
+
+    if key.endswith('itemindex'):
+        if values is None:
+            return 0
+        target = _ext_input(inputs, fields, 'ITEM', 'item', default='')
+        indexes = [index for index, item in enumerate(values)
+                   if _ext_same_value(item, target)]
+        if not indexes:
+            return 0
+        mode = _sc_str(_ext_input(inputs, fields, 'INDEX', 'index',
+                                  default='_first_')).lower()
+        if mode in ('_last_', 'last'):
+            return indexes[-1] + 1
+        if mode in ('_random_', 'random'):
+            return random.choice(indexes) + 1
+        return indexes[0] + 1
+
+    if key.endswith('listisempty'):
+        return not values
+
+    if key.endswith('itemnumexists'):
+        if not values:
+            return False
+        number = _ext_input(inputs, fields, 'NUM', 'num', default=0)
+        text = _sc_str(number).strip().lower()
+        if text in ('last', '末尾'):
+            return True
+        if text in ('random', 'any'):
+            return True
+        index = _sc_round(_sc_num(number))
+        return 1 <= index <= len(values)
+
+    if key.endswith('orderis'):
+        if values is None:
+            return False
+        order = _sc_str(_ext_input(inputs, fields, 'ORDER', 'order',
+                                   default='ascending')).lower()
+        pairs = zip(values, values[1:])
+        if order in ('ascending', '升序'):
+            return all(_sc_compare(a, b) <= 0 for a, b in pairs)
+        if order in ('descending', '降序'):
+            return all(_sc_compare(a, b) >= 0 for a, b in pairs)
+        if order in ('reversed', '反向'):
+            return all(_sc_compare(a, b) >= 0 for a, b in pairs)
+        return False
+
+    if key.endswith('orderlist'):
+        if values is None:
+            return 0
+        order = _sc_str(_ext_input(inputs, fields, 'ORDER', 'order',
+                                   default='reversed')).lower()
+        if order in ('ascending', '升序'):
+            values.sort(key=functools.cmp_to_key(_sc_compare))
+        elif order in ('descending', '降序'):
+            values.sort(key=functools.cmp_to_key(_sc_compare), reverse=True)
+        elif order in ('randomised', 'randomized', 'random', '随机'):
+            random.shuffle(values)
+        else:
+            values.reverse()
+        return 0
+
+    if key.endswith('setlisttolist'):
+        if values is None:
+            return 0
+        source = _ext_list_object(
+            sprite, _ext_input(inputs, fields, 'LIST2', 'list2', default=''))
+        if source is not None:
+            values[:] = list(source)
+        return 0
+
+    if key.endswith('joinlists'):
+        if values is None:
+            return 0
+        source = _ext_list_object(
+            sprite, _ext_input(inputs, fields, 'LIST2', 'list2', default=''))
+        if source is not None:
+            values.extend(source)
+        return 0
+
+    if key.endswith('setlistarray'):
+        if values is None:
+            return 0
+        text = _sc_str(_ext_input(inputs, fields, 'ARRAY', 'array', default='[]'))
+        try:
+            data = json.loads(text)
+        except (ValueError, TypeError):
+            data = []
+        values[:] = data if isinstance(data, list) else []
+        return 0
+
+    if key.endswith('getlistarray'):
+        return json.dumps(values or [], ensure_ascii=False,
+                          separators=(',', ':'))
+
+    return 0
+
+
+# ===================== Local Storage (localstorage) =====================
+
+def _localstorage_path(runtime):
+    namespace = getattr(runtime, 'localstorage_namespace', '') or \
+        os.path.splitext(os.path.basename(__file__))[0]
+    safe = ''.join(ch if ch.isalnum() or ch in '._-' else '_'
+                   for ch in _sc_str(namespace))[:80] or 'project'
+    folder = os.path.join(os.path.expanduser('~'), '.scratch-converter',
+                          'localstorage')
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except OSError:
+        pass
+    return os.path.join(folder, safe + '.json')
+
+
+def _localstorage_load(runtime):
+    if getattr(runtime, '_localstorage_cache', None) is not None:
+        return runtime._localstorage_cache
+    data = {}
+    try:
+        with open(_localstorage_path(runtime), 'r', encoding='utf-8') as handle:
+            loaded = json.load(handle)
+        if isinstance(loaded, dict):
+            data = loaded
+    except (OSError, ValueError):
+        pass
+    runtime._localstorage_cache = data
+    return data
+
+
+def _localstorage_save(runtime):
+    path = _localstorage_path(runtime)
+    temp = path + '.tmp'
+    try:
+        with open(temp, 'w', encoding='utf-8') as handle:
+            json.dump(getattr(runtime, '_localstorage_cache', {}), handle,
+                      ensure_ascii=False)
+        os.replace(temp, path)
+    except OSError:
+        pass
+
+
+def _extension_local_storage(runtime, sprite, opcode, inputs, fields):
+    """localstorage：持久化键值存储"""
+    key = str(opcode).lower().replace('_', '')
+    if key.endswith('setprojectid'):
+        namespace = _sc_str(_ext_input(inputs, fields, 'ID', 'id', default=''))
+        runtime.localstorage_namespace = namespace
+        runtime._localstorage_cache = None
+        return 0
+    data = _localstorage_load(runtime)
+    name = _sc_str(_ext_input(inputs, fields, 'KEY', 'key', default=''))
+    if key.endswith('get'):
+        return data.get(name, '')
+    if key.endswith('set'):
+        data[name] = _ext_input(inputs, fields, 'VALUE', 'value', default='')
+        _localstorage_save(runtime)
+        return 0
+    if key.endswith('remove'):
+        data.pop(name, None)
+        _localstorage_save(runtime)
+        return 0
+    if key.endswith('removeall'):
+        data.clear()
+        _localstorage_save(runtime)
+        return 0
+    if key.endswith('keycount'):
+        return len(data)
+    if key.endswith('itemofkey'):
+        index = _sc_round(_sc_num(
+            _ext_input(inputs, fields, 'NUM', 'num', default=1)))
+        keys = list(data.keys())
+        if 1 <= index <= len(keys):
+            return keys[index - 1]
+        return ''
+    return 0
+
+
+# ===================== Clipboard (clipboard) =====================
+
+def _clipboard_read(runtime):
+    text = ''
+    try:
+        if pygame is not None and getattr(runtime, '_scrap_ready', False):
+            data = pygame.scrap.get(pygame.SCRAP_TEXT)
+            if data:
+                text = data.decode('utf-8', 'replace').rstrip('\x00')
+    except Exception:
+        text = ''
+    if not text:
+        text = getattr(runtime, '_clipboard_text', '')
+    return text
+
+
+def _clipboard_write(runtime, text):
+    runtime._clipboard_text = text
+    try:
+        if pygame is not None and getattr(runtime, '_scrap_ready', False):
+            pygame.scrap.put(pygame.SCRAP_TEXT, text.encode('utf-8'))
+    except Exception:
+        pass
+
+
+def _extension_clipboard(runtime, sprite, opcode, inputs, fields):
+    """clipboard：系统剪贴板"""
+    key = str(opcode).lower().replace('_', '')
+    if key.endswith('setclipboard'):
+        _clipboard_write(runtime, _sc_str(
+            _ext_input(inputs, fields, 'TEXT', 'text', default='')))
+        return 0
+    if key.endswith('resetclipboard'):
+        _clipboard_write(runtime, '')
+        return 0
+    if key.endswith('getlastpastedtext'):
+        return getattr(runtime, '_clipboard_last_pasted', '')
+    if key.endswith('clipboard'):
+        return _clipboard_read(runtime)
+    return 0
+
+
+# ===================== Mouse Cursor (MouseCursor) =====================
+
+_CURSOR_KEYS = {
+    'default': 'ARROW', 'arrow': 'ARROW', 'pointer': 'HAND',
+    'hand': 'HAND', 'crosshair': 'CROSSHAIR', 'text': 'IBEAM',
+    'ibeam': 'IBEAM', 'wait': 'WAIT', 'progress': 'WAITARROW',
+    'help': 'ARROW', 'move': 'SIZEALL', 'all-scroll': 'SIZEALL',
+    'not-allowed': 'NO', 'no-drop': 'NO', 'grab': 'HAND',
+    'grabbing': 'HAND', 'zoom-in': 'SIZEALL', 'zoom-out': 'SIZEALL',
+    'n-resize': 'SIZENS', 's-resize': 'SIZENS', 'ns-resize': 'SIZENS',
+    'row-resize': 'SIZENS', 'e-resize': 'SIZEWE', 'w-resize': 'SIZEWE',
+    'ew-resize': 'SIZEWE', 'col-resize': 'SIZEWE',
+    'nw-resize': 'SIZENWSE', 'se-resize': 'SIZENWSE',
+    'nwse-resize': 'SIZENWSE', 'ne-resize': 'SIZENESW',
+    'sw-resize': 'SIZENESW', 'nesw-resize': 'SIZENESW',
+    'vertical-text': 'IBEAM', 'cell': 'CROSSHAIR', 'copy': 'ARROW',
+    'context-menu': 'ARROW', 'alias': 'HAND',
+}
+
+
+def _set_system_cursor(name):
+    constant = getattr(pygame, 'SYSTEM_CURSOR_' + name, None)
+    if constant is None:
+        constant = pygame.SYSTEM_CURSOR_ARROW
+    try:
+        pygame.mouse.set_cursor(constant)
+        return True
+    except Exception:
+        return False
+
+
+def _extension_mouse_cursor(runtime, sprite, opcode, inputs, fields):
+    """MouseCursor：系统光标与自定义造型光标"""
+    key = str(opcode).lower().replace('_', '')
+    if key.endswith('getcur'):
+        return getattr(runtime, '_cursor_name', 'default')
+    if key.endswith('hidecur'):
+        try:
+            pygame.mouse.set_visible(False)
+        except Exception:
+            pass
+        return 0
+    if key.endswith('setcur'):
+        name = _sc_str(_ext_input(inputs, fields, 'CUR', 'cur',
+                                  default='default')).lower()
+        runtime._cursor_name = name
+        try:
+            pygame.mouse.set_visible(True)
+        except Exception:
+            pass
+        _set_system_cursor(_CURSOR_KEYS.get(name, 'ARROW'))
+        return 0
+    if key.endswith('setcursorimage'):
+        try:
+            surface = sprite._costume_surface()
+            if surface is None:
+                return 0
+            max_size = int(_sc_num(_ext_input(inputs, fields, 'SIZE', 'size',
+                                              default=32)))
+            max_size = max(8, min(128, max_size))
+            width, height = surface.get_size()
+            scale = min(1.0, max_size / float(max(width, height, 1)))
+            if scale < 1.0:
+                surface = pygame.transform.smoothscale(
+                    surface, (max(1, int(width * scale)),
+                              max(1, int(height * scale))))
+            width, height = surface.get_size()
+            position = _sc_str(_ext_input(inputs, fields, 'POSITION',
+                                          'position', default='center')).lower()
+            hotspots = {
+                'top left': (0, 0), 'top': (width // 2, 0),
+                'top right': (width - 1, 0), 'left': (0, height // 2),
+                'center': (width // 2, height // 2),
+                'right': (width - 1, height // 2),
+                'bottom left': (0, height - 1),
+                'bottom': (width // 2, height - 1),
+                'bottom right': (width - 1, height - 1),
+            }
+            hotspot = hotspots.get(position, (width // 2, height // 2))
+            data = []
+            mask = []
+            for y in range(height):
+                for x in range(width):
+                    color = surface.get_at((x, y))
+                    data.append((color.r, color.g, color.b))
+                    mask.append(255 if color.a > 0 else 0)
+            pygame.mouse.set_cursor((width, height), hotspot, data, mask)
+            try:
+                pygame.mouse.set_visible(True)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return 0
+    return 0
+
+
+# ===================== Window Controls (cubesterWindowControls) =====================
+
+def _window_position(runtime):
+    try:
+        return pygame.display.get_window_position()
+    except Exception:
+        pass
+    try:
+        from pygame._sdl2 import video
+        window = video.Window.from_display_module()
+        return window.position
+    except Exception:
+        return (0, 0)
+
+
+def _window_set_position(runtime, x, y):
+    try:
+        pygame.display.set_window_position((int(x), int(y)))
+        return
+    except Exception:
+        pass
+    try:
+        from pygame._sdl2 import video
+        window = video.Window.from_display_module()
+        window.position = (int(x), int(y))
+    except Exception:
+        pass
+
+
+def _window_screen_size(runtime):
+    try:
+        info = pygame.display.Info()
+        return (info.current_w or 1920, info.current_h or 1080)
+    except Exception:
+        return (1920, 1080)
+
+
+def _extension_window_controls(runtime, sprite, opcode, inputs, fields):
+    """cubesterWindowControls：窗口位置/大小/标题/全屏"""
+    key = str(opcode).lower().replace('_', '')
+    screen_w, screen_h = _window_screen_size(runtime)
+    try:
+        width, height = runtime.screen.get_size()
+        pos_x, pos_y = _window_position(runtime)
+    except Exception:
+        width, height, pos_x, pos_y = runtime.stage_width, runtime.stage_height, 0, 0
+
+    if key.endswith('windowx'):
+        return pos_x
+    if key.endswith('windowy'):
+        return pos_y
+    if key.endswith('windoww'):
+        return width
+    if key.endswith('windowh'):
+        return height
+    if key.endswith('screenw'):
+        return screen_w
+    if key.endswith('screenh'):
+        return screen_h
+    if key.endswith('istouchingedge'):
+        return (pos_x <= 0 or pos_y <= 0
+                or pos_x + width >= screen_w or pos_y + height >= screen_h)
+    if key.endswith('isfocused'):
+        try:
+            return bool(pygame.key.get_focused())
+        except Exception:
+            return False
+    if key.endswith('isfullscreen'):
+        return bool(getattr(runtime, 'fullscreen', False))
+    if key.endswith('windowtitle'):
+        try:
+            return pygame.display.get_caption()[0]
+        except Exception:
+            return ''
+    if key.endswith('changetitleto'):
+        runtime.user_window_title = _sc_str(
+            _ext_input(inputs, fields, 'TITLE', 'title', default=''))
+        try:
+            pygame.display.set_caption(runtime.user_window_title)
+        except Exception:
+            pass
+        return 0
+    if key.endswith('enterfullscreen'):
+        runtime.set_fullscreen(True)
+        return 0
+    if key.endswith('exitfullscreen'):
+        runtime.set_fullscreen(False)
+        return 0
+    if key.endswith('closewindow'):
+        runtime.running = False
+        try:
+            pygame.event.post(pygame.event.Event(pygame.QUIT))
+        except Exception:
+            pass
+        return 0
+
+    if key.endswith('moveto'):
+        _window_set_position(
+            runtime, _sc_num(_ext_input(inputs, fields, 'X', 'x', default=0)),
+            _sc_num(_ext_input(inputs, fields, 'Y', 'y', default=0)))
+        return 0
+    if key.endswith('movetopresets'):
+        preset = _sc_str(_ext_input(inputs, fields, 'PRESETS', 'presets',
+                                    default='center')).lower()
+        max_x = max(0, screen_w - width)
+        max_y = max(0, screen_h - height)
+        positions = {
+            'center': (max_x // 2, max_y // 2),
+            'left': (0, max_y // 2),
+            'right': (max_x, max_y // 2),
+            'top': (max_x // 2, 0),
+            'bottom': (max_x // 2, max_y),
+            'top right': (max_x, 0), 'top left': (0, 0),
+            'bottom right': (max_x, max_y),
+            'bottom left': (0, max_y),
+        }
+        if preset in ('random position', 'random', '随机位置'):
+            target = (random.randint(0, max_x), random.randint(0, max_y))
+        else:
+            target = positions.get(preset, (max_x // 2, max_y // 2))
+        _window_set_position(runtime, target[0], target[1])
+        return 0
+    if key.endswith('changex'):
+        _window_set_position(runtime, pos_x + _sc_num(
+            _ext_input(inputs, fields, 'X', 'x', default=0)), pos_y)
+        return 0
+    if key.endswith('setx'):
+        _window_set_position(runtime, _sc_num(
+            _ext_input(inputs, fields, 'X', 'x', default=0)), pos_y)
+        return 0
+    if key.endswith('changey'):
+        _window_set_position(runtime, pos_x, pos_y + _sc_num(
+            _ext_input(inputs, fields, 'Y', 'y', default=0)))
+        return 0
+    if key.endswith('sety'):
+        _window_set_position(runtime, pos_x, _sc_num(
+            _ext_input(inputs, fields, 'Y', 'y', default=0)))
+        return 0
+    if key.endswith('resizeto'):
+        runtime.set_window_size(
+            int(_sc_num(_ext_input(inputs, fields, 'W', 'w', default=width))),
+            int(_sc_num(_ext_input(inputs, fields, 'H', 'h', default=height))))
+        return 0
+    if key.endswith('resizetopresets'):
+        preset = _sc_str(_ext_input(inputs, fields, 'PRESETS', 'presets',
+                                    default='480x360')).lower()
+        try:
+            new_w, new_h = preset.split('x', 1)
+            runtime.set_window_size(int(new_w), int(new_h))
+        except (ValueError, AttributeError):
+            pass
+        return 0
+    if key.endswith('changew'):
+        runtime.set_window_size(width + int(_sc_num(
+            _ext_input(inputs, fields, 'W', 'w', default=0))), height)
+        return 0
+    if key.endswith('setw'):
+        runtime.set_window_size(int(_sc_num(
+            _ext_input(inputs, fields, 'W', 'w', default=width))), height)
+        return 0
+    if key.endswith('changeh'):
+        runtime.set_window_size(width, height + int(_sc_num(
+            _ext_input(inputs, fields, 'H', 'h', default=0))))
+        return 0
+    if key.endswith('seth'):
+        runtime.set_window_size(width, int(_sc_num(
+            _ext_input(inputs, fields, 'H', 'h', default=height))))
+        return 0
+    if key.endswith('matchstagesize'):
+        runtime.set_window_size(runtime.stage_width,
+                                runtime.stage_height + runtime.toolbar_height)
+        return 0
     return 0'''

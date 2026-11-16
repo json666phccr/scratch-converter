@@ -48,9 +48,13 @@ class PythonGenerator:
         self.stage_globals = {}
         if project.stage is not None:
             for name, value in project.stage.variables.items():
-                self.stage_globals[sanitize_name(name, 'var')] = value
+                attr = project.stage.variable_attrs.get(name) \
+                    or sanitize_name(name, 'var')
+                self.stage_globals[attr] = value
             for name, items in project.stage.lists.items():
-                self.stage_globals[sanitize_name(name, 'lst')] = list(items)
+                attr = project.stage.list_attrs.get(name) \
+                    or sanitize_name(name, 'lst')
+                self.stage_globals[attr] = list(items)
         self.global_names = set(self.stage_globals)
 
     def generate_project(self, project: ProjectIR) -> str:
@@ -82,6 +86,8 @@ class PythonGenerator:
         lines.append("import threading")
         lines.append("import json")
         lines.append("import functools")
+        lines.append("import heapq")
+        lines.append("import _thread")
         lines.append("")
         lines.append("try:")
         lines.append("    import pygame")
@@ -170,6 +176,7 @@ class PythonGenerator:
             "import array", "import decimal", "import os", "import io",
             "import base64",
             "import threading", "import json", "import functools",
+            "import heapq", "import _thread",
             "",
             "try:",
             "    import pygame",
@@ -229,6 +236,20 @@ class PythonGenerator:
         lines.append(f"GLOBALS = {self.stage_globals!r}")
         lines.append("")
 
+        def monitor_attr(owner, name, kind):
+            target = None
+            if owner:
+                target = next((sprite for sprite in project.sprites
+                               if sprite.name == owner), None)
+            else:
+                target = project.stage
+            if target is not None:
+                mapping = (target.list_attrs if kind == 'list'
+                           else target.variable_attrs)
+                if name in mapping:
+                    return mapping[name]
+            return sanitize_name(name, 'lst' if kind == 'list' else 'var')
+
         monitors = []
         for monitor in project.monitors:
             if not monitor.get('visible'):
@@ -243,7 +264,7 @@ class PythonGenerator:
                     # 局部列表按Scratch习惯加角色名前缀
                     'label': name if not owner or name.startswith(owner + ':')
                              else f"{owner}: {name}",
-                    'attr': sanitize_name(name, 'lst'),
+                    'attr': monitor_attr(owner, name, 'list'),
                     'x': monitor.get('x', 0), 'y': monitor.get('y', 0),
                     'width': monitor.get('width') or 200,
                     'height': monitor.get('height') or 150,
@@ -256,7 +277,7 @@ class PythonGenerator:
                     # 局部变量按Scratch习惯加角色名前缀
                     'label': name if not owner or name.startswith(owner + ':')
                              else f"{owner}: {name}",
-                    'attr': sanitize_name(name, 'var'),
+                    'attr': monitor_attr(owner, name, 'var'),
                     'x': monitor.get('x', 0), 'y': monitor.get('y', 0),
                     'width': monitor.get('width') or 120,
                     'height': monitor.get('height') or 20,
@@ -361,6 +382,10 @@ class PythonGenerator:
                                'More Events: 项目保存前'),
                 'aftersave': ('after_project_saves',
                               'More Events: 项目保存后'),
+                'whencopied': ('when_clipboard_copied',
+                               '当有内容被复制时'),
+                'whenpasted': ('when_clipboard_pasted',
+                               '当有内容被粘贴时'),
             }
             name, doc = names.get(
                 short, ('when_' + sanitize_name(short, 'event'), '扩展帽子事件'))
@@ -465,8 +490,14 @@ class PythonGenerator:
         lines.append(f'    """精灵: {sprite.name}"""')
         lines.append("")
 
-        local_names = {sanitize_name(name, 'var') for name in sprite.variables}
-        local_names |= {sanitize_name(name, 'lst') for name in sprite.lists}
+        local_names = {
+            sprite.variable_attrs.get(name) or sanitize_name(name, 'var')
+            for name in sprite.variables
+        }
+        local_names |= {
+            sprite.list_attrs.get(name) or sanitize_name(name, 'lst')
+            for name in sprite.lists
+        }
         if sprite.is_stage:
             # 舞台声明的是Scratch全局变量/列表，必须全部走共享GLOBALS
             global_names = tuple(sorted(self.global_names))
@@ -476,10 +507,17 @@ class PythonGenerator:
         lines.append("    GLOBAL_NAMES_SET = frozenset(GLOBAL_NAMES)")
         # 扩展积木按“变量名”访问变量时，需要名字到Python属性的映射
         variable_attrs = {
-            str(name): sanitize_name(name, 'var')
+            str(name): (sprite.variable_attrs.get(name)
+                        or sanitize_name(name, 'var'))
             for name in sprite.variables
         }
+        list_attrs = {
+            str(name): (sprite.list_attrs.get(name)
+                        or sanitize_name(name, 'lst'))
+            for name in sprite.lists
+        }
         lines.append(f"    VAR_ATTRS = {variable_attrs!r}")
+        lines.append(f"    LIST_ATTRS = {list_attrs!r}")
         lines.append("")
 
         lines.append("    def __init__(self):")
@@ -518,12 +556,16 @@ class PythonGenerator:
 
         if not sprite.is_stage:
             for name, value in sprite.variables.items():
-                lines.append(f"        self.{sanitize_name(name, 'var')} = {value!r}")
+                attr = sprite.variable_attrs.get(name) \
+                    or sanitize_name(name, 'var')
+                lines.append(f"        self.{attr} = {value!r}")
             if sprite.variables:
                 lines.append("")
 
             for name, items in sprite.lists.items():
-                lines.append(f"        self.{sanitize_name(name, 'lst')} = {list(items)!r}")
+                attr = sprite.list_attrs.get(name) \
+                    or sanitize_name(name, 'lst')
+                lines.append(f"        self.{attr} = {list(items)!r}")
             if sprite.lists:
                 lines.append("")
 
@@ -796,37 +838,44 @@ class PythonGenerator:
             return [f"{spaces}self.reset_timer()"]
 
         if stmt.type == BlockType.SET_VARIABLE:
-            name = sanitize_name(stmt.extra.get('name') or 'var', 'var')
+            name = stmt.extra.get('attr') \
+                or sanitize_name(stmt.extra.get('name') or 'var', 'var')
             value = stmt.value.to_python_source() if stmt.value else "0"
             return [f"{spaces}self.{name} = {value}"]
 
         if stmt.type == BlockType.CHANGE_VARIABLE:
-            name = sanitize_name(stmt.extra.get('name') or 'var', 'var')
+            name = stmt.extra.get('attr') \
+                or sanitize_name(stmt.extra.get('name') or 'var', 'var')
             value = stmt.value.to_python_source() if stmt.value else "1"
             return [f"{spaces}self.{name} = _sc_add(self.{name}, {value})"]
 
         if stmt.type == BlockType.ADD_TO_LIST:
-            name = sanitize_name(stmt.extra.get('name') or 'list', 'lst')
+            name = stmt.extra.get('attr') \
+                or sanitize_name(stmt.extra.get('name') or 'list', 'lst')
             item = stmt.value.to_python_source() if stmt.value else "''"
             return [f"{spaces}self.{name}.append({item})"]
 
         if stmt.type == BlockType.DELETE_FROM_LIST:
-            name = sanitize_name(stmt.extra.get('name') or 'list', 'lst')
+            name = stmt.extra.get('attr') \
+                or sanitize_name(stmt.extra.get('name') or 'list', 'lst')
             index = stmt.value.to_python_source() if stmt.value else "1"
             return [f"{spaces}_sc_list_delete(self.{name}, {index})"]
 
         if stmt.type == BlockType.DELETE_ALL_FROM_LIST:
-            name = sanitize_name(stmt.extra.get('name') or 'list', 'lst')
+            name = stmt.extra.get('attr') \
+                or sanitize_name(stmt.extra.get('name') or 'list', 'lst')
             return [f"{spaces}self.{name}.clear()"]
 
         if stmt.type == BlockType.INSERT_IN_LIST:
-            name = sanitize_name(stmt.extra.get('name') or 'list', 'lst')
+            name = stmt.extra.get('attr') \
+                or sanitize_name(stmt.extra.get('name') or 'list', 'lst')
             item = stmt.extra.get('item', Expr(ExprType.STRING, '')).to_python_source()
             index = stmt.value.to_python_source() if stmt.value else "1"
             return [f"{spaces}_sc_list_insert(self.{name}, {index}, {item})"]
 
         if stmt.type == BlockType.REPLACE_IN_LIST:
-            name = sanitize_name(stmt.extra.get('name') or 'list', 'lst')
+            name = stmt.extra.get('attr') \
+                or sanitize_name(stmt.extra.get('name') or 'list', 'lst')
             item = stmt.extra.get('item', Expr(ExprType.STRING, '')).to_python_source()
             index = stmt.value.to_python_source() if stmt.value else "1"
             return [f"{spaces}_sc_list_replace(self.{name}, {index}, {item})"]
@@ -864,6 +913,31 @@ class PythonGenerator:
 
         if stmt.type == BlockType.EXTENSION:
             opcode = str(stmt.extra.get('opcode') or '')
+            namespace = str(stmt.extra.get('namespace') or '').lower()
+            short_opcode = opcode.lower().split('_', 1)[-1]
+            if namespace == 'lmslisttools' and short_opcode in (
+                    'foreachitemvalue', 'foreachitemnum'):
+                input_map = dict(stmt.extra.get('inputs', []))
+                variable = input_map.get(
+                    'VAR', Expr(ExprType.STRING, 'item')).to_python_source()
+                source = input_map.get(
+                    'LIST', Expr(ExprType.STRING, 'list')).to_python_source()
+                value_expr = ('_ext_lt_index'
+                              if short_opcode == 'foreachitemnum'
+                              else '_ext_lt_item')
+                lines = [
+                    f"{spaces}_ext_lt_var = _sc_str({variable})",
+                    f"{spaces}_ext_lt_values = _ext_list_object("
+                    f"self, _sc_str({source})) or []",
+                    f"{spaces}for _ext_lt_index, _ext_lt_item in "
+                    f"enumerate(list(_ext_lt_values), 1):",
+                    f"{spaces}    _ext_thread_vars(self)[_ext_lt_var] = "
+                    f"{value_expr}",
+                ]
+                body = self._emit_body(stmt.body, indent + 1)
+                lines.extend(body if body else [f"{spaces}    pass"])
+                lines.append(f"{spaces}    self._yield_frame()")
+                return lines
             if opcode.lower().endswith('foreachthreadvariable'):
                 # 临时变量扩展的循环块：把变量依次设为1..N，每次执行子栈
                 input_map = dict(stmt.extra.get('inputs', []))
@@ -934,7 +1008,8 @@ class PythonGenerator:
             return [f"{spaces}self.clear_sound_effects()"]
 
         if stmt.type == BlockType.FOR_EACH:
-            name = sanitize_name(stmt.extra.get('name') or 'item', 'var')
+            name = stmt.extra.get('attr') \
+                or sanitize_name(stmt.extra.get('name') or 'item', 'var')
             items = stmt.value.to_python_source() if stmt.value else "[]"
             lines = [f"{spaces}for _each in _sc_list_values({items}):",
                      f"{spaces}    self.{name} = _each"]

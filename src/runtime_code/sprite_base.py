@@ -6,6 +6,8 @@ SPRITE_BASE = r'''class ScratchSprite:
 
     GLOBAL_NAMES = ()
     GLOBAL_NAMES_SET = frozenset()
+    VAR_ATTRS = {}
+    LIST_ATTRS = {}
 
     def __init__(self):
         self.x = 0
@@ -463,29 +465,41 @@ SPRITE_BASE = r'''class ScratchSprite:
         if self._runtime is None:
             return
         text = _sc_str(name)
-        local = _sc_ident(text, 'var') in self.__dict__
-        self._runtime.show_monitor('var', text, self.name if local else None, True)
+        attr = getattr(type(self), 'VAR_ATTRS', {}).get(text) \
+            or _sc_ident(text, 'var')
+        local = attr in self.__dict__
+        self._runtime.show_monitor('var', text, self.name if local else None,
+                                   True, attr=attr)
 
     def hide_variable(self, name):
         if self._runtime is None:
             return
         text = _sc_str(name)
-        local = _sc_ident(text, 'var') in self.__dict__
-        self._runtime.show_monitor('var', text, self.name if local else None, False)
+        attr = getattr(type(self), 'VAR_ATTRS', {}).get(text) \
+            or _sc_ident(text, 'var')
+        local = attr in self.__dict__
+        self._runtime.show_monitor('var', text, self.name if local else None,
+                                   False, attr=attr)
 
     def show_list(self, name):
         if self._runtime is None:
             return
         text = _sc_str(name)
-        local = _sc_ident(text, 'lst') in self.__dict__
-        self._runtime.show_monitor('list', text, self.name if local else None, True)
+        attr = getattr(type(self), 'LIST_ATTRS', {}).get(text) \
+            or _sc_ident(text, 'lst')
+        local = attr in self.__dict__
+        self._runtime.show_monitor('list', text, self.name if local else None,
+                                   True, attr=attr)
 
     def hide_list(self, name):
         if self._runtime is None:
             return
         text = _sc_str(name)
-        local = _sc_ident(text, 'lst') in self.__dict__
-        self._runtime.show_monitor('list', text, self.name if local else None, False)
+        attr = getattr(type(self), 'LIST_ATTRS', {}).get(text) \
+            or _sc_ident(text, 'lst')
+        local = attr in self.__dict__
+        self._runtime.show_monitor('list', text, self.name if local else None,
+                                   False, attr=attr)
 
     def list_item_number(self, items, item):
         """返回item在列表中的位置(1起始)，不存在返回0"""
@@ -535,6 +549,12 @@ SPRITE_BASE = r'''class ScratchSprite:
             # 停止按钮是显式事件，直接走普通事件表
             self._register('stop_clicked', func)
             return
+        if key.endswith('whencopied'):
+            self._register('clipboard_copy', func)
+            return
+        if key.endswith('whenpasted'):
+            self._register('clipboard_paste', func)
+            return
         if key.endswith('beforesave') or key.endswith('aftersave'):
             # 生成脚本没有“保存项目”动作，这两个帽子永远不会触发
             return
@@ -551,7 +571,9 @@ SPRITE_BASE = r'''class ScratchSprite:
         """获取脚本执行权（同一时刻只让一个脚本执行，模拟Scratch单线程调度）"""
         runtime = self._runtime
         if runtime is not None and not getattr(self._local, 'turn_owned', False):
-            runtime.turn_lock.acquire()
+            context = getattr(self._local, 'context', None)
+            runtime._wait_start_gate(context)
+            runtime.turn_lock.acquire(getattr(context, 'order', 0))
             self._local.turn_owned = True
 
     def _turn_release(self):

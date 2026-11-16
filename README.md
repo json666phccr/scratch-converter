@@ -1,6 +1,6 @@
 # Scratch 3.0 <-> Python 双向转换器
 
-> 版本 **0.9.18** · [MIT License](LICENSE)
+> 版本 **0.9.20** · [MIT License](LICENSE)
 
 一个强大的 Scratch 3.0 与 Python 之间的双向转换工具，支持**一比一对应**的转换，同时支持高级 Python 语法。
 
@@ -320,6 +320,8 @@ python converter.py demo
 - [x] 运算符 (算术、比较、逻辑、字符串、随机)
 - [x] 变量 (设置、增加、显示/隐藏)
 - [x] 列表 (添加、删除、插入、替换、查询)
+- [x] 变量模型按 ID 解析：角色局部变量/列表与全局同名时互不覆盖，写回 sb3 时仍保留原变量名
+- [x] 公平脚本调度：FIFO 执行权 + 轻量脚本线程，大量克隆同时运行时不会互相饿死
 - [x] 广播 (发送、接收、等待)
 - [x] 自制积木 (定义、调用、参数)
 - [x] 克隆 (创建、删除)
@@ -337,6 +339,11 @@ python converter.py demo
 - [x] TurboWarp `lmsLooksPlus` 外观+ 扩展（跨角色显示/图层/特效/造型属性/快照/SVG 内容）
 - [x] TurboWarp `lmsMoreEvents` 更多事件扩展（forever/while/值变化/按键/每 N 帧/停止帽子、广播传数据）
 - [x] TurboWarp `lmsTempVars2` / 旧版 `lmstempvars` 临时变量扩展（线程变量、运行时变量、批量删除）
+- [x] TurboWarp `lmsListTools` 列表工具扩展（排序/反向/随机、拼接、查找、遍历循环、数组转换）
+- [x] TurboWarp `localstorage` 本地存储扩展（命名空间、读写/删除键、键数量）
+- [x] TurboWarp `clipboard` 剪贴板扩展（复制/读取、复制/粘贴帽子）
+- [x] TurboWarp `MouseCursor` 光标扩展（系统光标、隐藏光标、用当前造型做光标）
+- [x] TurboWarp `cubesterWindowControls` 窗口控制扩展（位置/大小/标题/全屏/屏幕信息）
 - [x] 同一帽子事件的多个并列脚本（自动生成 `when_xxx_2` 等独立方法并全部注册）
 
 ## 限制
@@ -350,7 +357,10 @@ python converter.py demo
 7. **角色拉伸/艺术字**: `stretch` 按角色自身坐标轴非等比缩放造型，旋转中心与舞台围栏一并考虑；`text` 艺术字用系统字体近似 Scratch 内置的 SVG 字体（Sans Serif / Serif / Handwriting / Marker / Curly / Pixel / Scratch），彩虹、缩放、抖动、打字动画按原扩展参数实现
 8. **JSON 扩展**: `skyhigh173JSON` 的对象/数组语义按原扩展实现（数组下标 1 起、负数从末尾、路径中的数组下标同样按 1 起）；解析错误文本是 Python 的原文；`export all variables` 使用 Python 侧变量名（空格等会被替换为下划线）；列表菜单里的列表 ID 会在转换时解析成列表名
 9. **补间/克隆+/外观+/更多事件/临时变量**: 五个扩展的积木、动态变量菜单与帽子事件已按原扩展复刻。补间在脚本线程中逐帧更新，turbo/warp 下也不会阻塞主循环；克隆+ 的克隆体变量在 `run()` 之前写入，避免克隆帽子读到旧值；更多事件的按键帽子按帧做上升沿检测（`shift`/`control` 兼容左右键）；临时变量按 Python 脚本线程隔离，绿旗和停止按钮会清空运行时变量。停止按钮已加入窗口顶部工具栏。`更多事件` 的“项目保存前/后”在生成的 pygame 程序里没有保存动作，因此不会触发；`外观+` 的 SVG 造型内容修改需要安装 `cairosvg` 才能立即改变画面，否则只保存文本供 `costumeContent` 读取
-10. **扩展**: 未注册的第三方扩展会保留调用但返回 0，不会中断脚本
+10. **变量模型**: 解析时按变量/列表 ID 判断归属；角色局部变量与全局变量同名时，局部变量会自动生成独立属性名（如 `local_score`），IR 与写回的 sb3 仍使用原始名字。扩展积木的变量菜单仍按变量名访问，同名遮蔽时优先访问局部变量
+11. **调度性能**: 执行权锁改为 FIFO 公平锁，脚本线程启动不再等待线程就绪，避免大量克隆创建时卡住创建者；每个脚本每帧执行一次，变量/列表访问保持 Python 原生属性速度。数百个同时运行的脚本仍受 Python 线程调度限制，帧率会随活动脚本数上升而下降
+12. **扩展**: 未注册的第三方扩展会保留调用但返回 0，不会中断脚本
+13. **新扩展细节**: `localstorage` 数据存放在 `~/.scratch-converter/localstorage/<命名空间>.json`（默认命名空间为生成脚本名），写入使用临时文件加 `os.replace` 原子替换；“当本地存储变化”类跨窗口帽子未实现。`clipboard` 优先使用 `pygame.scrap`（需要 SDL），不可用时退回到内存字符串，只能在同一个程序内复制粘贴。`MouseCursor` 用当前造型生成的系统光标限制在 8–128 像素。`cubesterWindowControls` 依赖 `pygame.display.set_window_position`，在 headless 或部分平台上是空操作。Files 扩展（读写本地文件）未实现
 
 ## 运行转换后的脚本
 
@@ -456,6 +466,11 @@ python output.py --assets ./my_assets --trace
 | `lmsLooksPlus` 外观+ | 跨角色显示/隐藏/可见性、图层编号与设置、特效值读取、造型数量/宽高/格式/旋转中心、舞台快照、SVG 内容读取/替换/恢复与颜色替换 |
 | `lmsMoreEvents` 更多事件 | when stop clicked / forever / when condition becomes / while condition is / when value changed / every N frames / key hit & released / while key pressed 帽子；广播到指定角色、广播携带数据、received data |
 | `lmsTempVars2` / `lmstempvars` 临时变量 | 线程变量与运行时变量的设置/增加/读取/存在性/列表/删除；`for [var] in [n]` 循环；绿旗与停止时清空运行时变量 |
+| `lmsListTools` 列表工具 | 删除/全量替换/随机/排序/反向、拼接、查找下标与出现次数、判空、判断顺序、列表互拷/合并、遍历项值与项号循环、数组转换 |
+| `localstorage` 本地存储 | 按命名空间读写/删除键、清空、键数量；数据写入用户目录下的 JSON 文件，跨脚本运行保留 |
+| `clipboard` 剪贴板 | 写入/读取文本；`当按下 Ctrl+C` / `当按下 Ctrl+V` 帽子事件 |
+| `MouseCursor` 光标 | 系统光标类型、隐藏/显示、用当前造型生成自定义光标 |
+| `cubesterWindowControls` 窗口控制 | 设置/增加窗口位置与大小、标题、全屏切换、屏幕尺寸与坐标、关闭窗口 |
 
 TurboWarp 高级选项既可以通过生成脚本的命令行参数设置（见上表），也可以在项目里直接用 Runtime Options 扩展积木设置。
 

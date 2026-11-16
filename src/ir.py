@@ -352,7 +352,7 @@ class Expr:
         elif self.type == ExprType.BOOLEAN:
             return "True" if self.value else "False"
         elif self.type == ExprType.VARIABLE:
-            return f"self.{sanitize_name(self.name, 'var')}"
+            return f"self.{self.extra.get('attr') or sanitize_name(self.name, 'var')}"
         elif self.type == ExprType.PROPERTY:
             sprite = "self"
             prop = self.name
@@ -432,19 +432,19 @@ class Expr:
         elif self.type == ExprType.DAYS_SINCE_2000:
             return "self.days_since_2000"
         elif self.type == ExprType.LIST_ACCESS:
-            return f"_sc_list_contents(self.{sanitize_name(self.name, 'lst')})"
+            return f"_sc_list_contents(self.{self._list_attr()})"
         elif self.type == ExprType.ITEM_OF_LIST:
-            list_name = f"self.{sanitize_name(self.name, 'lst')}"
+            list_name = f"self.{self._list_attr()}"
             index = self.left.to_python_source() if self.left else "1"
             return f"_sc_item_of({list_name}, {index})"
         elif self.type == ExprType.ITEM_NUMBER_OF_LIST:
             item = self.left.to_python_source() if self.left else "''"
-            return f"_sc_list_item_number(self.{sanitize_name(self.name, 'lst')}, {item})"
+            return f"_sc_list_item_number(self.{self._list_attr()}, {item})"
         elif self.type == ExprType.LENGTH_OF_LIST:
-            return f"len(self.{sanitize_name(self.name, 'lst')})"
+            return f"len(self.{self._list_attr()})"
         elif self.type == ExprType.LIST_CONTAINS:
             item = self.left.to_python_source() if self.left else "''"
-            return f"_sc_list_contains(self.{sanitize_name(self.name, 'lst')}, {item})"
+            return f"_sc_list_contains(self.{self._list_attr()}, {item})"
         elif self.type in (ExprType.MATH_OP, ExprType.ABS, ExprType.FLOOR,
                            ExprType.CEILING, ExprType.SQRT, ExprType.SIN,
                            ExprType.COS, ExprType.TAN, ExprType.ASIN,
@@ -519,6 +519,9 @@ class Expr:
         elif self.type == ExprType.ARGUMENT:
             return f"arg_{sanitize_name(self.name, 'arg')}"
         return f"# Unknown expr: {self.type.name}"
+
+    def _list_attr(self) -> str:
+        return self.extra.get('attr') or sanitize_name(self.name, 'lst')
 
     def to_scratch_value(self) -> Any:
         """将表达式转换为Scratch JSON值格式 [shadow, value, ...]"""
@@ -812,6 +815,13 @@ class SpriteIR:
     statements: List[Statement] = field(default_factory=list)
     variables: Dict[str, Any] = field(default_factory=dict)
     lists: Dict[str, List[Any]] = field(default_factory=dict)
+    # Scratch变量/列表名 -> 生成的Python属性名。
+    # 只有发生“局部变量与全局变量同名”等冲突时两者才会不同；
+    # IR里始终保留原变量名，保证写回sb3时不改名。
+    variable_attrs: Dict[str, str] = field(default_factory=dict)
+    list_attrs: Dict[str, str] = field(default_factory=dict)
+    variable_id_attrs: Dict[str, str] = field(default_factory=dict)
+    list_id_attrs: Dict[str, str] = field(default_factory=dict)
     broadcasts: List[str] = field(default_factory=list)
     costumes: List[Dict[str, Any]] = field(default_factory=list)
     sounds: List[Dict[str, Any]] = field(default_factory=list)

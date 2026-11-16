@@ -3965,6 +3965,364 @@ def test_temporary_variables_extension():
     return True
 
 
+def test_variable_shadowing_fidelity():
+    """局部变量/列表与全局同名时，按变量ID读写正确的存储"""
+    print("[测试65] 变量模型保真（局部遮蔽全局）")
+
+    import time
+
+    project = make_project({
+        "b1": block("event_whenflagclicked", "b2", None, top_level=True),
+        "b2": block("data_setvariableto", "b3", "b1",
+                    inputs={"VALUE": [1, [4, "1"]]},
+                    fields={"VARIABLE": ["score", "lvar"]}),
+        "b3": block("data_changevariableby", "b4", "b2",
+                    inputs={"VALUE": [1, [4, "5"]]},
+                    fields={"VARIABLE": ["score", "gvar"]}),
+        "b4": block("data_addtolist", "b5", "b3",
+                    inputs={"ITEM": [1, [10, "local"]]},
+                    fields={"LIST": ["items", "llist"]}),
+        "b5": block("data_addtolist", "b6", "b4",
+                    inputs={"ITEM": [1, [10, "global"]]},
+                    fields={"LIST": ["items", "glist"]}),
+        "b6": block("data_setvariableto", "b7", "b5",
+                    inputs={"VALUE": [3, "v_local"]},
+                    fields={"VARIABLE": ["read_local", "readid1"]}),
+        "b7": block("data_setvariableto", None, "b6",
+                    inputs={"VALUE": [3, "v_global"]},
+                    fields={"VARIABLE": ["read_global", "readid2"]}),
+        "v_local": block("data_variable", None, "b6",
+                         fields={"VARIABLE": ["score", "lvar"]}),
+        "v_global": block("data_variable", None, "b7",
+                          fields={"VARIABLE": ["score", "gvar"]}),
+    }, name="Shadow")
+    project["targets"][0]["variables"] = {
+        "lvar": ["score", 0],
+        "readid1": ["read_local", 0],
+        "readid2": ["read_global", 0],
+    }
+    project["targets"][0]["lists"] = {"llist": ["items", []]}
+    project["targets"].insert(0, {
+        "isStage": True, "name": "Stage",
+        "variables": {"gvar": ["score", 0]},
+        "lists": {"glist": ["items", []]},
+        "broadcasts": {}, "blocks": {}, "comments": {},
+        "currentCostume": 0, "costumes": [], "sounds": [],
+        "volume": 100, "layerOrder": 0,
+    })
+
+    parsed = parse_scratch_project(project)
+    shadow = next(sprite for sprite in parsed.sprites
+                  if sprite.name == "Shadow")
+    stage = parsed.stage
+    assert shadow.variable_attrs.get("score") == "local_score"
+    assert shadow.list_attrs.get("items") == "local_items"
+    assert stage.variable_attrs.get("score") == "score"
+
+    code = generate_python(parsed)
+    assert "self.local_score = 1" in code
+    assert "self.local_items" in code
+
+    namespace = {}
+    exec(compile(code, "<generated>", "exec"), namespace)
+    runtime = namespace["ScratchRuntime"](headless=True, audio=False)
+    sprite = namespace["Shadow"]()
+    runtime.add_sprite(sprite)
+    try:
+        sprite.run()
+        runtime.green_flag()
+        for _ in range(8):
+            runtime.step()
+            time.sleep(0.003)
+
+        assert sprite.local_score == 1, "局部变量应写入独立属性"
+        assert namespace["GLOBALS"]["score"] == 5, "全局变量应写入GLOBALS"
+        assert sprite.read_local == 1, "局部变量引用应解析到局部"
+        assert sprite.read_global == 5, "全局变量引用应解析到GLOBALS"
+        assert sprite.local_items == ["local"], "局部列表应独立"
+        assert namespace["GLOBALS"]["items"] == ["global"], "全局列表应独立"
+
+        sprite.show_variable("score")
+        monitor = runtime.dynamic_monitors[-1]
+        assert monitor["attr"] == "local_score"
+        assert monitor["sprite"] == "Shadow"
+        sprite.show_list("items")
+        monitor = runtime.dynamic_monitors[-1]
+        assert monitor["attr"] == "local_items"
+        assert monitor["sprite"] == "Shadow"
+    finally:
+        runtime.running = False
+        runtime.shutdown()
+
+    # 写回sb3时仍使用原始变量名，不暴露Python属性别名
+    written = write_scratch_project(parse_scratch_project(project))
+    shadow_json = next(target for target in written["targets"]
+                       if target.get("name") == "Shadow")
+    names = [value[0] for value in shadow_json["variables"].values()]
+    list_names = [value[0] for value in shadow_json["lists"].values()]
+    assert "score" in names and "local_score" not in names
+    assert "items" in list_names and "local_items" not in list_names
+
+    print("  [PASS] 变量模型保真通过")
+    return True
+
+
+def test_scheduler_fairness_with_clones():
+    """大量克隆脚本不会互相饿死，创建循环能正常完成"""
+    print("[测试66] 大项目调度公平性")
+
+    import time
+
+    project = make_project({
+        "b1": block("event_whenflagclicked", "b2", None, top_level=True),
+        "b2": block("control_repeat", "b3", "b1",
+                    inputs={"TIMES": [1, [4, "5"]],
+                            "SUBSTACK": [2, "b4"]}),
+        "b3": block("data_setvariableto", None, "b2",
+                    inputs={"VALUE": [1, [4, "1"]]},
+                    fields={"VARIABLE": ["done", "doneid"]}),
+        "b4": block("control_create_clone_of", None, "b2",
+                    inputs={"CLONE_OPTION": [1, [10, "_myself_"]]}),
+        "h1": block("control_start_as_clone", "h2", None, top_level=True),
+        "h2": block("control_forever", None, "h1",
+                    inputs={"SUBSTACK": [2, "h3"]}),
+        "h3": block("data_changevariableby", None, "h2",
+                    inputs={"VALUE": [1, [4, "1"]]},
+                    fields={"VARIABLE": ["ticks", "ticksid"]}),
+    }, name="Scheduler")
+    project["targets"][0]["variables"] = {
+        "doneid": ["done", 0], "ticksid": ["ticks", 0],
+    }
+
+    code = generate_python(parse_scratch_project(project))
+    namespace = {}
+    exec(compile(code, "<generated>", "exec"), namespace)
+    runtime = namespace["ScratchRuntime"](headless=True, audio=False)
+    sprite = namespace["Scheduler"]()
+    runtime.add_sprite(sprite)
+    try:
+        sprite.run()
+        runtime.green_flag()
+        for _ in range(120):
+            runtime.step()
+            time.sleep(0.003)
+
+        clones = [item for item in runtime.sprites
+                  if getattr(item, '_is_clone', False)]
+        assert len(clones) == 5, f"应创建5个克隆，实际 {len(clones)}"
+        assert sprite.done == 1, "创建克隆的循环不应被饿死"
+        assert all(clone.ticks > 0 for clone in clones), \
+            "每个克隆脚本都应至少执行过一次"
+        assert len(runtime.scripts) <= 6
+    finally:
+        runtime.running = False
+        runtime.shutdown()
+
+    print("  [PASS] 大项目调度公平性通过")
+    return True
+
+
+def test_list_tools_extension():
+    """List Tools：列表查找、排序、数组与遍历循环"""
+    print("[测试67] List Tools 扩展")
+
+    import time
+
+    project = make_project({
+        "b1": block("event_whenflagclicked", "b2", None, top_level=True),
+        "b2": block("data_setvariableto", "b3", "b1",
+                    inputs={"VALUE": [3, "joinblock"]},
+                    fields={"VARIABLE": ["joined", "j1"]}),
+        "b3": block("data_setvariableto", "b4", "b2",
+                    inputs={"VALUE": [3, "countblock"]},
+                    fields={"VARIABLE": ["count", "c1"]}),
+        "b4": block("data_setvariableto", "b5", "b3",
+                    inputs={"VALUE": [3, "indexblock"]},
+                    fields={"VARIABLE": ["last_index", "i1"]}),
+        "b5": block("lmsListTools_orderList", "b6", "b4",
+                    inputs={"LIST": [1, [10, "items"]],
+                            "ORDER": [1, [10, "ascending"]]}),
+        "b6": block("lmsListTools_setListArray", "b7", "b5",
+                    inputs={"LIST": [1, [10, "localItems"]],
+                            "ARRAY": [1, [10, '["a","b"]']]}),
+        "b7": block("lmsListTools_forEachItemValue", None, "b6",
+                    inputs={"VAR": [1, [10, "current"]],
+                            "LIST": [1, [10, "localItems"]],
+                            "SUBSTACK": [2, "b8"]}),
+        "b8": block("data_addtolist", None, "b7",
+                    inputs={"ITEM": [3, "tmpvar", [10, ""]]},
+                    fields={"LIST": ["seen", "s1"]}),
+        "tmpvar": block("lmsTempVars2_getThreadVariable", None, "b8",
+                        inputs={"VAR": [1, [10, "current"]]}),
+        "joinblock": block("lmsListTools_getListJoin", None, "b2",
+                           inputs={"LIST": [1, [10, "items"]],
+                                   "STRING": [1, [10, "-"]]}),
+        "countblock": block("lmsListTools_timesItemAppears", None, "b3",
+                            inputs={"ITEM": [1, [10, "apple"]],
+                                    "LIST": [1, [10, "items"]]}),
+        "indexblock": block("lmsListTools_itemIndex", None, "b4",
+                            inputs={"INDEX": [1, [10, "_last_"]],
+                                    "ITEM": [1, [10, "apple"]],
+                                    "LIST": [1, [10, "items"]]}),
+    }, name="ListSprite")
+    project["extensions"] = ["lmsListTools", "lmsTempVars2"]
+    project["targets"][0]["variables"] = {
+        "j1": ["joined", ""], "c1": ["count", 0], "i1": ["last_index", 0],
+    }
+    project["targets"][0]["lists"] = {"l1": ["localItems", []]}
+    project["targets"].insert(0, {
+        "isStage": True, "name": "Stage",
+        "variables": {}, "lists": {
+            "g1": ["items", ["banana", "apple", "apple"]],
+            "g2": ["seen", []],
+        },
+        "broadcasts": {}, "blocks": {}, "comments": {},
+        "currentCostume": 0, "costumes": [], "sounds": [],
+        "volume": 100, "layerOrder": 0,
+    })
+
+    code = generate_python(parse_scratch_project(project))
+    namespace = {}
+    exec(compile(code, "<generated>", "exec"), namespace)
+    runtime = namespace["ScratchRuntime"](headless=True, audio=False)
+    sprite = namespace["ListSprite"]()
+    runtime.add_sprite(sprite)
+    try:
+        sprite.run()
+        runtime.green_flag()
+        for _ in range(40):
+            runtime.step()
+            time.sleep(0.003)
+
+        assert sprite.joined == "banana-apple-apple"
+        assert sprite.count == 2
+        assert sprite.last_index == 3
+        assert namespace["GLOBALS"]["items"] == ["apple", "apple", "banana"]
+        assert sprite.localItems == ["a", "b"]
+        assert namespace["GLOBALS"]["seen"] == ["a", "b"]
+    finally:
+        runtime.running = False
+        runtime.shutdown()
+
+    print("  [PASS] List Tools 扩展通过")
+    return True
+
+
+def test_new_runtime_extensions():
+    """Local Storage / Clipboard / Mouse Cursor / Window Controls"""
+    print("[测试68] 本地存储、剪贴板、光标、窗口扩展")
+
+    import time
+    import os
+
+    namespace_name = "scratch_converter_test_ns"
+    storage_path = os.path.join(
+        os.path.expanduser("~"), ".scratch-converter", "localstorage",
+        namespace_name + ".json")
+
+    project = make_project({
+        "b1": block("event_whenflagclicked", "b2", None, top_level=True),
+        "b2": block("localstorage_setProjectId", "b3", "b1",
+                    inputs={"ID": [1, [10, namespace_name]]}),
+        "b3": block("localstorage_set", "b4", "b2",
+                    inputs={"KEY": [1, [10, "k"]],
+                            "VALUE": [1, [10, "v"]]}),
+        "b4": block("data_setvariableto", "b5", "b3",
+                    inputs={"VALUE": [3, "getblock"]},
+                    fields={"VARIABLE": ["got", "g1"]}),
+        "b5": block("data_setvariableto", "b6", "b4",
+                    inputs={"VALUE": [3, "countblock"]},
+                    fields={"VARIABLE": ["keys", "k1"]}),
+        "b6": block("data_setvariableto", "b7", "b5",
+                    inputs={"VALUE": [3, "firstkey"]},
+                    fields={"VARIABLE": ["first_key", "f1"]}),
+        "b7": block("clipboard_setClipboard", "b8", "b6",
+                    inputs={"TEXT": [1, [10, "hello"]]}),
+        "b8": block("data_setvariableto", "b9", "b7",
+                    inputs={"VALUE": [3, "clipblock"]},
+                    fields={"VARIABLE": ["clip", "c1"]}),
+        "b9": block("MouseCursor_setCur", "b10", "b8",
+                    inputs={"CUR": [1, [10, "pointer"]]}),
+        "b10": block("data_setvariableto", "b11", "b9",
+                     inputs={"VALUE": [3, "curblock"]},
+                     fields={"VARIABLE": ["cursor", "u1"]}),
+        "b11": block("cubesterWindowControls_changeTitleTo", "b12", "b10",
+                     inputs={"TITLE": [1, [10, "测试窗口"]]}),
+        "b12": block("data_setvariableto", "b13", "b11",
+                     inputs={"VALUE": [3, "titleblock"]},
+                     fields={"VARIABLE": ["title", "t1"]}),
+        "b13": block("data_setvariableto", "b14", "b12",
+                     inputs={"VALUE": [3, "widthblock"]},
+                     fields={"VARIABLE": ["win_width", "w1"]}),
+        "b14": block("data_setvariableto", None, "b13",
+                     inputs={"VALUE": [3, "fullblock"]},
+                     fields={"VARIABLE": ["fullscreen", "s1"]}),
+        "getblock": block("localstorage_get", None, "b4",
+                          inputs={"KEY": [1, [10, "k"]]}),
+        "countblock": block("localstorage_keyCount", None, "b5"),
+        "firstkey": block("localstorage_itemOfKey", None, "b6",
+                          inputs={"NUM": [1, [10, "1"]]}),
+        "clipblock": block("clipboard_clipboard", None, "b8"),
+        "curblock": block("MouseCursor_getCur", None, "b10"),
+        "titleblock": block("cubesterWindowControls_windowTitle", None, "b12"),
+        "widthblock": block("cubesterWindowControls_windowW", None, "b13"),
+        "fullblock": block("cubesterWindowControls_isFullscreen", None, "b14"),
+        # 复制帽子：runtime._trigger_event('clipboard_copy') 时应执行
+        "h1": block("clipboard_whencopied", "h2", None, top_level=True),
+        "h2": block("data_setvariableto", None, "h1",
+                    inputs={"VALUE": [1, [4, "1"]]},
+                    fields={"VARIABLE": ["copied", "p1"]}),
+    }, name="ExtSprite")
+    project["extensions"] = ["localstorage", "clipboard", "MouseCursor",
+                             "cubesterWindowControls"]
+    project["targets"][0]["variables"] = {
+        "g1": ["got", ""], "k1": ["keys", 0], "f1": ["first_key", ""],
+        "c1": ["clip", ""], "u1": ["cursor", ""], "t1": ["title", ""],
+        "w1": ["win_width", 0], "s1": ["fullscreen", False],
+        "p1": ["copied", 0],
+    }
+
+    code = generate_python(parse_scratch_project(project))
+    namespace = {}
+    exec(compile(code, "<generated>", "exec"), namespace)
+    runtime = namespace["ScratchRuntime"](headless=True, audio=False)
+    sprite = namespace["ExtSprite"]()
+    runtime.add_sprite(sprite)
+    try:
+        sprite.run()
+        runtime.green_flag()
+        for _ in range(30):
+            runtime.step()
+            time.sleep(0.003)
+
+        assert sprite.got == "v"
+        assert sprite.keys == 1
+        assert sprite.first_key == "k"
+        assert sprite.clip == "hello"
+        assert sprite.cursor == "pointer"
+        assert sprite.title == "测试窗口"
+        assert sprite.win_width == 480
+        assert sprite.fullscreen is False
+        assert os.path.exists(storage_path)
+
+        runtime._trigger_event("clipboard_copy")
+        for _ in range(10):
+            runtime.step()
+            time.sleep(0.003)
+        assert sprite.copied == 1, "复制帽子应被触发"
+    finally:
+        runtime.running = False
+        runtime.shutdown()
+        try:
+            if os.path.exists(storage_path):
+                os.remove(storage_path)
+        except OSError:
+            pass
+
+    print("  [PASS] 新运行时扩展通过")
+    return True
+
+
 def main():
     """运行所有测试"""
     print("=" * 60)
@@ -4036,6 +4394,10 @@ def main():
         test_looks_plus_extension,
         test_more_events_extension,
         test_temporary_variables_extension,
+        test_variable_shadowing_fidelity,
+        test_scheduler_fairness_with_clones,
+        test_list_tools_extension,
+        test_new_runtime_extensions,
     ]
     
     passed = 0

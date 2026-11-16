@@ -66,7 +66,12 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
         self.clock = pygame.time.Clock()
         self.sprites = []
         self.scripts = []
-        self.turn_lock = threading.Lock()
+        self.turn_lock = _FairLock()
+        self._script_order = 0
+        # 绿旗脚本的首次执行顺序闸门，保证角色按添加顺序先跑一帧
+        self._start_gate_cond = threading.Condition()
+        self._start_gate_total = 0
+        self._start_gate_next = 0
         self.running = True
         self.frame = 0
         self.frame_condition = threading.Condition()
@@ -109,6 +114,21 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
         self.music_cache = {}
         self.dynamic_monitors = []
         self.mask_cache = {}
+        # 新扩展状态：本地存储 / 剪贴板 / 光标 / 窗口
+        self.localstorage_namespace = ''
+        self._localstorage_cache = None
+        self._clipboard_text = ''
+        self._clipboard_last_pasted = ''
+        self._scrap_ready = False
+        self._cursor_name = 'default'
+        self.fullscreen = False
+        self.user_window_title = ''
+        self._windowed_size = None
+        try:
+            pygame.scrap.init()
+            self._scrap_ready = True
+        except Exception:
+            self._scrap_ready = False
         font_path = None
         for filename in ("msyh.ttc", "simhei.ttf", "arial.ttf"):
             candidate = os.path.join(os.environ.get("WINDIR", "C:\Windows"),
@@ -170,6 +190,16 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
             self.register_extension(name, _extension_temp_vars)
         for name in ('jeremygamerTweening', 'jeremygamertweening'):
             self.register_extension(name, _extension_tween)
+        for name in ('lmsListTools', 'lmslisttools'):
+            self.register_extension(name, _extension_list_tools)
+        for name in ('localstorage', 'localStorage'):
+            self.register_extension(name, _extension_local_storage)
+        for name in ('clipboard', 'Clipboard'):
+            self.register_extension(name, _extension_clipboard)
+        for name in ('MouseCursor', 'mousecursor', 'cursor'):
+            self.register_extension(name, _extension_mouse_cursor)
+        for name in ('cubesterWindowControls', 'cubesterwindowcontrols'):
+            self.register_extension(name, _extension_window_controls)
 
     @classmethod
     def register_extension(cls, name, handler):
@@ -217,6 +247,46 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
         self._manual_view = True
         if maximize:
             self._maximize_window()
+
+    def set_window_size(self, width, height):
+        """调整窗口大小（舞台仍按宽高比缩放）"""
+        width, height = max(1, int(width)), max(1, int(height))
+        if self.headless:
+            return
+        try:
+            flags = pygame.RESIZABLE
+            if self.fullscreen:
+                flags |= pygame.FULLSCREEN
+            self.screen = pygame.display.set_mode((width, height), flags)
+            self._windowed_size = (width, height)
+            self._view_size = None
+            self._view_scaled = None
+        except Exception:
+            pass
+
+    def set_fullscreen(self, enabled):
+        """进入/退出全屏，退出时恢复之前的窗口尺寸"""
+        if self.headless:
+            return
+        enabled = bool(enabled)
+        if enabled == self.fullscreen:
+            return
+        try:
+            if enabled:
+                self._windowed_size = self.screen.get_size()
+                self.screen = pygame.display.set_mode((0, 0),
+                                                      pygame.FULLSCREEN)
+                self.fullscreen = True
+            else:
+                width, height = self._windowed_size or (
+                    self.stage_width, self.stage_height + self.toolbar_height)
+                self.screen = pygame.display.set_mode((width, height),
+                                                      pygame.RESIZABLE)
+                self.fullscreen = False
+            self._view_size = None
+            self._view_scaled = None
+        except Exception:
+            pass
 
     def _maximize_window(self):
         """把窗口最大化到桌面可用区域（类似 Scratch 舞台放大到最大）"""
@@ -412,11 +482,15 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
             data = getattr(target, '__dict__', None)
             if not isinstance(data, dict):
                 continue
-            for key in (_sc_ident(text, 'lst'), text):
-                if isinstance(data.get(key), list):
+            mapped = getattr(type(target), 'LIST_ATTRS', {}).get(text)
+            for key in (mapped, _sc_ident(text, 'lst'), text):
+                if key and isinstance(data.get(key), list):
                     return data, key
-        for key in (_sc_ident(text, 'lst'), text):
-            if isinstance(GLOBALS.get(key), list):
+        stage = self.stage_sprite
+        mapped = getattr(type(stage), 'LIST_ATTRS', {}).get(text) \
+            if stage is not None else None
+        for key in (mapped, _sc_ident(text, 'lst'), text):
+            if key and isinstance(GLOBALS.get(key), list):
                 return GLOBALS, key
         return None, None
 
@@ -453,17 +527,24 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
                 entry['state'] = None
                 entry['thread'] = None
         time.sleep(0.02)
+        entries = []
         for sprite in list(self.sprites):
             sprite._global_running = True
-            for func in list(sprite._handlers.get("green_flag", [])):
-                self.start_script(func)
+            entries.extend(sprite._handlers.get("green_flag", []))
+        with self._start_gate_cond:
+            self._start_gate_total = len(entries)
+            self._start_gate_next = 0
+        for index, func in enumerate(entries):
+            self.start_script(func, gate_index=index)
 
-    def start_script(self, func, received_data=None):
+    def start_script(self, func, received_data=None, gate_index=None):
         sprite = getattr(func, "__self__", None)
-        context = _ScriptContext()
+        context = _ScriptContext(self._script_order)
+        self._script_order += 1
         context.sprite = sprite
         context.func = func
         context.received_data = received_data
+        context.gate_index = gate_index
         self.scripts.append(context)
 
         def runner():
@@ -492,9 +573,10 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
                 if self.trace:
                     print("[trace] finish", name)
 
-        thread = threading.Thread(target=runner, daemon=True)
+        thread = _ScriptThread(runner)
         # 供 More Events 的 while 帽子在条件变假时停止对应线程
         thread._scratch_context = context
+        context.thread = thread
         thread.start()
         return thread
 
@@ -653,6 +735,29 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
             return
         self.stop_scripts_of(clone)
         self.remove_sprite(clone)
+
+    def _wait_start_gate(self, context):
+        """绿旗脚本按注册顺序依次获得第一次执行权"""
+        index = getattr(context, 'gate_index', None)
+        if index is None or getattr(context, 'first_turn_done', False):
+            return
+        with self._start_gate_cond:
+            while self.running and self._start_gate_next != index:
+                self._start_gate_cond.wait(0.05)
+            context.first_turn_done = True
+            if self._start_gate_next == index:
+                self._start_gate_next += 1
+            self._start_gate_cond.notify_all()
+
+    def _trigger_event(self, event):
+        """启动注册在指定普通事件上的脚本（如剪贴板复制/粘贴帽子）"""
+        for sprite in list(self.sprites):
+            handlers = list(sprite._handlers.get(event, []))
+            if not handlers:
+                continue
+            sprite._running = True
+            for func in handlers:
+                self.start_script(func)
 
     def stop_clicked(self):
         """停止按钮：停止所有脚本，然后触发 More Events 的停止帽子"""
@@ -824,6 +929,22 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
                 if event.key == pygame.K_ESCAPE:
                     self.running = False
                     return
+                # Clipboard扩展：Ctrl+C / Ctrl+V 触发复制/粘贴帽子
+                try:
+                    ctrl = bool(pygame.key.get_mods() & pygame.KMOD_CTRL)
+                except Exception:
+                    ctrl = False
+                if ctrl and event.key in (pygame.K_c, pygame.K_v):
+                    if event.key == pygame.K_c:
+                        self._trigger_event('clipboard_copy')
+                    else:
+                        self._clipboard_last_pasted = _clipboard_read(self)
+                        if self.ask_pending and self._clipboard_last_pasted:
+                            self.ask_buffer += self._clipboard_last_pasted
+                            self.ask_key_pending = ''
+                        self._trigger_event('clipboard_paste')
+                    if not self.ask_pending:
+                        continue
                 if self.ask_pending:
                     if self.trace:
                         print("[trace] ask key", event.key,
@@ -1074,10 +1195,10 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
     def _all_monitors(self):
         return list(MONITORS) + self.dynamic_monitors
 
-    def show_monitor(self, kind, name, owner, visible):
+    def show_monitor(self, kind, name, owner, visible, attr=None):
         """显示/隐藏变量或列表监视器（不存在时动态创建）"""
         prefix = 'lst' if kind == 'list' else 'var'
-        attr = _sc_ident(name, prefix)
+        attr = attr or _sc_ident(name, prefix)
         target = None
         for monitor in self._all_monitors():
             if (monitor.get('kind') == kind and monitor.get('attr') == attr
@@ -1649,8 +1770,17 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
 
     def shutdown(self):
         self.running = False
+        # 先停掉所有脚本，避免关闭窗口后仍有线程在后台空转
+        self.stop_all_scripts()
         with self.frame_condition:
             self.frame_condition.notify_all()
+        deadline = time.time() + 0.2
+        for context in list(self.scripts):
+            thread = getattr(context, 'thread', None)
+            remaining = deadline - time.time()
+            if thread is None or remaining <= 0:
+                break
+            thread.join(remaining)
         self._close_microphone()
         try:
             pygame.display.quit()

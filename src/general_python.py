@@ -336,9 +336,8 @@ class GeneralPythonParser(PythonParser):
                         and value.args and isinstance(value.args[0], ast.Name):
                     self._list_vars.add(target)
                     self._list_vars.add(value.args[0].id)
-            elif isinstance(node, ast.For) and isinstance(node.target, ast.Name) \
-                    and isinstance(node.iter, ast.Name):
-                self._list_vars.add(node.iter.id)
+            # 注意：不能因为 for x in name 就把 name 当成列表，
+            # 它也可能是字符串（for ch in text）。具体类型在解析循环时判断。
 
         for node in functions:
             self._parse_general_function(node)
@@ -563,9 +562,13 @@ class GeneralPythonParser(PythonParser):
                 if self._is_list(inner.id):
                     return self._parse_list_loop(
                         var, inner.id, node.body, enumerate_var, start)
-                return self._parse_string_loop(
-                    var, make_variable(inner.id), node.body, enumerate_var,
-                    start)
+                if inner.id in self._string_vars:
+                    return self._parse_string_loop(
+                        var, make_variable(inner.id), node.body, enumerate_var,
+                        start)
+                # 类型未知时沿用列表语义，避免把未知列表当字符串
+                return self._parse_list_loop(
+                    var, inner.id, node.body, enumerate_var, start)
             if isinstance(inner, ast.List):
                 list_name = self._literal_list(inner)
                 if list_name is None:
@@ -594,13 +597,15 @@ class GeneralPythonParser(PythonParser):
                 return None
             return self._parse_list_loop(var, list_name, node.body)
 
-        # for x in <list_name>
+        # for x in <list_name> / for ch in <text>
         if isinstance(iterable, ast.Name):
             if self._is_list(iterable.id):
                 return self._parse_list_loop(var, iterable.id, node.body)
-            # 非列表变量按字符串处理：for ch in text
-            return self._parse_string_loop(var, make_variable(iterable.id),
-                                           node.body)
+            if iterable.id in self._string_vars:
+                return self._parse_string_loop(var, make_variable(iterable.id),
+                                               node.body)
+            # 类型未知时沿用列表语义
+            return self._parse_list_loop(var, iterable.id, node.body)
 
         # for x in "字符串字面量"
         if isinstance(iterable, ast.Constant) and isinstance(iterable.value, str):

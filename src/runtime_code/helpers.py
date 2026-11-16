@@ -3,7 +3,95 @@
 
 HELPERS = r'''
 _SCRATCH_LIST_LIMIT = 200000
-_RUNTIME_VERSION = '0.9.18'
+_RUNTIME_VERSION = '0.9.20'
+
+
+class _FairLock:
+    """FIFO公平锁：避免某个脚本一直抢到执行权导致其他脚本饿死"""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._owner = None
+        # 按脚本注册顺序排队，既公平又保证同一帧内的执行顺序稳定
+        self._waiters = []
+        self._wait_seq = 0
+        # 每个线程复用一个Event，避免每帧大量创建/销毁对象
+        self._local = threading.local()
+
+    def acquire(self, order=0):
+        waiter = getattr(self._local, 'event', None)
+        if waiter is None:
+            waiter = threading.Event()
+            self._local.event = waiter
+        with self._lock:
+            if self._owner is None:
+                self._owner = threading.get_ident()
+                return True
+            waiter.clear()
+            self._wait_seq += 1
+            heapq.heappush(self._waiters,
+                           (order, self._wait_seq, waiter))
+        waiter.wait()
+        with self._lock:
+            self._owner = threading.get_ident()
+        return True
+
+    def release(self):
+        with self._lock:
+            if self._waiters:
+                # 直接把所有权移交给序最小的脚本，避免新线程插队
+                _, _, waiter = heapq.heappop(self._waiters)
+                waiter.set()
+            else:
+                self._owner = None
+
+    def locked(self):
+        with self._lock:
+            return self._owner is not None
+
+
+class _ScriptThread:
+    """轻量脚本线程：start()不等待线程真正启动
+
+    threading.Thread.start() 会阻塞到新线程执行 bootstrap，
+    大量克隆同时启动时容易互相拖慢；这里直接用 _thread 接口。
+    """
+
+    _counter = 0
+
+    def __init__(self, target):
+        self._target = target
+        self._alive = False
+        _ScriptThread._counter += 1
+        self.name = "runner-%d" % _ScriptThread._counter
+        self.ident = None
+        self._scratch_context = None
+
+    def start(self):
+        self._alive = True
+        try:
+            _thread.start_new_thread(self._bootstrap, ())
+        except Exception:
+            self._alive = False
+            raise
+
+    def _bootstrap(self):
+        try:
+            self._target()
+        finally:
+            self._alive = False
+
+    def is_alive(self):
+        return self._alive
+
+    def join(self, timeout=None):
+        if timeout is None:
+            while self._alive:
+                time.sleep(0.001)
+            return
+        deadline = time.time() + timeout
+        while self._alive and time.time() < deadline:
+            time.sleep(0.001)
 
 
 def _sc_is_white(value):
@@ -663,10 +751,14 @@ def _svg_resolve_paint(value, gradients):
 
 
 class _ScriptContext:
-    def __init__(self):
+    def __init__(self, order=0):
         self.running = True
         self.sprite = None
         self.func = None
+        self.order = order
+        self.thread = None
+        self.gate_index = None
+        self.first_turn_done = False
         # More Events 的“广播并传数据”把数据挂在接收线程上
         self.received_data = None
 
