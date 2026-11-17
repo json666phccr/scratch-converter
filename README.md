@@ -1,6 +1,6 @@
 # Scratch 3.0 <-> Python 双向转换器
 
-> 版本 **0.9.20** · [MIT License](LICENSE)
+> 版本 **0.9.25** · [MIT License](LICENSE)
 
 一个强大的 Scratch 3.0 与 Python 之间的双向转换工具，支持**一比一对应**的转换，同时支持高级 Python 语法。
 
@@ -33,9 +33,10 @@ Scratch JSON  <--->  中间表示(IR)  <--->  Python 代码
 | `scratch_parser.py` | Scratch JSON -> IR 解析器 |
 | `scratch_writer.py` | IR -> Scratch JSON 写入器 |
 | `python_generator.py` | IR -> Python 代码生成器 |
-| `runtime_code/` | 生成脚本使用的运行时模板（helpers / extensions / runtime_class / sprite_base），生成时原样写入 |
+| `runtime_code/` | 生成脚本使用的运行时模板；`extensions/` 下按扩展拆分子文件，由 `config.json` 描述处理器、别名与依赖，生成时按需拼装 |
 | `python_parser.py` | Python DSL -> IR 解析器（高保真） |
 | `general_python.py` | 通用 Python -> IR 解析器（实验性） |
+| `convert_log.py` | 转换日志（阶段、中间状态、异常定位） |
 | `converter.py` | 主转换器入口 |
 
 ## 使用方法
@@ -44,7 +45,11 @@ Scratch JSON  <--->  中间表示(IR)  <--->  Python 代码
 
 ```bash
 # Scratch -> Python
+# 默认生成独立项目文件夹：output/output.py + output/assets/
 python converter.py scratch2py input.sb3 output.py
+
+# 同一目录转换多个项目时素材不会互相覆盖；--no-bundle 可恢复旧的平铺输出
+python converter.py scratch2py input.sb3 output.py --no-bundle
 
 # 模块化输出：入口 + 运行时 + 每个角色一个模块（大项目更易读）
 python converter.py scratch2py input.sb3 output.py --split
@@ -64,7 +69,16 @@ python converter.py roundtrip-py input.py output.py
 
 # 运行演示
 python converter.py demo
+
+# 转换日志：-v 输出各阶段与中间状态，--log-file 同时写入文件
+python converter.py -v scratch2py input.sb3 output.py
+python converter.py -v --log-file convert.log scratch2py input.sb3 output.py
+python converter.py --quiet scratch2py input.sb3 output.py
 ```
+
+日志级别可用 `--log-level debug|info|warning|error|quiet` 或环境变量
+`SCRATCH_LOG_LEVEL` 设置。转换失败时会输出所处阶段、异常信息以及转换器源码中的
+具体文件/行号（加 `-v` 还会打印完整调用栈），便于定位是哪个阶段、哪个积木出的问题。
 
 ### Python API 使用
 
@@ -317,10 +331,12 @@ python converter.py demo
 - [x] 控制块 (循环、while、for-each、条件、等待、停止、计数器、单帧执行)
 - [x] 侦测块 (触摸、按键、鼠标、计时器、响度（可选麦克风）、颜色侦测、属性读取、拖拽模式、用户名、像素级碰撞)
 - [x] 变量监视器 (显示/隐藏监视器积木会动态创建或隐藏监视器)
+- [x] 变量滑动条监视器（`mode: slider`、`sliderMin`/`sliderMax`、可拖动调整、离散/连续）
 - [x] 运算符 (算术、比较、逻辑、字符串、随机)
 - [x] 变量 (设置、增加、显示/隐藏)
 - [x] 列表 (添加、删除、插入、替换、查询)
 - [x] 变量模型按 ID 解析：角色局部变量/列表与全局同名时互不覆盖，写回 sb3 时仍保留原变量名
+- [x] 往返解析恢复 `GLOBALS` / `GLOBAL_NAMES`：非舞台角色引用舞台全局列表时，`clear()`/`append()` 等仍写回列表积木，不会误降级成自制积木
 - [x] 公平脚本调度：FIFO 执行权 + 轻量脚本线程，大量克隆同时运行时不会互相饿死
 - [x] 广播 (发送、接收、等待)
 - [x] 自制积木 (定义、调用、参数)
@@ -345,6 +361,17 @@ python converter.py demo
 - [x] TurboWarp `MouseCursor` 光标扩展（系统光标、隐藏光标、用当前造型做光标）
 - [x] TurboWarp `cubesterWindowControls` 窗口控制扩展（位置/大小/标题/全屏/屏幕信息）
 - [x] 同一帽子事件的多个并列脚本（自动生成 `when_xxx_2` 等独立方法并全部注册）
+- [x] “不刷新屏幕”自制积木：warp 期间暂停其他脚本，结束后统一绘制，不显示中间状态
+- [x] SVG 渐变填充（linear/radial、多个 stop、stop-opacity）与透明度（`opacity`/`fill-opacity`/`stroke-opacity`/`rgba()`）
+- [x] SVG 渲染改为单次标签扫描 + `<g>` 样式栈，元素较多时不再重复解析整段 XML
+- [x] 渲染性能优化：造型变换缓存、按倍率复用 SVG、素材路径缓存、内嵌位图解码缓存、帧耗时自适应降低超采样倍率
+- [x] 运行时扩展按 `runtime_code/extensions/` 子文件拆分，由 `config.json` 描述处理器/别名/依赖并按需拼装
+- [x] 导出默认生成独立项目文件夹（`<项目名>/<项目名>.py` + `assets/`），同目录多个项目素材互不覆盖
+- [x] 启动时按时间预算分帧预加载造型/背景，并显示加载进度条，避免大项目一次性加载卡死
+- [x] MouseCursor 扩展只在舞台区域内生效，工具栏/黑边自动恢复系统箭头，绿旗与停止按钮始终可点击
+- [x] 转换日志：阶段耗时、IR/语句/扩展摘要，异常定位到转换器源码行
+- [x] SVG 按窗口倍率重新栅格化（窗口越大越清晰，最高 3 倍超采样）
+- [x] 运行时扩展按需拼装：只写入项目实际使用的扩展及其依赖函数
 
 ## 限制
 
@@ -361,6 +388,7 @@ python converter.py demo
 11. **调度性能**: 执行权锁改为 FIFO 公平锁，脚本线程启动不再等待线程就绪，避免大量克隆创建时卡住创建者；每个脚本每帧执行一次，变量/列表访问保持 Python 原生属性速度。数百个同时运行的脚本仍受 Python 线程调度限制，帧率会随活动脚本数上升而下降
 12. **扩展**: 未注册的第三方扩展会保留调用但返回 0，不会中断脚本
 13. **新扩展细节**: `localstorage` 数据存放在 `~/.scratch-converter/localstorage/<命名空间>.json`（默认命名空间为生成脚本名），写入使用临时文件加 `os.replace` 原子替换；“当本地存储变化”类跨窗口帽子未实现。`clipboard` 优先使用 `pygame.scrap`（需要 SDL），不可用时退回到内存字符串，只能在同一个程序内复制粘贴。`MouseCursor` 用当前造型生成的系统光标限制在 8–128 像素。`cubesterWindowControls` 依赖 `pygame.display.set_window_position`，在 headless 或部分平台上是空操作。Files 扩展（读写本地文件）未实现
+14. **渲染倍率与扩展拼装**: 舞台内部按窗口大小以 0.25 步进在 1–3 倍之间超采样（`SCRATCH_RENDER_SCALE_MAX` 可提高到 4），并依据每帧耗时自适应降低；窗口中缩放稳定后才切换倍率，切换时保留画笔内容与按倍率缓存的造型。大体积（>512KB）的 SVG 通常是包裹内嵌 PNG 的截图，固定最多按 2 倍栅格化以控制内存与切换开销；PNG/JPG 造型仍按原始像素绘制。启动预加载按约 12ms/帧分批进行并显示进度条，单个超大 SVG 仍可能占用较长时间。SVG 的渐变填充支持 linear/radial 与多 stop（含 stop 透明度），描边渐变按平均色近似；透明度按元素/组叠加近似。生成脚本只拼装项目实际使用的扩展（含依赖函数），未注册扩展仍返回 0。扩展源码位于 `runtime_code/extensions/`，新增内置扩展时添加子文件并在 `config.json` 登记处理器、别名与依赖即可，无需修改 `ext_assembly.py`
 
 ## 运行转换后的脚本
 
@@ -395,9 +423,11 @@ python converter.py py2scratch 脚本.py 项目.sb3 --mode general
 - 鼠标 `x 坐标` / `y 坐标` 超出舞台时返回边界值（默认 ±240 / ±180），与 Scratch 一致。
 - 角色默认不能离开舞台：按造型旋转/缩放后的包围盒约束，造型比舞台还大时居中；对应 TurboWarp 的 Fencing 选项，可用 `--no-fencing` 或 Runtime Options 里的 `fencing: false` 关闭。
 - 脚本采用 Scratch 式协作调度：同一时刻只有一个脚本在执行，遇到让帧/等待才切换，避免数据驱动的列表被并发读改写破坏。
+- 勾选“不刷新屏幕”的自制积木会以 warp 方式运行：期间其他脚本暂停、画面不重绘，积木结束后一次性呈现最终状态；warp 超过 `--warp-timer`（默认 0.5 秒）会临时让出一帧。
+- 窗口放大时舞台会按新的倍率重新栅格化（默认最多 3 倍超采样，可用 `SCRATCH_RENDER_SCALE_MAX` 调整；大体积内嵌位图 SVG 最多 2 倍），并根据每帧实际耗时自动降低倍率；SVG 造型不会随窗口拉伸而发糊。启动时会先显示资源加载进度条，按约 12ms/帧的预算分批缓存图片。
 - 如果输入是 `.sb3`，转换器会把造型/声音资源直接导出到 `.py` 所在目录，脚本运行时从同目录加载；同时兼容旧的 `assets/` 子目录。
 - 窗口模式可直接游玩：顶部工具栏有绿旗按钮（与 Scratch 一致，不占用舞台区域），舞台背景默认白色；按 `F1` 可显示运行时调试面板（版本、帧号、询问状态、鼠标/按键事件）；`ESC` 退出，可拖动开启了拖动模式的角色，`询问并等待` 会在舞台底部弹出输入框；支持中文输入法，按回车（含小键盘）或点击右侧“确认”按钮提交；点击输入框本身不会提交，多个脚本同时询问时按顺序排队。
-- SVG 造型由内置渲染器光栅化（支持 text、内嵌 base64 位图、linear/radial 渐变、rect/circle/ellipse/line/polygon/polyline/path）；文字最后绘制，不会被背景形状遮挡。安装 `cairosvg` 时优先使用 cairosvg。
+- SVG 造型由内置渲染器光栅化（支持 text、内嵌 base64 位图、linear/radial 渐变、rect/circle/ellipse/line/polygon/polyline/path）；支持 `opacity`、`fill-opacity`、`stroke-opacity`、`stop-opacity`、`rgba()` 与 `transparent`，半透明形状按画布正确混色；`<g>` 的样式与变换通过一次扫描继承，内嵌位图的 base64 数据会先被遮罩再解析，避免反复扫描大数据。文字最后绘制，不会被背景形状遮挡。默认使用内置渲染器；需要 cairosvg 的高保真度时可设置环境变量 `SCRATCH_SVG_CAIROSVG=1`（首次导入可能较慢）。
 - 支持 `当计时器 > 值` / `当响度 > 值` 帽子事件：条件由假变真时触发一次脚本，持续为真不会重复触发，重置计时器后可再次触发。响度需要可选依赖 `pip install sounddevice numpy` 并授予麦克风权限，未安装时恒为 0。
 - `用户名` 默认返回 `player`（与离线播放器一致），可用环境变量 `SCRATCH_USERNAME=tom` 覆盖。
 - 声音的 `音高` 特效会真正改变音调：按 `2^(pitch/120)` 重采样，音高升高时播放变快变短，与 Scratch 行为一致；同一段声音的常用音高会缓存，避免每帧重复重采样。
@@ -421,7 +451,7 @@ python output.py --assets ./my_assets --trace
 | 参数 | 作用 |
 |------|------|
 | `--headless` | 无窗口（dummy video），适合 CI/调试 |
-| `--frames N` | 运行 N 帧后退出 |
+| `--frames N` | 运行 N 帧后退出（无头模式下会额外让出 1ms/帧给脚本线程；需要精确按时长结束请用 `--seconds`） |
 | `--seconds T` | 运行 T 秒后退出 |
 | `--fps N` | 覆盖运行时帧率 |
 | `--seed N` | 设置随机种子 |
@@ -484,10 +514,10 @@ ScratchRuntime.register_extension("myext", handler)
 
 ## 依赖
 
-- Python 3.8+
+- Python 3.8+（兼容 3.12+；`python_parser.py` 不再依赖已移除的 `ast.Num`/`ast.Str`/`ast.NameConstant`）
 - 转换本身只使用标准库
 - 运行生成的脚本需要 `pygame`（`pip install pygame`）
-- 可选：`numpy`（鱼眼/旋涡特效与更快的音高重采样）、`sounddevice`（麦克风响度）、`pyttsx3`（文字朗读）、`cairosvg`（SVG 渲染）
+- 可选：`numpy`（鱼眼/旋涡特效与更快的音高重采样）、`sounddevice`（麦克风响度）、`pyttsx3`（文字朗读）、`cairosvg`（设置 `SCRATCH_SVG_CAIROSVG=1` 后用于更高保真的 SVG 渲染）
 
 ## 许可
 

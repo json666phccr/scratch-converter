@@ -49,6 +49,25 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
             self.stage_width, self.stage_height = self.STAGE_WIDTH, self.STAGE_HEIGHT
         if headless:
             os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+        # 内部渲染倍率：窗口放大时按比例重新栅格化，避免整层拉伸发糊
+        self.render_scale = 1.0
+        # 超采样上限（默认 3 倍，可用 SCRATCH_RENDER_SCALE_MAX 调整）
+        try:
+            self.max_render_scale = min(4.0, max(1.0, float(
+                os.environ.get('SCRATCH_RENDER_SCALE_MAX') or 3.0)))
+        except (TypeError, ValueError):
+            self.max_render_scale = 3.0
+        # 内置 SVG 渲染器默认启用；cairosvg 首次导入可能耗时数秒，改为按需开启
+        self.use_cairosvg = os.environ.get(
+            'SCRATCH_SVG_CAIROSVG', '').lower() in ('1', 'true', 'yes', 'on')
+        # 倍率切换的稳定帧数/画质上限（自适应降低，避免卡顿时仍按 3 倍绘制）
+        self._scale_target = 1.0
+        self._scale_stable = 0
+        self._quality_cap = self.max_render_scale
+        self._slow_streak = 0
+        self._fast_streak = 0
+        self._scale_cooldown = 0
+        self._ui_font_obj = None
         pygame.display.init()
         pygame.font.init()
         self._create_display(maximize=self.maximize)
@@ -72,6 +91,8 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
         self._start_gate_cond = threading.Condition()
         self._start_gate_total = 0
         self._start_gate_next = 0
+        # “不刷新屏幕”自制积木：warp 执行期间冻结其他脚本并延后绘制
+        self._warp_active = 0
         self.running = True
         self.frame = 0
         self.frame_condition = threading.Condition()
@@ -113,6 +134,9 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
         self.music_instrument = 1
         self.music_cache = {}
         self.dynamic_monitors = []
+        # 变量滑动条监视器：拖动时记录当前监视器
+        self._slider_drag = None
+        self._slider_hits = []
         self.mask_cache = {}
         # 新扩展状态：本地存储 / 剪贴板 / 光标 / 窗口
         self.localstorage_namespace = ''
@@ -121,6 +145,13 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
         self._clipboard_last_pasted = ''
         self._scrap_ready = False
         self._cursor_name = 'default'
+        # 光标状态：只在舞台区域内生效，工具栏/黑边恢复系统箭头
+        self._cursor_visible = True
+        self._cursor_system = 'ARROW'
+        self._cursor_custom = None
+        self._cursor_over_stage = True
+        # 最近一次实际应用的光标（供调试/测试观察）
+        self._applied_cursor = None
         self.fullscreen = False
         self.user_window_title = ''
         self._windowed_size = None
@@ -139,6 +170,19 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
         self.font = pygame.font.Font(font_path, 14) if font_path else pygame.font.Font(None, 14)
         self.font_path = font_path
         self.costume_cache = {}
+        # 每个造型位图的栅格化倍率（SVG 会按窗口大小重新栅格化）
+        self.costume_image_scales = {}
+        # (造型名, 倍率) -> 位图：窗口来回缩放时复用，避免反复重新栅格化
+        self.costume_cache_scales = {}
+        # 素材路径/是否为 SVG 的缓存，避免每帧对每个角色做 os.path.exists
+        self._asset_path_cache = {}
+        self._asset_path_root = None
+        self._costume_kind = {}
+        self._costume_scale_caps = {}
+        # 内嵌位图（base64）解码缓存：切换窗口倍率时无需重复解码
+        self._svg_bitmap_cache = {}
+        # 启动阶段已预加载的图片资源
+        self._preloaded_names = set()
         self.sound_cache = {}
         # Temporary Variables 扩展的运行时变量（每次绿旗/停止时清空）
         self.ext_runtime_vars = {}
@@ -166,40 +210,10 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
         self.background = self._load_image(STAGE_COSTUME) if STAGE_COSTUME else None
         if self.background is not None:
             self.background = pygame.transform.smoothscale(
-                self.background, (self.stage_width, self.stage_height))
-        # 内置TurboWarp扩展
-        self.register_extension('pen', _extension_pen)
-        self.register_extension('runtimeoptions', _extension_runtimeoptions)
-        self.register_extension('runtime-options', _extension_runtimeoptions)
-        self.register_extension('turbowarp', _extension_runtimeoptions)
-        self.register_extension('tw', _extension_runtimeoptions)
-        self.register_extension('music', _extension_music)
-        self.register_extension('text2speech', _extension_text2speech)
-        self.register_extension('speech', _extension_text2speech)
-        self.register_extension('stretch', _extension_stretch)
-        self.register_extension('text', _extension_text)
-        self.register_extension('skyhigh173JSON', _extension_skyhigh_json)
-        self.register_extension('skyhigh173json', _extension_skyhigh_json)
-        for name in ('lmsclonesplus', 'lmsClonesPlus'):
-            self.register_extension(name, _extension_clones_plus)
-        for name in ('lmsLooksPlus', 'lmslooksplus'):
-            self.register_extension(name, _extension_looks_plus)
-        for name in ('lmsMoreEvents', 'lmsmoreevents'):
-            self.register_extension(name, _extension_more_events)
-        for name in ('lmsTempVars2', 'lmstempvars2', 'lmstempvars'):
-            self.register_extension(name, _extension_temp_vars)
-        for name in ('jeremygamerTweening', 'jeremygamertweening'):
-            self.register_extension(name, _extension_tween)
-        for name in ('lmsListTools', 'lmslisttools'):
-            self.register_extension(name, _extension_list_tools)
-        for name in ('localstorage', 'localStorage'):
-            self.register_extension(name, _extension_local_storage)
-        for name in ('clipboard', 'Clipboard'):
-            self.register_extension(name, _extension_clipboard)
-        for name in ('MouseCursor', 'mousecursor', 'cursor'):
-            self.register_extension(name, _extension_mouse_cursor)
-        for name in ('cubesterWindowControls', 'cubesterwindowcontrols'):
-            self.register_extension(name, _extension_window_controls)
+                self.background, self._stage_pixel_size())
+        # 内置扩展按需注册：_BUILTIN_EXTENSIONS 只包含项目实际用到的扩展
+        for _ext_name, _ext_handler in _BUILTIN_EXTENSIONS.items():
+            self.register_extension(_ext_name, _ext_handler)
 
     @classmethod
     def register_extension(cls, name, handler):
@@ -215,6 +229,31 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
 
     def set_framerate(self, fps):
         self.fps = max(1, min(250, int(fps))) if fps else 0
+
+    def warp_begin(self):
+        """进入“不刷新屏幕”的自制积木：暂停其他脚本并停止重绘"""
+        self._warp_active += 1
+
+    def warp_end(self):
+        """离开 warp：最后一次绘制会在本帧结束时统一完成"""
+        if self._warp_active > 0:
+            self._warp_active -= 1
+
+    @property
+    def warping(self):
+        return self._warp_active > 0
+
+    def _read_clipboard(self):
+        """读取系统剪贴板，失败时退回内存文本"""
+        text = ''
+        try:
+            if getattr(self, '_scrap_ready', False):
+                data = pygame.scrap.get(pygame.SCRAP_TEXT)
+                if data:
+                    text = data.decode('utf-8', 'replace').rstrip('\x00')
+        except Exception:
+            text = ''
+        return text or getattr(self, '_clipboard_text', '')
 
     def _create_display(self, maximize=False):
         """创建可自由拉伸的窗口，启动时最大化，舞台按宽高比缩放到最大可用区域。
@@ -243,10 +282,97 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
         except pygame.error:
             self.screen = pygame.display.set_mode(
                 (width, height + self.toolbar_height))
-        self.stage_surface = pygame.Surface((width, height))
+        self.stage_surface = self._make_stage_surface()
         self._manual_view = True
         if maximize:
             self._maximize_window()
+
+    def _stage_pixel_size(self):
+        """舞台内部渲染尺寸（窗口较大时按 render_scale 超采样）"""
+        return (max(1, int(round(self.stage_width * self.render_scale))),
+                max(1, int(round(self.stage_height * self.render_scale))))
+
+    def _make_stage_surface(self):
+        surface = pygame.Surface(self._stage_pixel_size())
+        surface.fill((255, 255, 255))
+        return surface
+
+    def _ui_font(self):
+        """按渲染倍率放大的界面字体（监视器/询问框/调试面板）"""
+        font = self._ui_font_obj
+        if font is None:
+            font = self._font(max(1, int(round(14 * self.render_scale))))
+            self._ui_font_obj = font
+        return font
+
+    def _clear_sprite_caches(self):
+        """切换渲染倍率后清理按 id 缓存的特效/变换结果，避免旧 Surface id 复用导致闪烁"""
+        for sprite in self.sprites:
+            for name in ('_color_cache', '_brightness_cache',
+                         '_distortion_cache', '_transform_cache',
+                         '_text_cache'):
+                if name in sprite.__dict__:
+                    sprite.__dict__[name] = {}
+        self._slider_hits = []
+
+    def _set_render_scale(self, scale):
+        scale = max(1.0, min(self.max_render_scale, float(scale)))
+        if abs(scale - self.render_scale) < 1e-3:
+            return
+        old_pen = self.pen_layer
+        old_used = self._pen_used
+        self.render_scale = scale
+        self._ui_font_obj = None
+        self.stage_surface = self._make_stage_surface()
+        new_size = self._stage_pixel_size()
+        self.pen_layer = pygame.Surface(new_size, pygame.SRCALPHA)
+        # 画笔内容不能因为缩放窗口就丢失：按新倍率重建而不是直接清空
+        self._pen_used = bool(old_used and old_pen is not None)
+        if self._pen_used:
+            try:
+                pygame.transform.smoothscale(old_pen, new_size, self.pen_layer)
+            except Exception:
+                self.pen_layer.blit(pygame.transform.smoothscale(
+                    old_pen, new_size), (0, 0))
+        if self.background is not None:
+            self.background = pygame.transform.smoothscale(
+                self.background, new_size)
+        # 造型位图按 (名字, 倍率) 保留，窗口来回缩放时无需重新栅格化
+        self.costume_cache.clear()
+        self.costume_image_scales.clear()
+        self.mask_cache.clear()
+        self._clear_sprite_caches()
+        self._view_scaled = None
+        self._view_size = None
+        # 切换倍率后的一段帧内不做自适应判断：避免把重新栅格化的耗时误判为持续卡顿
+        self._scale_cooldown = 30
+        self._slow_streak = 0
+        self._fast_streak = 0
+
+    def _ensure_render_scale(self):
+        """窗口尺寸稳定后再切换内部渲染倍率，避免拖动窗口时反复重建/闪烁"""
+        if self.headless or not self._manual_view:
+            return
+        try:
+            scale = self._view_geometry()[0]
+        except Exception:
+            return
+        target = max(1.0, min(self.max_render_scale,
+                              round(scale * 4) / 4.0))
+        target = min(target, self._quality_cap)
+        if target != self._scale_target:
+            # 目标变化（窗口仍在拖动）：重新计时
+            self._scale_target = target
+            self._scale_stable = 0
+            return
+        if abs(target - self.render_scale) < 0.25:
+            self._scale_stable = 0
+            return
+        self._scale_stable += 1
+        if self._scale_stable < 6:
+            return
+        self._scale_stable = 0
+        self._set_render_scale(target)
 
     def set_window_size(self, width, height):
         """调整窗口大小（舞台仍按宽高比缩放）"""
@@ -326,6 +452,53 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
         scale, offset, _size = self._view_geometry()
         return ((pos[0] - offset[0]) / scale, (pos[1] - offset[1]) / scale)
 
+    def _stage_area_contains(self, pos):
+        """窗口坐标是否落在舞台区域（不含顶部工具栏与黑边）"""
+        if not self._manual_view:
+            return True
+        _scale, offset, size = self._view_geometry()
+        return pygame.Rect(offset, size).collidepoint(pos)
+
+    def apply_mouse_cursor(self):
+        """按“是否在舞台内”应用光标状态：工具栏/黑边始终显示系统箭头"""
+        if not self._manual_view:
+            return
+        if not self._cursor_over_stage:
+            self._applied_cursor = 'arrow-outside'
+            try:
+                pygame.mouse.set_visible(True)
+                pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_ARROW)
+            except Exception:
+                pass
+            return
+        if not self._cursor_visible:
+            self._applied_cursor = 'hidden'
+            try:
+                pygame.mouse.set_visible(False)
+            except Exception:
+                pass
+            return
+        self._applied_cursor = 'custom' if self._cursor_custom is not None \
+            else ('system', self._cursor_system)
+        try:
+            pygame.mouse.set_visible(True)
+            if self._cursor_custom is not None:
+                pygame.mouse.set_cursor(*self._cursor_custom)
+            else:
+                constant = getattr(
+                    pygame, 'SYSTEM_CURSOR_' + self._cursor_system,
+                    pygame.SYSTEM_CURSOR_ARROW)
+                pygame.mouse.set_cursor(constant)
+        except Exception:
+            pass
+
+    def _update_cursor_for_position(self, pos):
+        """鼠标在舞台/工具栏之间移动时切换光标的作用范围"""
+        over_stage = self._stage_area_contains(pos)
+        if over_stage != self._cursor_over_stage:
+            self._cursor_over_stage = over_stage
+            self.apply_mouse_cursor()
+
     def _present(self):
         """把逻辑舞台呈现到窗口；按宽高比居中放大到窗口最大可用区域"""
         if self._manual_view:
@@ -335,17 +508,29 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
             window_width, window_height = self.screen.get_size()
             if window_width <= 0 or window_height <= 0:
                 return
-            if self._view_scaled is None or self._view_size != (draw_width, draw_height):
-                self._view_size = (draw_width, draw_height)
-                self._view_scaled = pygame.Surface((draw_width, draw_height)).convert()
-            if self._view_size == (self.stage_width, self.stage_height):
-                self._view_scaled.blit(self.stage_surface, (0, 0))
+            stage_width_px, stage_height_px = self.stage_surface.get_size()
+            if abs(draw_width - stage_width_px) <= 1 \
+                    and abs(draw_height - stage_height_px) <= 1:
+                # 内部倍率与窗口像素接近 1:1，直接 blit，省掉每帧 smoothscale
+                self.screen.fill((0, 0, 0))
+                self.screen.blit(self.stage_surface, offset)
             else:
-                pygame.transform.smoothscale(self.stage_surface,
-                                             (draw_width, draw_height),
-                                             self._view_scaled)
-            self.screen.fill((0, 0, 0))
-            self.screen.blit(self._view_scaled, offset)
+                if self._view_scaled is None \
+                        or self._view_size != (draw_width, draw_height):
+                    self._view_size = (draw_width, draw_height)
+                    self._view_scaled = pygame.Surface(
+                        (draw_width, draw_height)).convert()
+                # 放大到 1.5 倍以上时用最近邻，速度远快于 smoothscale 且观感接近
+                if draw_width >= stage_width_px * 1.5:
+                    pygame.transform.scale(self.stage_surface,
+                                           (draw_width, draw_height),
+                                           self._view_scaled)
+                else:
+                    pygame.transform.smoothscale(self.stage_surface,
+                                                 (draw_width, draw_height),
+                                                 self._view_scaled)
+                self.screen.fill((0, 0, 0))
+                self.screen.blit(self._view_scaled, offset)
             self._draw_toolbar()
         pygame.display.flip()
 
@@ -391,10 +576,13 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
         if width == self.stage_width and height == self.stage_height:
             return
         self.stage_width, self.stage_height = width, height
-        self.pen_layer = pygame.Surface((width, height), pygame.SRCALPHA)
+        self.pen_layer = pygame.Surface(self._stage_pixel_size(), pygame.SRCALPHA)
         self._pen_used = False
         if self.background is not None:
-            self.background = pygame.transform.smoothscale(self.background, (width, height))
+            self.background = pygame.transform.smoothscale(
+                self.background, self._stage_pixel_size())
+        self.mask_cache.clear()
+        self._clear_sprite_caches()
         self._create_display(maximize=self.maximize)
 
     def pen_clear(self):
@@ -419,14 +607,15 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
         return color
 
     def pen_draw_segment(self, start, end, color, size, cap_start=False):
-        size = max(1, int(size))
+        size = max(1, int(round(_sc_num(size) * self.render_scale)))
         if len(color) > 3 and color[3] <= 0:
             # 完全透明（透明度 100）的线段不会改变画面
             return
-        sx = int(self.stage_width / 2 + start[0])
-        sy = int(self.stage_height / 2 - start[1])
-        ex = int(self.stage_width / 2 + end[0])
-        ey = int(self.stage_height / 2 - end[1])
+        scale = self.render_scale
+        sx = int((self.stage_width / 2 + start[0]) * scale)
+        sy = int((self.stage_height / 2 - start[1]) * scale)
+        ex = int((self.stage_width / 2 + end[0]) * scale)
+        ey = int((self.stage_height / 2 - end[1]) * scale)
         self._pen_used = True
         pygame.draw.line(self.pen_layer, color, (sx, sy), (ex, ey), size)
         if size > 1:
@@ -661,22 +850,35 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
     def _draw_ask(self):
         if not self.ask_visible or not self.ask_pending:
             return
+        scale = self.render_scale
         rect = self._ask_rect()
-        pygame.draw.rect(self.stage_surface, (255, 255, 255), rect, border_radius=6)
-        pygame.draw.rect(self.stage_surface, (90, 90, 90), rect, 1, border_radius=6)
+        draw_rect = pygame.Rect(int(rect.x * scale), int(rect.y * scale),
+                                int(rect.width * scale),
+                                int(rect.height * scale))
+        pygame.draw.rect(self.stage_surface, (255, 255, 255), draw_rect,
+                         border_radius=max(1, int(6 * scale)))
+        pygame.draw.rect(self.stage_surface, (90, 90, 90), draw_rect,
+                         max(1, int(scale)), border_radius=max(1, int(6 * scale)))
+        font = self._ui_font()
         text = self.ask_question + ' ' + self.ask_buffer + self.ask_composition + '_'
-        surface = self.font.render(text, True, (30, 30, 30))
-        area_width = max(20, rect.width - 90)
+        surface = font.render(text, True, (30, 30, 30))
+        area_width = max(20, draw_rect.width - int(90 * scale))
         if surface.get_width() > area_width:
             # 文字太长时只显示末尾（当前输入的内容）
-            clipped = pygame.Surface((area_width, rect.height - 8), pygame.SRCALPHA)
+            clipped = pygame.Surface((area_width, draw_rect.height - int(8 * scale)),
+                                     pygame.SRCALPHA)
             clipped.blit(surface, (area_width - surface.get_width(), 0))
             surface = clipped
-        self.stage_surface.blit(surface, (rect.x + 8, rect.y + 11))
+        self.stage_surface.blit(surface, (draw_rect.x + int(8 * scale),
+                                          draw_rect.y + int(11 * scale)))
         button = self._ask_button_rect()
-        pygame.draw.rect(self.stage_surface, (80, 135, 220), button, border_radius=5)
-        label = self.font.render('确认', True, (255, 255, 255))
-        self.stage_surface.blit(label, label.get_rect(center=button.center))
+        draw_button = pygame.Rect(int(button.x * scale), int(button.y * scale),
+                                  int(button.width * scale),
+                                  int(button.height * scale))
+        pygame.draw.rect(self.stage_surface, (80, 135, 220), draw_button,
+                         border_radius=max(1, int(5 * scale)))
+        label = font.render('确认', True, (255, 255, 255))
+        self.stage_surface.blit(label, label.get_rect(center=draw_button.center))
 
     def stop_all_scripts(self):
         for context in list(self.scripts):
@@ -902,6 +1104,7 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
     def step(self):
         if not self.running or pygame is None:
             return
+        self._ensure_render_scale()
         for event in pygame.event.get():
             if event.type == pygame.KEYDOWN and event.key == pygame.K_F1:
                 self.debug_overlay = not self.debug_overlay
@@ -938,7 +1141,7 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
                     if event.key == pygame.K_c:
                         self._trigger_event('clipboard_copy')
                     else:
-                        self._clipboard_last_pasted = _clipboard_read(self)
+                        self._clipboard_last_pasted = self._read_clipboard()
                         if self.ask_pending and self._clipboard_last_pasted:
                             self.ask_buffer += self._clipboard_last_pasted
                             self.ask_key_pending = ''
@@ -983,6 +1186,7 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
                 self.keys.discard(self._key_name(event.key))
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 stage_pos = self._window_to_stage(event.pos)
+                self._update_cursor_for_position(event.pos)
                 if self.ask_pending:
                     if self.trace:
                         print("[trace] ask click", stage_pos,
@@ -993,9 +1197,15 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
                         continue
                 self.mouse_down = True
                 self.mouse_x, self.mouse_y = self._screen_to_scratch(event.pos)
+                slider, slider_rect = self._slider_hit(stage_pos)
+                if slider is not None:
+                    self._slider_drag = (slider, slider_rect)
+                    self._apply_slider(slider, slider_rect, stage_pos[0])
+                    continue
                 self._start_drag(event.pos)
                 self._handle_click(event.pos)
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                self._update_cursor_for_position(event.pos)
                 if self.ask_pending:
                     stage_pos = self._window_to_stage(event.pos)
                     if self._ask_button_rect().collidepoint(stage_pos):
@@ -1004,21 +1214,64 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
                         continue
                 self.mouse_down = False
                 self.dragging = None
+                self._slider_drag = None
             elif event.type == pygame.MOUSEMOTION:
+                self._update_cursor_for_position(event.pos)
                 self.mouse_x, self.mouse_y = self._screen_to_scratch(event.pos)
+                if self._slider_drag is not None:
+                    slider, slider_rect = self._slider_drag
+                    self._apply_slider(
+                        slider, slider_rect, self._window_to_stage(event.pos)[0])
                 if self.dragging is not None:
                     offset_x, offset_y = self.dragging_offset
                     self.dragging.x = self.mouse_x + offset_x
                     self.dragging.y = self.mouse_y + offset_y
                     self.dragging._apply_fencing()
+        work_start = time.time()
         self._update_state()
-        self._draw()
-        self._present()
+        if self._warp_active <= 0:
+            # warp 块运行期间保持上一帧画面，结束后再统一渲染
+            self._draw()
+            self._present()
+        self._adapt_quality(time.time() - work_start)
         with self.frame_condition:
             self.frame += 1
             self.frame_condition.notify_all()
         if not self.headless:
             self.clock.tick(self.fps)
+
+    def _adapt_quality(self, work_seconds):
+        """按实际每帧耗时自适应降低渲染倍率，避免大窗口下持续掉帧"""
+        if self.headless or not self.fps or not self._manual_view:
+            return
+        if self._scale_cooldown > 0:
+            self._scale_cooldown -= 1
+        budget = max(0.012, 0.9 / float(self.fps))
+        if work_seconds > budget:
+            self._slow_streak += 1
+            self._fast_streak = 0
+        else:
+            self._slow_streak = 0
+            if work_seconds < budget * 0.5:
+                self._fast_streak += 1
+            else:
+                self._fast_streak = 0
+        if self._scale_cooldown > 0:
+            return
+        severe = work_seconds > budget * 2
+        if ((self._slow_streak >= 8 or (severe and self._slow_streak >= 3))
+                and self.render_scale > 1.0):
+            step = 1.0 if (severe and self._slow_streak >= 3) else 0.5
+            self._quality_cap = max(1.0, self.render_scale - step)
+            self._scale_target = self._quality_cap
+            self._scale_stable = 0
+            self._set_render_scale(self._quality_cap)
+            self._slow_streak = 0
+        elif self._fast_streak >= 240 \
+                and self._quality_cap < self.max_render_scale:
+            self._quality_cap = min(self.max_render_scale,
+                                    self._quality_cap + 0.5)
+            self._fast_streak = 0
 
     def _log_event(self, event):
         """记录最近的事件，供 F1 调试面板显示"""
@@ -1051,12 +1304,16 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
         ] + list(self._debug_events)
         width = max(self.font.size(line)[0] for line in lines) + 14
         height = len(lines) * 16 + 10
-        panel = pygame.Surface((width, height), pygame.SRCALPHA)
+        scale = self.render_scale
+        panel = pygame.Surface((int(width * scale), int(height * scale)),
+                               pygame.SRCALPHA)
         panel.fill((0, 0, 0, 190))
-        self.stage_surface.blit(panel, (6, 6))
+        self.stage_surface.blit(panel, (int(6 * scale), int(6 * scale)))
+        font = self._ui_font()
         for index, line in enumerate(lines):
-            surface = self.font.render(line, True, (255, 255, 255))
-            self.stage_surface.blit(surface, (12, 10 + index * 16))
+            surface = font.render(line, True, (255, 255, 255))
+            self.stage_surface.blit(
+                surface, (int(12 * scale), int((10 + index * 16) * scale)))
 
     def _init_microphone(self):
         """可选麦克风：安装 sounddevice + numpy 后“响度”才有真实数值"""
@@ -1186,7 +1443,7 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
             self.stage_surface.blit(self.pen_layer, (0, 0))
         for sprite in list(self.sprites):
             if sprite.visible and not getattr(sprite, 'is_stage', False):
-                sprite._draw(self.stage_surface, self.font)
+                sprite._draw(self.stage_surface, self._ui_font())
         self._draw_monitors()
         self._draw_ask()
         if self.debug_overlay:
@@ -1217,38 +1474,134 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
             self.dynamic_monitors.append(target)
         target['visible'] = visible
 
+    def _monitor_value(self, monitor):
+        owner = monitor.get("sprite")
+        if owner:
+            target = self.find_sprite(owner)
+            return getattr(target, monitor["attr"], None) if target else None
+        return GLOBALS.get(monitor["attr"])
+
+    def _set_monitor_value(self, monitor, value):
+        """把滑动条拖动结果写回对应的变量"""
+        owner = monitor.get("sprite")
+        if owner:
+            target = self.find_sprite(owner)
+            if target is not None:
+                setattr(target, monitor["attr"], value)
+        else:
+            GLOBALS[monitor["attr"]] = value
+
+    @staticmethod
+    def _slider_range(monitor):
+        low = _sc_num(monitor.get("slider_min", 0))
+        high = _sc_num(monitor.get("slider_max", 100))
+        if high < low:
+            low, high = high, low
+        return low, high
+
+    def _slider_track_rect(self, rect):
+        """滑动条轨道区域（监视器底部）"""
+        return pygame.Rect(rect.x + 10, rect.bottom - 16,
+                           max(10, rect.width - 20), 8)
+
+    def _slider_hit(self, pos):
+        """返回鼠标位置命中的滑动条监视器"""
+        for monitor, rect in self._slider_hits:
+            if self._slider_track_rect(rect).inflate(4, 8).collidepoint(pos):
+                return monitor, rect
+        return None, None
+
+    def _apply_slider(self, monitor, rect, x):
+        track = self._slider_track_rect(rect)
+        ratio = (x - track.x) / float(max(1, track.width))
+        ratio = max(0.0, min(1.0, ratio))
+        low, high = self._slider_range(monitor)
+        value = low + (high - low) * ratio
+        if monitor.get("discrete", True):
+            value = _sc_round(value)
+        value = max(low, min(high, value))
+        self._set_monitor_value(monitor, value)
+
     def _draw_monitors(self):
+        self._slider_hits = []
+        scale = self.render_scale
+        font = self._ui_font()
+
+        def scaled_rect(rect):
+            return pygame.Rect(int(rect.x * scale), int(rect.y * scale),
+                               int(rect.width * scale),
+                               int(rect.height * scale))
+
+        def scaled_point(x, y):
+            return (int(x * scale), int(y * scale))
+
         for monitor in self._all_monitors():
             if monitor.get('visible') is False:
                 continue
             rect = pygame.Rect(int(monitor["x"]), int(monitor["y"]),
                                int(monitor["width"]), int(monitor["height"]))
+            draw_rect = scaled_rect(rect)
             label = monitor.get("label") or monitor["name"]
-            owner = monitor.get("sprite")
-            if owner:
-                target = self.find_sprite(owner)
-                value = getattr(target, monitor["attr"], None) if target else None
-            else:
-                value = GLOBALS.get(monitor["attr"])
+            value = self._monitor_value(monitor)
             if monitor["kind"] == "list":
-                pygame.draw.rect(self.stage_surface, (255, 255, 255), rect, border_radius=4)
-                pygame.draw.rect(self.stage_surface, (130, 130, 130), rect, 1, border_radius=4)
-                title = self.font.render(label, True, (40, 40, 40))
-                self.stage_surface.blit(title, (rect.x + 5, rect.y + 3))
+                pygame.draw.rect(self.stage_surface, (255, 255, 255), draw_rect,
+                                 border_radius=max(1, int(4 * scale)))
+                pygame.draw.rect(self.stage_surface, (130, 130, 130), draw_rect,
+                                 max(1, int(scale)), border_radius=max(1, int(4 * scale)))
+                title = font.render(label, True, (40, 40, 40))
+                self.stage_surface.blit(title, scaled_point(rect.x + 5, rect.y + 3))
                 if isinstance(value, list):
                     line_y = rect.y + 21
                     for item in value:
                         if line_y + 14 > rect.bottom - 2:
                             break
-                        text = self.font.render(_sc_str(item), True, (60, 60, 60))
-                        self.stage_surface.blit(text, (rect.x + 8, line_y))
+                        text = font.render(_sc_str(item), True, (60, 60, 60))
+                        self.stage_surface.blit(
+                            text, scaled_point(rect.x + 8, line_y))
                         line_y += 15
+            elif monitor.get("mode") == "slider":
+                pygame.draw.rect(self.stage_surface, (255, 255, 255), draw_rect,
+                                 border_radius=max(1, int(3 * scale)))
+                pygame.draw.rect(self.stage_surface, (130, 130, 130), draw_rect,
+                                 max(1, int(scale)), border_radius=max(1, int(3 * scale)))
+                name_surface = font.render(label, True, (40, 40, 40))
+                value_surface = font.render(_sc_str(value), True, (40, 40, 40))
+                self.stage_surface.blit(
+                    name_surface, scaled_point(rect.x + 5, rect.y + 2))
+                self.stage_surface.blit(
+                    value_surface,
+                    (draw_rect.right - int(5 * scale) - value_surface.get_width(),
+                     int((rect.y + 2) * scale)))
+                track = self._slider_track_rect(rect)
+                draw_track = scaled_rect(track)
+                knob_radius = max(2, int(round(6 * scale)))
+                pygame.draw.rect(self.stage_surface, (210, 210, 210), draw_track,
+                                 border_radius=max(1, int(4 * scale)))
+                low, high = self._slider_range(monitor)
+                span = high - low
+                ratio = 0.0 if abs(span) < 1e-9 else \
+                    max(0.0, min(1.0, (_sc_num(value) - low) / span))
+                fill = pygame.Rect(draw_track.x, draw_track.y,
+                                   max(0, int(round(draw_track.width * ratio))),
+                                   draw_track.height)
+                if fill.width:
+                    pygame.draw.rect(self.stage_surface, (76, 151, 255), fill,
+                                     border_radius=max(1, int(4 * scale)))
+                knob_x = draw_track.x + int(round(draw_track.width * ratio))
+                pygame.draw.circle(self.stage_surface, (76, 151, 255),
+                                   (knob_x, draw_track.centery), knob_radius)
+                pygame.draw.circle(self.stage_surface, (255, 255, 255),
+                                   (knob_x, draw_track.centery), knob_radius,
+                                   max(1, int(scale)))
+                self._slider_hits.append((monitor, rect))
             else:
                 text = f"{label} {_sc_str(value)}"
-                pygame.draw.rect(self.stage_surface, (255, 255, 255), rect, border_radius=3)
-                pygame.draw.rect(self.stage_surface, (130, 130, 130), rect, 1, border_radius=3)
-                surface = self.font.render(text, True, (40, 40, 40))
-                self.stage_surface.blit(surface, (rect.x + 5, rect.y + 3))
+                pygame.draw.rect(self.stage_surface, (255, 255, 255), draw_rect,
+                                 border_radius=max(1, int(3 * scale)))
+                pygame.draw.rect(self.stage_surface, (130, 130, 130), draw_rect,
+                                 max(1, int(scale)), border_radius=max(1, int(3 * scale)))
+                surface = font.render(text, True, (40, 40, 40))
+                self.stage_surface.blit(surface, scaled_point(rect.x + 5, rect.y + 3))
 
     @property
     def backdrop_name(self):
@@ -1310,7 +1663,7 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
         self.background = None
         if image is not None:
             self.background = pygame.transform.smoothscale(
-                image, (self.stage_width, self.stage_height))
+                image, self._stage_pixel_size())
         name = BACKDROPS[self.current_backdrop][0]
         threads = []
         for sprite in list(self.sprites):
@@ -1432,14 +1785,59 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
         second = self._costume_color_mask(sprite, other)
         return bool(first and second and first.count() > 0 and second.count() > 0)
 
+    def _costume_scale_cap(self, name):
+        """大体积的 SVG 通常是包裹内嵌 PNG 的截图，放大栅格化不会增加细节"""
+        cap = self._costume_scale_caps.get(name)
+        if cap is not None:
+            return cap
+        cap = 3.0
+        path = self._asset_path(name)
+        if path:
+            try:
+                if os.path.getsize(path) > 512 * 1024:
+                    # 内嵌位图截图型 SVG：2 倍足够清晰，同时控制内存/重栅格化开销
+                    cap = 2.0
+            except OSError:
+                pass
+        self._costume_scale_caps[name] = cap
+        return cap
+
     def get_sprite_image(self, name):
         if not name:
             return None
-        if name in self.costume_cache:
+        is_svg = self._costume_kind.get(name)
+        if is_svg is None:
+            path = self._asset_path(name)
+            is_svg = bool(path and path.lower().endswith('.svg'))
+            self._costume_kind[name] = is_svg
+        if is_svg:
+            scale = min(self.render_scale, self._costume_scale_cap(name))
+        else:
+            scale = 1.0
+        if name in self.costume_cache \
+                and self.costume_image_scales.get(name) == scale:
             return self.costume_cache[name]
-        image = self._load_image(name)
+        key = (name, scale)
+        image = self.costume_cache_scales.get(key)
+        if image is None:
+            image = self._load_image(name, scale)
+            if image is not None:
+                self.costume_cache_scales[key] = image
+                if len(self.costume_cache_scales) > 64:
+                    # 简单裁剪：丢掉最早缓存的一批，控制显存
+                    for old_key in list(self.costume_cache_scales)[:16]:
+                        self.costume_cache_scales.pop(old_key, None)
         self.costume_cache[name] = image
+        self.costume_image_scales[name] = scale
         return image
+
+    def get_sprite_image_scale(self, name):
+        """返回造型位图的栅格化倍率（SVG 可能是 1~3 倍）"""
+        if not name:
+            return 1.0
+        if name not in self.costume_cache:
+            self.get_sprite_image(name)
+        return self.costume_image_scales.get(name, 1.0)
 
     def snapshot_data_uri(self):
         """把当前舞台画面编码成 data:image/png;base64,..."""
@@ -1464,9 +1862,12 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
         rect = getattr(sprite, "_screen_rect", None)
         if rect is not None:
             return rect
-        radius = max(6, int(20 * _sc_num(sprite.size) / 100.0))
-        center = (int(self.stage_width / 2 + _sc_num(sprite.x)),
-                  int(self.stage_height / 2 - _sc_num(sprite.y)))
+        radius = max(6, int(20 * _sc_num(sprite.size) / 100.0
+                           * self.render_scale))
+        center = (int((self.stage_width / 2 + _sc_num(sprite.x))
+                      * self.render_scale),
+                  int((self.stage_height / 2 - _sc_num(sprite.y))
+                      * self.render_scale))
         return pygame.Rect(center[0] - radius, center[1] - radius,
                            radius * 2, radius * 2)
 
@@ -1491,12 +1892,13 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
 
     def touching(self, sprite, target):
         rect = self._sprite_rect(sprite)
+        scale = self.render_scale
         if target == "_edge_":
-            return (rect.left <= 0 or rect.right >= self.stage_width or
-                    rect.top <= 0 or rect.bottom >= self.stage_height)
+            return (rect.left <= 0 or rect.right >= self.stage_width * scale or
+                    rect.top <= 0 or rect.bottom >= self.stage_height * scale)
         if target == "_mouse_":
-            x = self.stage_width // 2 + self.mouse_x
-            y = self.stage_height // 2 - self.mouse_y
+            x = (self.stage_width / 2 + self.mouse_x) * scale
+            y = (self.stage_height / 2 - self.mouse_y) * scale
             return rect.collidepoint(x, y)
         # “碰到角色”应检查该角色的所有可见克隆体（不包括自己）
         first = None
@@ -1742,11 +2144,114 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
         if self.mixer_ready:
             pygame.mixer.stop()
 
+    def _prepare_render_scale_for_start(self):
+        """启动时先按最终窗口大小确定渲染倍率，避免预加载后马上重栅格化"""
+        if self.headless or not self._manual_view:
+            return
+        try:
+            scale = self._view_geometry()[0]
+        except Exception:
+            return
+        target = max(1.0, min(self.max_render_scale,
+                              round(scale * 4) / 4.0))
+        target = min(target, self._quality_cap)
+        if abs(target - self.render_scale) >= 0.25:
+            self._set_render_scale(target)
+        self._scale_target = target
+        self._scale_stable = 6
+
+    def _preload_assets(self):
+        """分帧预加载造型/背景，并显示加载进度条
+
+        每帧最多占用约 12ms，避免一次性加载大项目导致窗口长时间无响应。
+        """
+        names = []
+        seen = set()
+
+        def add(name):
+            if not name:
+                return
+            name = str(name)
+            if name in seen:
+                return
+            if not name.lower().endswith(
+                    ('.svg', '.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')):
+                return
+            seen.add(name)
+            names.append(name)
+
+        add(STAGE_COSTUME)
+        for backdrop in BACKDROPS:
+            add(backdrop[1])
+        for sprite in self.sprites:
+            for costume in getattr(sprite, 'costumes', ()) or ():
+                add(costume.get('md5ext') or costume.get('name'))
+        pending = [name for name in names
+                   if name not in self._preloaded_names]
+        total = len(pending)
+        if not total:
+            return
+        index = 0
+        while index < total and self.running:
+            started = time.time()
+            while index < total and time.time() - started < 0.012:
+                name = pending[index]
+                index += 1
+                self.get_sprite_image(name)
+                self._preloaded_names.add(name)
+            if self.headless:
+                continue
+            self._draw_loading(index, total)
+            self._present()
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT or (
+                        event.type == pygame.KEYDOWN
+                        and event.key == pygame.K_ESCAPE):
+                    self.running = False
+            if self.fps:
+                self.clock.tick(self.fps)
+        if not self.headless and self.running:
+            self.stage_surface.fill((255, 255, 255))
+
+    def _draw_loading(self, done, total):
+        """绘制启动加载进度条"""
+        scale = self.render_scale
+        width, height = self.stage_surface.get_size()
+        self.stage_surface.fill((30, 34, 42))
+        font = self._ui_font()
+        title = font.render('正在加载资源…', True, (240, 240, 240))
+        self.stage_surface.blit(
+            title, title.get_rect(center=(width // 2,
+                                          height // 2 - int(46 * scale))))
+        bar_width = max(80, int(self.stage_width * 0.62 * scale))
+        bar_height = max(6, int(10 * scale))
+        bar_x = (width - bar_width) // 2
+        bar_y = height // 2
+        ratio = 0.0 if total <= 0 else done / float(total)
+        radius = max(1, int(5 * scale))
+        pygame.draw.rect(self.stage_surface, (68, 74, 86),
+                         (bar_x, bar_y, bar_width, bar_height),
+                         border_radius=radius)
+        if ratio > 0:
+            pygame.draw.rect(
+                self.stage_surface, (76, 151, 255),
+                (bar_x, bar_y, max(1, int(bar_width * ratio)), bar_height),
+                border_radius=radius)
+        detail = font.render('%d / %d' % (done, total), True, (200, 205, 215))
+        self.stage_surface.blit(
+            detail, detail.get_rect(center=(width // 2,
+                                            bar_y + int(28 * scale))))
+
     def start(self, max_frames=None, max_seconds=None):
         if pygame is None:
             raise RuntimeError("运行生成的脚本需要pygame: pip install pygame")
         for sprite in list(self.sprites):
             sprite.run()
+        if not self.headless:
+            self._prepare_render_scale_for_start()
+            self._preload_assets()
+            if not self.running:
+                return
         self.green_flag()
         frames = 0
         deadline = None if max_seconds is None else time.time() + max_seconds
@@ -1761,6 +2266,11 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
                 frames += 1
                 if max_frames is not None and frames >= max_frames:
                     break
+                if self.headless and max_frames is not None:
+                    # 无头主循环远快于脚本线程；给脚本线程一点调度时间，
+                    # 避免 --frames 在脚本还没执行完时就退出。
+                    # 需要精确按时间结束时请使用 --seconds。
+                    time.sleep(0.001)
                 if deadline is not None and time.time() >= deadline:
                     break
         finally:
@@ -1791,28 +2301,40 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
         """素材优先从脚本同目录读取，其次兼容旧的assets子目录"""
         if not filename:
             return None
+        if self._asset_path_root != self.assets_dir:
+            self._asset_path_cache.clear()
+            self._asset_path_root = self.assets_dir
+        if filename in self._asset_path_cache:
+            return self._asset_path_cache[filename]
         name = os.path.basename(filename)
+        result = None
         for folder in (self.assets_dir, os.path.join(self.assets_dir, 'assets')):
             path = os.path.join(folder, name)
             if os.path.exists(path):
-                return path
-        return None
+                result = path
+                break
+        self._asset_path_cache[filename] = result
+        return result
 
-    def _load_image(self, filename):
+    def _load_image(self, filename, scale=1.0):
         path = self._asset_path(filename)
         if not path:
             return None
         if path.lower().endswith(".svg"):
-            try:
-                import cairosvg
-                png_data = cairosvg.svg2png(url=path)
-                image = pygame.image.load(io.BytesIO(png_data))
+            # 内置渲染器已支持渐变/透明度，且不会像 cairosvg 那样在首次使用时
+            # 触发数秒的导入开销；需要更高保真度时可设置 SCRATCH_SVG_CAIROSVG=1
+            if self.use_cairosvg:
                 try:
-                    return image.convert_alpha()
+                    import cairosvg
+                    data = cairosvg.svg2png(url=path, scale=max(1.0, scale))
+                    image = pygame.image.load(io.BytesIO(data))
+                    try:
+                        return image.convert_alpha()
+                    except Exception:
+                        return image
                 except Exception:
-                    return image
-            except Exception:
-                return self._render_svg(path)
+                    pass
+            return self._render_svg(path, scale)
         try:
             image = pygame.image.load(path)
         except Exception:
@@ -1822,35 +2344,480 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
         except Exception:
             return image
 
-    def _svg_style_at(self, text, position, base):
-        """计算position处继承的 fill/stroke/font-size"""
-        fill, stroke, width, font_size = base
-        for match in re.finditer(r'<g\b([^>]*)>|</g>', text[:position]):
-            tag = match.group(0)
-            if tag.startswith('</g'):
+    # ===================== SVG 渲染 =====================
+    # 说明：先一次性扫描所有标签，把 <g> 的样式/变换压栈，元素处直接取栈顶，
+    # 避免旧实现对每个元素重复扫描整段 XML（元素多时是 O(n^2)）。
+
+    def _svg_default_style(self):
+        return {
+            'fill': '#000000',
+            'stroke': 'none',
+            'stroke_width': '1',
+            'font_size': '16',
+            'opacity': 1.0,
+            'fill_opacity': 1.0,
+            'stroke_opacity': 1.0,
+        }
+
+    def _svg_child_style(self, base, attrs):
+        style = dict(base)
+        for key, name in (('fill', 'fill'), ('stroke', 'stroke'),
+                          ('stroke_width', 'stroke-width'),
+                          ('font_size', 'font-size')):
+            value = _svg_get(attrs, name)
+            if value is not None:
+                style[key] = value
+        style['opacity'] = base['opacity'] * _svg_opacity(
+            _svg_get(attrs, 'opacity'))
+        for key, name in (('fill_opacity', 'fill-opacity'),
+                          ('stroke_opacity', 'stroke-opacity')):
+            value = _svg_opacity(_svg_get(attrs, name), None)
+            if value is not None:
+                style[key] = base[key] * value
+        return style
+
+    def _svg_parse_gradients(self, text):
+        """解析 linearGradient / radialGradient 及其中的 stop"""
+        gradients = {}
+        pattern = re.compile(
+            r'<(linearGradient|radialGradient)\b([^>]*)>(.*?)</\1>', re.S)
+        for match in pattern.finditer(text):
+            kind, attrs, body = match.group(1), match.group(2), match.group(3)
+            ident = _svg_get(attrs, 'id')
+            if not ident:
                 continue
-            attrs = match.group(1)
-            fill = _svg_attr(attrs, 'fill', fill)
-            stroke = _svg_attr(attrs, 'stroke', stroke)
-            width = _svg_attr(attrs, 'stroke-width', width)
-            font_size = _svg_attr(attrs, 'font-size', font_size)
-        return fill, stroke, width, font_size
+            stops = []
+            for stop in re.finditer(r'<stop\b([^>]*?)/?>', body):
+                stop_attrs = stop.group(1)
+                offset_text = _sc_str(_svg_attr(stop_attrs, 'offset', '0')).strip()
+                if offset_text.endswith('%'):
+                    offset = _sc_num(offset_text[:-1]) / 100.0
+                else:
+                    offset = _sc_num(offset_text)
+                color_text = _svg_prop(stop_attrs, 'stop-color', '#000000')
+                opacity_text = _svg_prop(stop_attrs, 'stop-opacity', '1')
+                color = _svg_color(color_text) or (0, 0, 0, 255)
+                alpha = int(round(color[3] * _svg_opacity(opacity_text)))
+                stops.append((max(0.0, min(1.0, offset)),
+                              (color[0], color[1], color[2],
+                               max(0, min(255, alpha)))))
+            stops.sort(key=lambda item: item[0])
+            gradients[ident] = {
+                'type': 'linear' if kind == 'linearGradient' else 'radial',
+                'attrs': attrs,
+                'stops': stops,
+            }
+        # xlink:href 复用其它渐变的 stop
+        for gradient in gradients.values():
+            if gradient['stops']:
+                continue
+            href = _svg_attr(gradient['attrs'], 'xlink:href') \
+                or _svg_attr(gradient['attrs'], 'href')
+            if href.startswith('#'):
+                gradient['stops'] = list(
+                    gradients.get(href[1:], {}).get('stops') or ())
+        return gradients
 
-    def _svg_matrix_at(self, text, position):
-        stack = [(1.0, 0.0, 0.0, 1.0, 0.0, 0.0)]
-        for match in re.finditer(r'<g\b([^>]*)>|</g>', text[:position]):
-            tag = match.group(0)
-            if tag.startswith('</g'):
-                if len(stack) > 1:
-                    stack.pop()
+    @staticmethod
+    def _svg_matrix_scale(matrix):
+        return max(0.01, math.hypot(matrix[0], matrix[1]))
+
+    def _svg_geometry(self, kind, attrs, matrix):
+        """计算元素在输出画布上的几何：折线点或椭圆矩形"""
+        try:
+            if kind == 'rect':
+                rx = _sc_num(_svg_get(attrs, 'x', '0'))
+                ry = _sc_num(_svg_get(attrs, 'y', '0'))
+                rw = _sc_num(_svg_get(attrs, 'width', '0'))
+                rh = _sc_num(_svg_get(attrs, 'height', '0'))
+                return 'polygon', [
+                    _svg_point(matrix, rx, ry),
+                    _svg_point(matrix, rx + rw, ry),
+                    _svg_point(matrix, rx + rw, ry + rh),
+                    _svg_point(matrix, rx, ry + rh),
+                ]
+            if kind in ('circle', 'ellipse'):
+                if kind == 'circle':
+                    cx = _sc_num(_svg_get(attrs, 'cx', '0'))
+                    cy = _sc_num(_svg_get(attrs, 'cy', '0'))
+                    radius = _sc_num(_svg_get(attrs, 'r', '0'))
+                    rx = ry = radius
+                else:
+                    cx = _sc_num(_svg_get(attrs, 'cx', '0'))
+                    cy = _sc_num(_svg_get(attrs, 'cy', '0'))
+                    rx = _sc_num(_svg_get(attrs, 'rx', '0'))
+                    ry = _sc_num(_svg_get(attrs, 'ry', '0'))
+                center = _svg_point(matrix, cx, cy)
+                scale_x = math.hypot(matrix[0], matrix[1])
+                scale_y = math.hypot(matrix[2], matrix[3])
+                width = max(1, int(round(rx * scale_x * 2)))
+                height = max(1, int(round(ry * scale_y * 2)))
+                return 'ellipse', pygame.Rect(
+                    int(round(center[0] - width / 2)),
+                    int(round(center[1] - height / 2)), width, height)
+            if kind == 'line':
+                return 'line', [
+                    _svg_point(matrix, _sc_num(_svg_get(attrs, 'x1', '0')),
+                               _sc_num(_svg_get(attrs, 'y1', '0'))),
+                    _svg_point(matrix, _sc_num(_svg_get(attrs, 'x2', '0')),
+                               _sc_num(_svg_get(attrs, 'y2', '0'))),
+                ]
+            if kind in ('polygon', 'polyline'):
+                values = [_sc_num(item) for item in
+                          re.split(r'[ ,]+',
+                                   _svg_get(attrs, 'points', '').strip())
+                          if item]
+                return kind, [
+                    _svg_point(matrix, values[index], values[index + 1])
+                    for index in range(0, len(values) - 1, 2)]
+            if kind == 'path':
+                return 'path', [
+                    _svg_point(matrix, px, py)
+                    for px, py in _svg_path_points(_svg_get(attrs, 'd', ''))]
+        except (ValueError, TypeError, IndexError):
+            return None
+        return None
+
+    def _svg_paint(self, surface, kind, geometry, color, width=0,
+                   offset=(0, 0)):
+        """把几何形状填充/描边到画布
+
+        半透明颜色不能直接 draw（pygame 会覆盖而不是混色），
+        先画到同尺寸临时层再 blit，才能得到正确的透明度叠加。
+        """
+        if color is None:
+            return
+        alpha = color[3] if len(color) > 3 else 255
+        ox, oy = int(offset[0]), int(offset[1])
+        target = surface
+        base_x = base_y = 0
+        if alpha < 255:
+            bounds = self._svg_bbox(kind, geometry)
+            if bounds is None:
+                return
+            margin = max(1, int(width)) + 2
+            bounds = bounds.inflate(margin * 2, margin * 2).move(ox, oy)
+            target = pygame.Surface(bounds.size, pygame.SRCALPHA)
+            base_x, base_y = bounds.x, bounds.y
+            ox -= base_x
+            oy -= base_y
+        if kind == 'ellipse':
+            rect = geometry.move(ox, oy)
+            if rect.width > 0 and rect.height > 0:
+                if width > 0:
+                    pygame.draw.ellipse(target, color, rect,
+                                        max(1, int(width)))
+                else:
+                    pygame.draw.ellipse(target, color, rect)
+        else:
+            points = [(int(x + ox), int(y + oy)) for x, y in geometry]
+            if len(points) >= 2:
+                if width > 0:
+                    pygame.draw.lines(target, color, kind == 'polygon', points,
+                                      max(1, int(width)))
+                elif len(points) >= 3:
+                    pygame.draw.polygon(target, color, points)
+        if target is not surface:
+            surface.blit(target, (base_x, base_y))
+
+    @staticmethod
+    def _svg_apply_opacity(color, opacity):
+        alpha = int(round(color[3] * max(0.0, min(1.0, opacity))))
+        return (color[0], color[1], color[2], max(0, min(255, alpha)))
+
+    @staticmethod
+    def _svg_gradient_average(gradient):
+        stops = gradient.get('stops') or []
+        if not stops:
+            return None
+        count = float(len(stops))
+        return tuple(int(round(sum(stop[1][index] for stop in stops) / count))
+                     for index in range(4))
+
+    def _svg_fill_paint(self, raw, gradients):
+        """把 fill/stroke 值解析为 RGBA 或渐变定义"""
+        if raw is None:
+            return None
+        text = _sc_str(raw).strip()
+        if not text or text.lower() == 'none':
+            return None
+        if text.startswith('url('):
+            start = text.find('#')
+            end = text.find(')', start + 1)
+            if start >= 0 and end > start:
+                return gradients.get(text[start + 1:end])
+            return None
+        return _svg_color(text)
+
+    @staticmethod
+    def _svg_bbox(kind, geometry):
+        if kind == 'ellipse':
+            return geometry.copy()
+        if not geometry:
+            return None
+        xs = [point[0] for point in geometry]
+        ys = [point[1] for point in geometry]
+        left = int(math.floor(min(xs)))
+        top = int(math.floor(min(ys)))
+        width = max(1, int(math.ceil(max(xs))) - left)
+        height = max(1, int(math.ceil(max(ys))) - top)
+        return pygame.Rect(left, top, width, height)
+
+    def _svg_gradient_surface(self, gradient, bbox, matrix):
+        """按包围盒生成渐变位图（支持线性/径向、stop 透明度）"""
+        width = max(1, bbox.width)
+        height = max(1, bbox.height)
+        stops = gradient.get('stops') or []
+        if not stops:
+            return None
+        attrs = gradient.get('attrs') or ''
+        units = _svg_get(attrs, 'gradientUnits', 'objectBoundingBox')
+        user_space = units == 'userSpaceOnUse'
+        unit_scale = self._svg_matrix_scale(matrix)
+
+        def coord_x(value, fallback):
+            text = _sc_str(value if value not in (None, '') else fallback).strip()
+            if text.endswith('%'):
+                return _sc_num(text[:-1]) / 100.0 * width
+            number = _sc_num(text)
+            return number * unit_scale - bbox.x if user_space else number * width
+
+        def coord_y(value, fallback):
+            text = _sc_str(value if value not in (None, '') else fallback).strip()
+            if text.endswith('%'):
+                return _sc_num(text[:-1]) / 100.0 * height
+            number = _sc_num(text)
+            return number * unit_scale - bbox.y if user_space else number * height
+
+        offsets = [stop[0] for stop in stops]
+        colors = [stop[1] for stop in stops]
+
+        def sample(t):
+            if t <= offsets[0]:
+                return colors[0]
+            if t >= offsets[-1]:
+                return colors[-1]
+            for index in range(1, len(offsets)):
+                if t <= offsets[index]:
+                    span = offsets[index] - offsets[index - 1]
+                    local = 0.0 if span <= 1e-9 else \
+                        (t - offsets[index - 1]) / span
+                    first, second = colors[index - 1], colors[index]
+                    return tuple(
+                        int(round(first[channel] +
+                                  (second[channel] - first[channel]) * local))
+                        for channel in range(4))
+            return colors[-1]
+
+        if gradient['type'] == 'linear':
+            x1 = coord_x(_svg_get(attrs, 'x1'), '0%')
+            y1 = coord_y(_svg_get(attrs, 'y1'), '0%')
+            x2 = coord_x(_svg_get(attrs, 'x2'), '100%')
+            y2 = coord_y(_svg_get(attrs, 'y2'), '0%')
+        else:
+            cx = coord_x(_svg_get(attrs, 'cx'), '50%')
+            cy = coord_y(_svg_get(attrs, 'cy'), '50%')
+            radius_text = _sc_str(_svg_get(attrs, 'r', '50%')).strip()
+            if radius_text.endswith('%'):
+                radius = _sc_num(radius_text[:-1]) / 100.0 * \
+                    math.hypot(width, height) / math.sqrt(2)
             else:
-                current = _svg_mul(stack[-1],
-                                   _svg_transform(_svg_attr(match.group(1), 'transform')))
-                stack.append(current)
-        return stack[-1]
+                radius = _sc_num(radius_text) * (
+                    unit_scale if user_space else
+                    math.hypot(width, height) / math.sqrt(2))
 
-    def _render_svg(self, path):
-        """没有cairosvg时的简易SVG渲染：支持text/常见形状/path"""
+        try:
+            import numpy
+            xs = numpy.arange(width, dtype=numpy.float32)
+            ys = numpy.arange(height, dtype=numpy.float32)
+            grid_x, grid_y = numpy.meshgrid(xs, ys, indexing='ij')
+            if gradient['type'] == 'linear':
+                dx = x2 - x1
+                dy = y2 - y1
+                denominator = dx * dx + dy * dy
+                if denominator < 1e-6:
+                    ratio = numpy.zeros((width, height), dtype=numpy.float32)
+                else:
+                    ratio = ((grid_x - x1) * dx + (grid_y - y1) * dy) \
+                        / denominator
+            else:
+                ratio = numpy.sqrt((grid_x - cx) ** 2 +
+                                   (grid_y - cy) ** 2) / max(1e-6, radius)
+            ratio = numpy.clip(ratio, 0.0, 1.0)
+            offsets_array = numpy.array(offsets, dtype=numpy.float32)
+            channels = [
+                numpy.interp(ratio, offsets_array,
+                             numpy.array([color[channel] for color in colors],
+                                         dtype=numpy.float32))
+                for channel in range(4)]
+            result = pygame.Surface((width, height), pygame.SRCALPHA)
+            pixels = pygame.surfarray.pixels3d(result)
+            pixels[:, :, 0] = channels[0].astype(numpy.uint8)
+            pixels[:, :, 1] = channels[1].astype(numpy.uint8)
+            pixels[:, :, 2] = channels[2].astype(numpy.uint8)
+            alpha = pygame.surfarray.pixels_alpha(result)
+            alpha[:, :] = channels[3].astype(numpy.uint8)
+            del pixels, alpha
+            return result
+        except Exception:
+            pass
+
+        result = pygame.Surface((width, height), pygame.SRCALPHA)
+        if gradient['type'] == 'linear':
+            dx = x2 - x1
+            dy = y2 - y1
+            steps = max(2, int(max(abs(dx), abs(dy), 1)))
+            steps = min(256, steps)
+            for index in range(steps):
+                t = index / float(steps - 1)
+                color = sample(t)
+                if abs(dx) >= abs(dy):
+                    pygame.draw.line(result, color,
+                                     (int(x1 + dx * t), 0),
+                                     (int(x1 + dx * t), height))
+                else:
+                    pygame.draw.line(result, color,
+                                     (0, int(y1 + dy * t)),
+                                     (width, int(y1 + dy * t)))
+        else:
+            steps = min(64, max(8, int(radius)))
+            for index in range(steps, 0, -1):
+                t = index / float(steps)
+                pygame.draw.circle(result, sample(t),
+                                   (int(cx), int(cy)), int(radius * t))
+        return result
+
+    def _svg_gradient_fill(self, surface, gradient, kind, geometry, style,
+                           matrix):
+        bbox = self._svg_bbox(kind, geometry)
+        if bbox is None:
+            return
+        paint = self._svg_gradient_surface(gradient, bbox, matrix)
+        if paint is None:
+            color = self._svg_gradient_average(gradient)
+            if color is not None:
+                self._svg_paint(
+                    surface, kind, geometry,
+                    self._svg_apply_opacity(color, style['fill_opacity'] *
+                                            style['opacity']))
+            return
+        mask = pygame.Surface(paint.get_size(), pygame.SRCALPHA)
+        self._svg_paint(mask, kind, geometry, (255, 255, 255, 255), 0,
+                        offset=(-bbox.x, -bbox.y))
+        paint.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+        alpha = int(round(255 * style['fill_opacity'] * style['opacity']))
+        if alpha < 255:
+            paint.fill((255, 255, 255, max(0, alpha)),
+                       special_flags=pygame.BLEND_RGBA_MULT)
+        surface.blit(paint, (bbox.x, bbox.y))
+
+    def _svg_draw_record(self, surface, record, gradients):
+        tag, attrs, style, matrix, inner = record
+        if tag == 'image':
+            self._svg_draw_image(surface, attrs, style, matrix)
+            return
+        if tag == 'text':
+            self._svg_draw_text(surface, attrs, style, matrix, inner,
+                                gradients)
+            return
+        geometry = self._svg_geometry(tag, attrs, matrix)
+        if geometry is None:
+            return
+        kind, points = geometry
+        fill = self._svg_fill_paint(style['fill'], gradients)
+        if isinstance(fill, dict):
+            self._svg_gradient_fill(surface, fill, kind, points, style, matrix)
+        elif fill is not None:
+            color = self._svg_apply_opacity(
+                fill, style['fill_opacity'] * style['opacity'])
+            if color[3] > 0:
+                self._svg_paint(surface, kind, points, color)
+        stroke = self._svg_fill_paint(style['stroke'], gradients)
+        if isinstance(stroke, dict):
+            stroke = self._svg_gradient_average(stroke)
+        if stroke is not None:
+            color = self._svg_apply_opacity(
+                stroke, style['stroke_opacity'] * style['opacity'])
+            width = _sc_num(style['stroke_width']) * \
+                self._svg_matrix_scale(matrix)
+            if color[3] > 0:
+                self._svg_paint(surface, kind, points, color,
+                                max(1, int(round(width))))
+
+    def _svg_draw_image(self, surface, attrs, style, matrix):
+        href = attrs.get('__href') if isinstance(attrs, dict) else None
+        if not href:
+            href = _svg_get(attrs, 'xlink:href') or _svg_get(attrs, 'href')
+        if not href.startswith('data:image') or 'base64,' not in href:
+            return
+        try:
+            key = (len(href), hash(href))
+            image = self._svg_bitmap_cache.get(key)
+            if image is None:
+                import base64
+                raw = base64.b64decode(href.split('base64,', 1)[1])
+                image = pygame.image.load(io.BytesIO(raw))
+                if len(self._svg_bitmap_cache) >= 12:
+                    self._svg_bitmap_cache.clear()
+                self._svg_bitmap_cache[key] = image
+        except Exception:
+            return
+        width = _sc_num(_svg_get(attrs, 'width', '0'))
+        height = _sc_num(_svg_get(attrs, 'height', '0'))
+        if width <= 0 or height <= 0:
+            width, height = float(image.get_width()), float(image.get_height())
+        scale = math.hypot(matrix[0], matrix[1]) or 1.0
+        angle = -math.degrees(math.atan2(matrix[1], matrix[0]))
+        if abs(angle) < 1e-6:
+            # 纯缩放（绝大多数内嵌位图）用 smoothscale，比 rotozoom 快很多
+            drawn = pygame.transform.smoothscale(
+                image, (max(1, int(round(image.get_width() * scale))),
+                        max(1, int(round(image.get_height() * scale)))))
+        else:
+            drawn = pygame.transform.rotozoom(image, angle, scale)
+        offset_x = _sc_num(_svg_get(attrs, 'x', '0'))
+        offset_y = _sc_num(_svg_get(attrs, 'y', '0'))
+        center_x, center_y = _svg_point(matrix, offset_x + width / 2,
+                                        offset_y + height / 2)
+        alpha = int(round(255 * style['opacity']))
+        if alpha < 255:
+            drawn.set_alpha(max(0, alpha))
+        surface.blit(drawn, drawn.get_rect(
+            center=(int(center_x), int(center_y))))
+
+    def _svg_draw_text(self, surface, attrs, style, matrix, inner, gradients):
+        fill = self._svg_fill_paint(style['fill'], gradients)
+        if isinstance(fill, dict):
+            fill = self._svg_gradient_average(fill)
+        if fill is None:
+            return
+        size = _sc_num(style['font_size']) or 16
+        scale = abs(matrix[0]) or 1.0
+        font_size = max(1, int(round(size * scale)))
+        font = self._font(font_size)
+        contents = re.findall(r'<tspan[^>]*>(.*?)</tspan>', inner, re.S)
+        label = contents[0] if contents else inner
+        label = re.sub(r'<[^>]+>', '', label).strip()
+        if not label:
+            return
+        rendered = font.render(label, True, fill[:3])
+        alpha = int(round(fill[3] * style['fill_opacity'] * style['opacity']))
+        if alpha < 255:
+            rendered.set_alpha(max(0, alpha))
+        x, y = matrix[4], matrix[5]
+        anchor = _svg_get(attrs, 'text-anchor')
+        if anchor == 'middle':
+            x -= rendered.get_width() / 2
+        elif anchor == 'end':
+            x -= rendered.get_width()
+        surface.blit(rendered, (int(x), int(y - font.get_ascent())))
+
+    def _render_svg(self, path, image_scale=1.0):
+        """没有 cairosvg 时的 SVG 渲染：text/常见形状/path/渐变/透明度
+
+        image_scale > 1 时按更高分辨率栅格化，窗口放大后仍然清晰。
+        单次扫描标签并按 <g> 样式栈求值，避免逐元素重复解析整段 XML。
+        """
         try:
             with open(path, encoding='utf-8', errors='ignore') as handle:
                 text = handle.read()
@@ -1869,157 +2836,95 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
                     height = _sc_num(parts[3])
         width = max(1, int(round(width or 100)))
         height = max(1, int(round(height or 100)))
-        surface = pygame.Surface((width, height), pygame.SRCALPHA)
-        default_style = ('#000000', 'none', '1', '16')
+        texture_scale = max(1.0, float(image_scale))
+        texture_width = max(1, int(round(width * texture_scale)))
+        texture_height = max(1, int(round(height * texture_scale)))
+        surface = pygame.Surface((texture_width, texture_height),
+                                 pygame.SRCALPHA)
+        scale_matrix = (texture_scale, 0.0, 0.0, texture_scale, 0.0, 0.0)
 
-        # 渐变用平均色近似（完整渐变渲染成本过高）
-        gradients = {}
-        for gradient in re.finditer(
-                r'<(linearGradient|radialGradient)\b([^>]*)>(.*?)</\1>', text, re.S):
-            ident = _svg_attr(gradient.group(2), 'id')
-            colors = [_svg_color(item) for item in
-                      re.findall(r'stop-color="([^"]*)"', gradient.group(3))]
-            colors = [color for color in colors if color]
-            if ident and colors:
-                gradients[ident] = tuple(
-                    sum(color[index] for color in colors) // len(colors)
-                    for index in range(3))
+        # 先把内嵌位图的 base64 换成占位符：标签扫描不需要反复经过几百 KB 的图片数据
+        image_hrefs = []
+        image_re = re.compile(r'<image\b([^>]*?)/?>', re.S)
+        href_re = re.compile(r'(?:xlink:)?href\s*=\s*"([^"]*)"')
 
-        # 内嵌位图（data:image/png;base64,...）
-        for match in re.finditer(r'<image\b([^>]*?)/?>', text):
+        def mask_image(match):
             attrs = match.group(1)
-            href = _svg_attr(attrs, 'xlink:href') or _svg_attr(attrs, 'href')
-            if not href.startswith('data:image') or 'base64,' not in href:
-                continue
-            try:
-                import base64
-                raw = base64.b64decode(href.split('base64,', 1)[1])
-                image = pygame.image.load(io.BytesIO(raw))
-            except Exception:
-                continue
-            matrix = _svg_mul(self._svg_matrix_at(text, match.start()),
-                              _svg_transform(_svg_attr(attrs, 'transform')))
-            width = _sc_num(_svg_attr(attrs, 'width', '0'))
-            height = _sc_num(_svg_attr(attrs, 'height', '0'))
-            if width <= 0 or height <= 0:
-                width, height = float(image.get_width()), float(image.get_height())
-            scale = math.hypot(matrix[0], matrix[1]) or 1.0
-            angle = -math.degrees(math.atan2(matrix[1], matrix[0]))
-            drawn = pygame.transform.rotozoom(image, angle, scale)
-            offset_x = _sc_num(_svg_attr(attrs, 'x', '0'))
-            offset_y = _sc_num(_svg_attr(attrs, 'y', '0'))
-            center_x, center_y = _svg_point(matrix, offset_x + width / 2,
-                                            offset_y + height / 2)
-            surface.blit(drawn, drawn.get_rect(center=(int(center_x), int(center_y))))
+            href_match = href_re.search(attrs)
+            if href_match is None:
+                image_hrefs.append('')
+                return '<image%s>' % attrs
+            image_hrefs.append(href_match.group(1))
+            return '<image%s>' % (attrs[:href_match.start()] +
+                                  attrs[href_match.end():])
 
-        # 形状
-        shape_re = r'<(rect|circle|ellipse|line|polygon|polyline|path)\b([^>]*?)/?>'
-        for match in re.finditer(shape_re, text):
-            kind, attrs = match.group(1), match.group(2)
-            base_fill, base_stroke, base_width, _size = self._svg_style_at(
-                text, match.start(), default_style)
-            fill = _svg_resolve_paint(_svg_attr(attrs, 'fill', base_fill), gradients)
-            stroke = _svg_resolve_paint(_svg_attr(attrs, 'stroke', base_stroke), gradients)
-            stroke_width_value = _sc_num(_svg_attr(attrs, 'stroke-width', base_width))
-            if stroke_width_value <= 0:
-                stroke = None
-            stroke_width = max(1, int(stroke_width_value))
-            matrix = _svg_mul(self._svg_matrix_at(text, match.start()),
-                              _svg_transform(_svg_attr(attrs, 'transform')))
-            points = []
-            try:
-                if kind == 'rect':
-                    rx = _sc_num(_svg_attr(attrs, 'x', '0'))
-                    ry = _sc_num(_svg_attr(attrs, 'y', '0'))
-                    rw = _sc_num(_svg_attr(attrs, 'width', '0'))
-                    rh = _sc_num(_svg_attr(attrs, 'height', '0'))
-                    points = [_svg_point(matrix, rx, ry),
-                              _svg_point(matrix, rx + rw, ry),
-                              _svg_point(matrix, rx + rw, ry + rh),
-                              _svg_point(matrix, rx, ry + rh)]
-                elif kind == 'circle':
-                    cx = _sc_num(_svg_attr(attrs, 'cx', '0'))
-                    cy = _sc_num(_svg_attr(attrs, 'cy', '0'))
-                    radius = _sc_num(_svg_attr(attrs, 'r', '0'))
-                    center = _svg_point(matrix, cx, cy)
-                    points = [(center[0] - radius * abs(matrix[0]),
-                               center[1] - radius * abs(matrix[3])),
-                              (center[0] + radius * abs(matrix[0]),
-                               center[1] + radius * abs(matrix[3]))]
-                elif kind == 'ellipse':
-                    cx = _sc_num(_svg_attr(attrs, 'cx', '0'))
-                    cy = _sc_num(_svg_attr(attrs, 'cy', '0'))
-                    rx = _sc_num(_svg_attr(attrs, 'rx', '0'))
-                    ry = _sc_num(_svg_attr(attrs, 'ry', '0'))
-                    center = _svg_point(matrix, cx, cy)
-                    points = [(center[0] - rx, center[1] - ry),
-                              (center[0] + rx, center[1] + ry)]
-                elif kind == 'line':
-                    points = [
-                        _svg_point(matrix, _sc_num(_svg_attr(attrs, 'x1', '0')),
-                                   _sc_num(_svg_attr(attrs, 'y1', '0'))),
-                        _svg_point(matrix, _sc_num(_svg_attr(attrs, 'x2', '0')),
-                                   _sc_num(_svg_attr(attrs, 'y2', '0'))),
-                    ]
-                elif kind in ('polygon', 'polyline'):
-                    values = [_sc_num(item) for item in
-                              re.split(r'[ ,]+', _svg_attr(attrs, 'points').strip())
-                              if item]
-                    points = [_svg_point(matrix, values[i], values[i + 1])
-                              for i in range(0, len(values) - 1, 2)]
-                elif kind == 'path':
-                    points = [_svg_point(matrix, px, py)
-                              for px, py in _svg_path_points(_svg_attr(attrs, 'd'))]
-            except (ValueError, IndexError):
-                continue
-            if not points:
-                continue
-            if kind in ('circle', 'ellipse') and len(points) == 2:
-                left, size = points[0], (points[1][0] - points[0][0],
-                                         points[1][1] - points[0][1])
-                rect = pygame.Rect(int(left[0]), int(left[1]),
-                                   int(size[0]), int(size[1]))
-                if fill:
-                    pygame.draw.ellipse(surface, fill, rect)
-                if stroke:
-                    pygame.draw.ellipse(surface, stroke, rect, stroke_width)
-                continue
-            if len(points) >= 2:
-                if fill and len(points) >= 3:
-                    pygame.draw.polygon(surface, fill, [(int(px), int(py))
-                                                        for px, py in points])
-                if stroke:
-                    pygame.draw.lines(surface, stroke, kind == 'polygon',
-                                      [(int(px), int(py)) for px, py in points],
-                                      stroke_width)
+        try:
+            masked_text = image_re.sub(mask_image, text)
+        except Exception:
+            masked_text = text
 
-        # 文本最后绘制，避免被前面的背景形状遮住
-        for match in re.finditer(r'<text\b([^>]*)>(.*?)</text>', text, re.S):
-            attrs, inner = match.group(1), match.group(2)
-            base_fill, _stroke, _width, base_size = self._svg_style_at(
-                text, match.start(), default_style)
-            fill = _svg_resolve_paint(_svg_attr(attrs, 'fill', base_fill), gradients)
-            if fill is None:
+        gradients = self._svg_parse_gradients(masked_text)
+        body = re.sub(r'<defs\b.*?</defs>', '', masked_text, flags=re.S)
+        body = re.sub(r'<(linearGradient|radialGradient)\b.*?</\1>', '',
+                      body, flags=re.S)
+
+        token_re = re.compile(
+            r'<(/?)(g|rect|circle|ellipse|line|polygon|polyline|path|'
+            r'text|image)\b([^>]*?)(/?)>', re.S)
+        style_stack = [self._svg_default_style()]
+        matrix_stack = [(1.0, 0.0, 0.0, 1.0, 0.0, 0.0)]
+        records = []
+        image_index = 0
+        position = 0
+        while True:
+            match = token_re.search(body, position)
+            if match is None:
+                break
+            closing, tag, attrs, self_closing = match.groups()
+            position = match.end()
+            # 一次解析属性：内嵌位图的 base64 属性可达数百 KB，
+            # 逐属性 search 会把整段字符串反复扫描多遍
+            attr_map = _svg_parse_attrs(attrs)
+            if tag == 'g':
+                if closing:
+                    if len(style_stack) > 1:
+                        style_stack.pop()
+                        matrix_stack.pop()
+                elif not self_closing:
+                    style_stack.append(
+                        self._svg_child_style(style_stack[-1], attr_map))
+                    matrix_stack.append(_svg_mul(
+                        matrix_stack[-1],
+                        _svg_transform(_svg_get(attr_map, 'transform') or '')))
                 continue
-            matrix = _svg_mul(self._svg_matrix_at(text, match.start()),
-                              _svg_transform(_svg_attr(attrs, 'transform')))
-            size = _sc_num(_svg_attr(attrs, 'font-size', base_size)) or 16
-            scale = abs(matrix[0]) or 1.0
-            font_size = max(1, int(round(size * scale)))
-            font = self._font(font_size)
-            contents = re.findall(r'<tspan[^>]*>(.*?)</tspan>', inner, re.S)
-            label = (contents[0] if contents else inner)
-            label = re.sub(r'<[^>]+>', '', label).strip()
-            if not label:
+            if closing:
                 continue
-            rendered = font.render(label, True, fill)
-            x, y = matrix[4], matrix[5]
-            anchor = _svg_attr(attrs, 'text-anchor')
-            if anchor == 'middle':
-                x -= rendered.get_width() / 2
-            elif anchor == 'end':
-                x -= rendered.get_width()
-            surface.blit(rendered, (int(x), int(y - font.get_ascent())))
+            style = self._svg_child_style(style_stack[-1], attr_map)
+            matrix = _svg_mul(
+                scale_matrix,
+                _svg_mul(matrix_stack[-1],
+                         _svg_transform(_svg_get(attr_map, 'transform') or '')))
+            if tag == 'image':
+                if image_index < len(image_hrefs):
+                    attr_map['__href'] = image_hrefs[image_index]
+                image_index += 1
+            if tag == 'text':
+                end = body.find('</text>', match.end())
+                if end < 0:
+                    continue
+                inner = body[match.end():end]
+                position = end + len('</text>')
+                records.append(('text', attr_map, style, matrix, inner))
+            else:
+                records.append((tag, attr_map, style, matrix, ''))
+
+        # 先画形状/位图，再画文本（与 Scratch SVG 的常见层级一致）
+        for record in records:
+            if record[0] != 'text':
+                self._svg_draw_record(surface, record, gradients)
+        for record in records:
+            if record[0] == 'text':
+                self._svg_draw_record(surface, record, gradients)
         try:
             return surface.convert_alpha()
         except Exception:

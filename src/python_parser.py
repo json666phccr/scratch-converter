@@ -53,6 +53,9 @@ class PythonParser:
         self.in_event_handler: bool = False
         self._procedure_args: Dict[str, str] = {}
         self._procedure_meta: Dict[str, Dict] = {}
+        # 模块级 GLOBALS（全局变量/列表的初始值）与当前类声明的 GLOBAL_NAMES
+        self._global_values: Dict[str, Any] = {}
+        self._defined_procedures: Set[str] = set()
 
     def parse_code(self, code: str, sprite_name: str = "Sprite") -> SpriteIR:
         """解析Python代码为SpriteIR"""
@@ -60,12 +63,25 @@ class PythonParser:
         self.sprite = SpriteIR(name=sprite_name)
         self.local_vars = {}
         self._procedure_meta = {}
+        self._defined_procedures = set()
+        self._global_values = {}
 
         try:
             tree = ast.parse(code)
         except SyntaxError as e:
             print(f"Python语法错误: {e}")
             return self.sprite
+
+        # 生成代码把舞台全局变量/列表放在模块级 GLOBALS 里；
+        # 反向解析必须恢复这份信息，否则 self.results.clear() 会被当成自制积木。
+        for node in ast.iter_child_nodes(tree):
+            if isinstance(node, ast.Assign) \
+                    and len(node.targets) == 1 \
+                    and isinstance(node.targets[0], ast.Name) \
+                    and node.targets[0].id == 'GLOBALS':
+                value = self._eval_expr(node.value)
+                if isinstance(value, dict):
+                    self._global_values = value
 
         classes = [node for node in ast.iter_child_nodes(tree)
                    if isinstance(node, ast.ClassDef)]
@@ -178,6 +194,33 @@ class PythonParser:
                 break
 
         self._condition_hats = {}
+        # 先扫描类属性 GLOBAL_NAMES 与自制积木名：
+        # 事件处理函数可能写在自制积木定义之前，需要提前知道哪些方法真实存在。
+        global_names = ()
+        for item in node.body:
+            if isinstance(item, ast.Assign) \
+                    and len(item.targets) == 1 \
+                    and isinstance(item.targets[0], ast.Name) \
+                    and item.targets[0].id == 'GLOBAL_NAMES':
+                value = self._eval_expr(item.value)
+                if isinstance(value, (list, tuple, set)):
+                    global_names = tuple(str(entry) for entry in value)
+            elif isinstance(item, ast.FunctionDef):
+                if not item.name.startswith('_') \
+                        and item.name not in ('__init__', 'run') \
+                        and not item.name.startswith('when_') \
+                        and item.name not in self.KNOWN_METHODS:
+                    self._defined_procedures.add(item.name)
+        for name in global_names:
+            if isinstance(self._global_values.get(name), list):
+                self.sprite.global_list_names.add(name)
+            else:
+                self.sprite.global_variable_names.add(name)
+        self.sprite.global_values = {
+            name: self._global_values[name]
+            for name in global_names if name in self._global_values
+        }
+
         for item in node.body:
             if isinstance(item, ast.FunctionDef) and item.name == 'run':
                 self._collect_condition_hats(item)
@@ -201,7 +244,7 @@ class PythonParser:
         'x', 'y', 'direction', 'visible', 'size', 'costume', 'costume_number',
         'costume_name', 'volume', 'answer', 'mouse_x', 'mouse_y', 'mouse_down',
         'timer', 'loudness', 'days_since_2000', 'rotation_style',
-        'name', 'costumes', 'sounds',
+        'name', 'costumes', 'sounds', 'draggable', 'is_stage',
         '_running', '_clones',
     }
 
@@ -226,6 +269,9 @@ class PythonParser:
                             attr = target.id if hasattr(target, 'id') else target.attr
                             value = self._eval_expr(stmt.value)
                             if attr in self.INTERNAL_ATTRS or attr in self.BUILTIN_ATTRS:
+                                continue
+                            if attr in self.sprite.global_variable_names \
+                                    or attr in self.sprite.global_list_names:
                                 continue
                             if isinstance(value, (int, float)):
                                 self.sprite.variables[attr] = value
@@ -429,9 +475,11 @@ class PythonParser:
         return None
 
     def _list_name_from_node(self, node: ast.AST) -> Optional[str]:
-        """从 self.<list> 节点中取出列表名"""
+        """从 self.<list> 节点中取出列表名（局部列表或舞台全局列表）"""
         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) \
-                and node.value.id == 'self' and node.attr in self.sprite.lists:
+                and node.value.id == 'self' \
+                and (node.attr in self.sprite.lists
+                     or node.attr in self.sprite.global_list_names):
             return node.attr
         return None
 
@@ -775,8 +823,11 @@ class PythonParser:
             name = args[0] if args else 'list'
             return Statement(type=BlockType.HIDE_LIST, extra={'name': name})
 
-        # 自制积木调用
-        elif not func_name.startswith('_'):
+        # 自制积木调用（只有确实定义了同名自制积木才降级，避免 clear/append
+        # 这类列表方法因为作用域识别失败而变成不存在的自制积木）
+        elif not func_name.startswith('_') \
+                and (func_name in self._defined_procedures
+                     or func_name in self._procedure_meta):
             call_args = [self._parse_expr_to_ir(arg) for arg in call.args]
             return Statement(
                 type=BlockType.PROCEDURE_CALL,
@@ -954,20 +1005,6 @@ class PythonParser:
                 return make_string(node.value)
             return make_string(str(node.value))
 
-        elif isinstance(node, ast.Num):
-            return make_number(node.n)
-
-        elif isinstance(node, ast.Str):
-            return make_string(node.s)
-
-        elif isinstance(node, ast.NameConstant):
-            if node.value is True:
-                return make_boolean(True)
-            elif node.value is False:
-                return make_boolean(False)
-            elif node.value is None:
-                return make_string('None')
-
         elif isinstance(node, ast.Name):
             if node.id == 'self':
                 return make_variable('self')
@@ -977,9 +1014,11 @@ class PythonParser:
 
         elif isinstance(node, ast.Attribute):
             if isinstance(node.value, ast.Name) and node.value.id == 'self':
-                if node.attr in self.sprite.lists:
+                if node.attr in self.sprite.lists \
+                        or node.attr in self.sprite.global_list_names:
                     return Expr(ExprType.LIST_ACCESS, name=node.attr)
-                if node.attr in self.sprite.variables:
+                if node.attr in self.sprite.variables \
+                        or node.attr in self.sprite.global_variable_names:
                     return make_variable(node.attr)
                 if node.attr == 'backdrop_number':
                     return make_property('_sprite_', 'backdrop #')
@@ -1238,7 +1277,9 @@ class PythonParser:
             # 自制积木作为表达式（TurboWarp自定义reporter）
             if isinstance(node.func, ast.Attribute) \
                     and isinstance(node.func.value, ast.Name) \
-                    and node.func.value.id == 'self':
+                    and node.func.value.id == 'self' \
+                    and (func_name in self._defined_procedures
+                         or func_name in self._procedure_meta):
                 meta = dict(self._procedure_meta.get(func_name, {}))
                 return Expr(ExprType.PROCEDURE_CALL, name=func_name,
                             args=args, extra=meta)
@@ -1294,14 +1335,13 @@ class PythonParser:
         """求值Python AST表达式为Python值"""
         if isinstance(node, ast.Constant):
             return node.value
-        elif isinstance(node, ast.Num):
-            return node.n
-        elif isinstance(node, ast.Str):
-            return node.s
-        elif isinstance(node, ast.NameConstant):
-            return node.value
-        elif isinstance(node, ast.List):
+        elif isinstance(node, (ast.List, ast.Tuple, ast.Set)):
             return [self._eval_expr(e) for e in node.elts]
+        elif isinstance(node, ast.Dict):
+            result = {}
+            for key, value in zip(node.keys, node.values):
+                result[self._eval_expr(key)] = self._eval_expr(value)
+            return result
         elif isinstance(node, ast.Name):
             return node.id
         return None

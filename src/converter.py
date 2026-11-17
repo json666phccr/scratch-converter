@@ -28,15 +28,49 @@ from python_generator import generate_python, save_python, generate_modules
 from python_parser import (parse_python_code, parse_python_file,
                            python_to_project, PythonParser)
 from general_python import parse_general_project
+from convert_log import LOG
 
-__version__ = "0.9.20"
+__version__ = "0.9.25"
+
+
+def _count_statements(project: ProjectIR) -> int:
+    """统计 IR 中的语句总数（含嵌套子栈），用于日志中的中间状态"""
+    total = 0
+    stack = []
+    for sprite in project.sprites:
+        stack.extend(sprite.statements)
+    while stack:
+        stmt = stack.pop()
+        total += 1
+        stack.extend(stmt.body)
+        stack.extend(stmt.else_body)
+        if stmt.next is not None:
+            stack.append(stmt.next)
+    return total
+
+
+def _log_project(project: ProjectIR):
+    """输出项目 IR 的摘要，便于定位转换中间状态"""
+    LOG.debug('精灵: %d 个（舞台: %s）'
+              % (len(project.sprites),
+                 project.stage.name if project.stage else '无'))
+    LOG.debug('语句: %d 条，转换告警: %d 种，监视器: %d 个'
+              % (_count_statements(project), len(project.warnings),
+                 len(project.monitors)))
+    if project.extensions:
+        LOG.debug('扩展: %s' % ', '.join(sorted(project.extensions)))
+    for sprite in project.sprites:
+        LOG.debug('  - %s: 变量 %d，列表 %d，顶层脚本 %d'
+                  % (sprite.name, len(sprite.variables), len(sprite.lists),
+                     len(sprite.statements)))
+
 
 
 class ScratchConverter:
     """Scratch 3.0 双向转换器"""
 
     def scratch_to_python(self, sb3_path: str, py_path: Optional[str] = None,
-                          split: bool = False) -> str:
+                          split: bool = False, bundle: bool = False) -> str:
         """
         将Scratch项目(.sb3)转换为Python代码
 
@@ -44,17 +78,32 @@ class ScratchConverter:
             sb3_path: .sb3文件路径
             py_path: 输出.py文件路径(可选)
             split: 是否生成模块化多文件（入口 + 运行时 + 每个角色一个模块）
+            bundle: 是否生成独立项目文件夹（<项目名>/<项目名>.py + assets），
+                    避免同一目录下多个项目的素材互相覆盖
 
         Returns:
             生成的Python代码字符串（split 时为入口文件内容）
         """
         print(f"[Scratch -> Python] 正在转换: {sb3_path}")
+        LOG.debug('输入文件: %s' % os.path.abspath(sb3_path))
+
+        output_path = py_path
+        project_dir = None
+        if py_path and bundle:
+            project_dir, output_path = self._bundle_paths(py_path)
 
         # 1. 读取sb3文件（ZIP格式）
-        project_data = self._read_sb3(sb3_path)
+        with LOG.stage('读取项目'):
+            project_data = self._read_sb3(sb3_path)
+        LOG.debug('project.json: targets=%d, monitors=%d, extensions=%d'
+                  % (len(project_data.get('targets') or []),
+                     len(project_data.get('monitors') or []),
+                     len(project_data.get('extensions') or [])))
 
         # 2. 解析为IR
-        ir = parse_scratch_project(project_data)
+        with LOG.stage('解析为 IR'):
+            ir = parse_scratch_project(project_data)
+            _log_project(ir)
         print(f"  解析完成: {len(ir.sprites)} 个精灵")
         if ir.warnings:
             print("  [转换报告] 暂未支持的积木:")
@@ -64,27 +113,38 @@ class ScratchConverter:
             print(f"  TurboWarp高级选项: {ir.runtime_options}")
 
         # 3. 生成Python代码
-        if split:
-            stem = (os.path.splitext(os.path.basename(py_path))[0]
-                    if py_path else 'scratch')
-            python_code, extra_files = generate_modules(ir, stem)
-            if py_path:
-                base_dir = os.path.dirname(os.path.abspath(py_path))
-                for name, code in extra_files.items():
-                    with open(os.path.join(base_dir, name), 'w', encoding='utf-8') as f:
-                        f.write(code)
-        else:
-            python_code = generate_python(ir)
+        with LOG.stage('生成 Python'):
+            if split:
+                stem = (os.path.splitext(os.path.basename(output_path))[0]
+                        if output_path else 'scratch')
+                python_code, extra_files = generate_modules(ir, stem)
+                LOG.debug('模块: %s'
+                          % ', '.join(sorted(extra_files)))
+            else:
+                python_code = generate_python(ir)
+        LOG.debug('生成代码: %d 行' % len(python_code.splitlines()))
 
         # 4. 保存到文件
-        if py_path:
-            with open(py_path, 'w', encoding='utf-8') as f:
-                f.write(python_code)
-            print(f"  Python代码已保存: {py_path}")
+        if output_path:
+            if project_dir:
+                os.makedirs(project_dir, exist_ok=True)
+            with LOG.stage('写入输出'):
+                if split:
+                    base_dir = os.path.dirname(os.path.abspath(output_path))
+                    for name, code in extra_files.items():
+                        with open(os.path.join(base_dir, name), 'w',
+                                  encoding='utf-8') as f:
+                            f.write(code)
+                with open(output_path, 'w', encoding='utf-8') as f:
+                    f.write(python_code)
+            print(f"  Python代码已保存: {output_path}")
+            if project_dir:
+                print(f"  项目文件夹: {project_dir}")
             if split:
                 print(f"  模块化输出: 另生成 {len(extra_files)} 个模块文件（运行时 + 角色）")
             # 提取造型/声音资源，供pygame运行时加载
-            self._extract_assets(sb3_path, py_path)
+            with LOG.stage('导出素材'):
+                self._extract_assets(sb3_path, output_path)
 
         total_lines = len(python_code.splitlines())
         if split:
@@ -93,6 +153,21 @@ class ScratchConverter:
         if not split and total_lines > 3000:
             print("  [提示] 代码较长，可使用 --split 生成模块化多文件，便于阅读和调试")
         return python_code
+
+    @staticmethod
+    def _bundle_paths(py_path: str):
+        """返回 (项目文件夹, 入口脚本路径)
+
+        例如 out/game.py -> out/game/game.py；
+        如果输出已经在 out/game/game.py，则沿用该文件夹，避免重复嵌套。
+        """
+        parent = os.path.dirname(os.path.abspath(py_path))
+        stem = os.path.splitext(os.path.basename(py_path))[0] or 'scratch'
+        if os.path.basename(parent) == stem:
+            project_dir = parent
+        else:
+            project_dir = os.path.join(parent, stem)
+        return project_dir, os.path.join(project_dir, stem + '.py')
 
     @staticmethod
     def _parse_dsl_project(code: str):
@@ -119,6 +194,15 @@ class ScratchConverter:
             if name == 'Stage':
                 sprite.is_stage = True
                 sprite.variables.pop('is_stage', None)
+                # 舞台全局变量/列表只在模块级 GLOBALS 中出现，
+                # 这里把它们补回舞台，角色侧只保留引用关系。
+                for global_name, global_value in sprite.global_values.items():
+                    if isinstance(global_value, list):
+                        sprite.lists.setdefault(
+                            global_name, list(global_value))
+                    else:
+                        sprite.variables.setdefault(
+                            global_name, global_value)
             project.add_sprite(sprite)
         return project
 
@@ -147,22 +231,27 @@ class ScratchConverter:
             Scratch项目JSON字典
         """
         print(f"[Python -> Scratch] 正在转换: {py_path}")
+        LOG.debug('输入文件: %s' % os.path.abspath(py_path))
 
-        with open(py_path, 'r', encoding='utf-8') as f:
-            code = f.read()
+        with LOG.stage('读取 Python'):
+            with open(py_path, 'r', encoding='utf-8') as f:
+                code = f.read()
         if mode == 'auto':
             mode = self._detect_python_mode(code)
         if mode not in ('dsl', 'general'):
             raise ValueError(f"未知转换模式: {mode}")
+        LOG.debug('输入 %d 行，模式: %s' % (len(code.splitlines()), mode))
 
         # 1. 解析Python代码为IR
-        if mode == 'general':
-            sprite_name = os.path.splitext(os.path.basename(py_path))[0] or 'Python'
-            project = parse_general_project(code, sprite_name)
-            print(f"  解析模式: 通用Python（实验性）")
-        else:
-            project = self._parse_dsl_project(code)
-            print(f"  解析模式: Scratch DSL")
+        with LOG.stage('解析 Python'):
+            if mode == 'general':
+                sprite_name = os.path.splitext(os.path.basename(py_path))[0] or 'Python'
+                project = parse_general_project(code, sprite_name)
+                print(f"  解析模式: 通用Python（实验性）")
+            else:
+                project = self._parse_dsl_project(code)
+                print(f"  解析模式: Scratch DSL")
+            _log_project(project)
         sprite = next((item for item in project.sprites if not item.is_stage),
                       project.sprites[0])
         print(f"  解析完成: 精灵 '{sprite.name}'")
@@ -172,11 +261,17 @@ class ScratchConverter:
             print(f"  转换报告（以下特性未完整支持）: {summary}")
 
         # 2. 转换为Scratch JSON
-        scratch_json = write_scratch_project(project)
+        with LOG.stage('生成 Scratch 项目'):
+            scratch_json = write_scratch_project(project)
+        LOG.debug('targets=%d, blocks=%d'
+                  % (len(scratch_json.get('targets') or []),
+                     sum(len(target.get('blocks') or {})
+                         for target in scratch_json.get('targets') or [])))
 
         # 3. 保存到文件
         if sb3_path:
-            self._write_sb3(scratch_json, sb3_path, project.assets)
+            with LOG.stage('写入 sb3'):
+                self._write_sb3(scratch_json, sb3_path, project.assets)
             print(f"  Scratch项目已保存: {sb3_path}")
 
         print(f"[转换完成] Scratch项目（{mode} 模式）")
@@ -318,36 +413,98 @@ class ScratchConverter:
                 zf.writestr(name, data)
 
 
+def _extract_log_args(args):
+    """从命令行参数中提取日志选项，返回 (剩余参数, 级别, 日志文件)"""
+    level = None
+    log_file = None
+    rest = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in ('--log-level', '--log-file', '--log') and index + 1 < len(args):
+            if arg == '--log-level':
+                level = args[index + 1]
+            else:
+                log_file = args[index + 1]
+            index += 2
+            continue
+        if arg.startswith('--log-level='):
+            level = arg.split('=', 1)[1]
+        elif arg.startswith('--log-file=') or arg.startswith('--log='):
+            log_file = arg.split('=', 1)[1]
+        elif arg in ('-v', '--verbose'):
+            level = 'debug'
+        elif arg == '--quiet':
+            level = 'quiet'
+        else:
+            rest.append(arg)
+        index += 1
+    return rest, level, log_file
+
+
 def main():
     """命令行入口"""
     converter = ScratchConverter()
+    args, log_level, log_file = _extract_log_args(sys.argv[1:])
+    try:
+        LOG.configure(level=log_level, path=log_file,
+                      timestamps=bool(log_file))
+    except ValueError as error:
+        print(error)
+        sys.exit(1)
 
-    if len(sys.argv) < 2:
+    try:
+        _dispatch(converter, args)
+    except KeyboardInterrupt:
+        raise
+    except Exception as error:
+        LOG.exception(error, '转换失败: %s: %s'
+                      % (type(error).__name__, error))
+        if not LOG.debug_enabled:
+            LOG.error('可加 -v 查看完整调用栈')
+        sys.exit(2)
+    finally:
+        LOG.close()
+
+
+def _dispatch(converter, args):
+    """按子命令执行转换"""
+    if not args:
         print("Scratch 3.0 <-> Python 双向转换器")
         print()
         print("用法:")
-        print("  python converter.py scratch2py <input.sb3> [output.py] [--split]")
+        print("  python converter.py scratch2py <input.sb3> [output.py] [--split] [--no-bundle]")
         print("  python converter.py py2scratch <input.py> [output.sb3] [--mode dsl|general|auto]")
         print("  python converter.py roundtrip-sb3 <input.sb3> [output.sb3]")
         print("  python converter.py roundtrip-py <input.py> [output.py]")
         print("  python converter.py demo")
+        print()
+        print("日志选项（可放在任意位置）:")
+        print("  -v, --verbose        输出详细转换日志")
+        print("  --quiet              只输出错误")
+        print("  --log-level LEVEL    debug/info/warning/error/quiet")
+        print("  --log-file FILE      把日志写入文件（含时间戳）")
         sys.exit(1)
 
-    command = sys.argv[1]
+    command = args[0]
 
     if command == 'scratch2py':
-        args = sys.argv[2:]
+        args = args[1:]
         split = '--split' in args
-        args = [item for item in args if item != '--split']
+        bundle = '--no-bundle' not in args
+        args = [item for item in args
+                if item not in ('--split', '--bundle', '--no-bundle')]
         if not args:
-            print("用法: python converter.py scratch2py <input.sb3> [output.py] [--split]")
+            print("用法: python converter.py scratch2py <input.sb3> [output.py] "
+                  "[--split] [--no-bundle]")
             sys.exit(1)
         input_path = args[0]
         output_path = args[1] if len(args) > 1 else input_path.replace('.sb3', '.py').replace('.json', '.py')
-        converter.scratch_to_python(input_path, output_path, split=split)
+        converter.scratch_to_python(input_path, output_path, split=split,
+                                    bundle=bundle)
 
     elif command == 'py2scratch':
-        args = sys.argv[2:]
+        args = args[1:]
         mode = 'auto'
         if '--mode' in args:
             index = args.index('--mode')
@@ -362,19 +519,19 @@ def main():
         converter.python_to_scratch(input_path, output_path, mode)
 
     elif command == 'roundtrip-sb3':
-        if len(sys.argv) < 3:
+        if len(args) < 2:
             print("用法: python converter.py roundtrip-sb3 <input.sb3> [output.sb3]")
             sys.exit(1)
-        input_path = sys.argv[2]
-        output_path = sys.argv[3] if len(sys.argv) > 3 else input_path.replace('.sb3', '_roundtrip.sb3')
+        input_path = args[1]
+        output_path = args[2] if len(args) > 2 else input_path.replace('.sb3', '_roundtrip.sb3')
         converter.roundtrip_scratch(input_path, output_path)
 
     elif command == 'roundtrip-py':
-        if len(sys.argv) < 3:
+        if len(args) < 2:
             print("用法: python converter.py roundtrip-py <input.py> [output.py]")
             sys.exit(1)
-        input_path = sys.argv[2]
-        output_path = sys.argv[3] if len(sys.argv) > 3 else input_path.replace('.py', '_roundtrip.py')
+        input_path = args[1]
+        output_path = args[2] if len(args) > 2 else input_path.replace('.py', '_roundtrip.py')
         converter.roundtrip_python(input_path, output_path)
 
     elif command == 'demo':

@@ -19,7 +19,20 @@ from ir import (
 )
 from runtime_code import (
     RUNTIME_HELPERS, RUNTIME_EXTENSIONS, RUNTIME_CLASS, SPRITE_BASE,
+    assemble_extensions, extension_registrations_source,
 )
+
+
+def _walk_container(value, walk_expr, seen):
+    """遍历 extra/inputs 里嵌套的表达式容器"""
+    if isinstance(value, Expr):
+        walk_expr(value)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                _walk_container(item[1], walk_expr, seen)
+            else:
+                _walk_container(item, walk_expr, seen)
 
 
 class PythonGenerator:
@@ -38,6 +51,10 @@ class PythonGenerator:
         self.procedure_names: Dict[str, str] = {}
         self.stage_globals: Dict[str, object] = {}
         self.global_names: Set[str] = set()
+        # 按需拼装的扩展源码与注册表
+        self.ext_source = ''
+        self.ext_registrations: Dict[str, str] = {}
+        self.used_extensions: Set[str] = set()
 
     def _prepare_globals(self, project: ProjectIR):
         """收集舞台上的全局变量/列表（单文件与多文件输出共用）"""
@@ -57,9 +74,63 @@ class PythonGenerator:
                 self.stage_globals[attr] = list(items)
         self.global_names = set(self.stage_globals)
 
+    def _prepare_extensions(self, project: ProjectIR):
+        """按项目实际使用的扩展拼装运行时扩展源码"""
+        used, has_hat = self._collect_extensions(project)
+        self.used_extensions = used
+        extra = ('_ext_frame_hat_action',) if has_hat else ()
+        self.ext_source, self.ext_registrations, _included = \
+            assemble_extensions(used, extra_roots=extra)
+
+    @staticmethod
+    def _collect_extensions(project: ProjectIR):
+        """收集项目声明/实际用到的扩展命名空间，以及是否存在扩展帽子"""
+        used = {str(item).lower() for item in (project.extensions or ())}
+        seen = set()
+        has_hat = [False]
+
+        def walk_expr(expr):
+            if expr is None or id(expr) in seen:
+                return
+            seen.add(id(expr))
+            if expr.type == ExprType.EXTENSION_CALL:
+                used.add(str(expr.extra.get('namespace') or '').lower())
+            for child in (expr.left, expr.right):
+                walk_expr(child)
+            for child in list(expr.children) + list(expr.args):
+                walk_expr(child)
+            for value in (expr.extra or {}).values():
+                _walk_container(value, walk_expr, seen)
+
+        def walk_stmt(stmt):
+            if stmt is None or id(stmt) in seen:
+                return
+            seen.add(id(stmt))
+            if stmt.type == BlockType.EXTENSION_HAT:
+                has_hat[0] = True
+                used.add(str(stmt.extra.get('namespace') or '').lower())
+            elif stmt.type == BlockType.EXTENSION:
+                used.add(str(stmt.extra.get('namespace') or '').lower())
+            walk_expr(stmt.value)
+            walk_expr(stmt.condition)
+            for value in (stmt.extra or {}).values():
+                _walk_container(value, walk_expr, seen)
+            for child in stmt.body:
+                walk_stmt(child)
+            for child in stmt.else_body:
+                walk_stmt(child)
+            walk_stmt(stmt.next)
+
+        for sprite in project.sprites:
+            for stmt in sprite.statements:
+                walk_stmt(stmt)
+        used.discard('')
+        return used, has_hat[0]
+
     def generate_project(self, project: ProjectIR) -> str:
         """生成整个项目的Python代码"""
         self._prepare_globals(project)
+        self._prepare_extensions(project)
 
         lines = []
         lines.append("# -*- coding: utf-8 -*-")
@@ -121,6 +192,7 @@ class PythonGenerator:
         - <prefix>_sprite_NN_*.py  每个角色一个模块
         """
         self._prepare_globals(project)
+        self._prepare_extensions(project)
         prefix = sanitize_name(prefix, 'scratch') or 'scratch'
         header = [
             "# -*- coding: utf-8 -*-",
@@ -209,7 +281,8 @@ class PythonGenerator:
         """生成复刻Scratch类型转换与运算语义的模块级辅助函数"""
         lines = self.RUNTIME_HELPERS.strip('\n').splitlines()
         lines.append("")
-        lines.extend(self.RUNTIME_EXTENSIONS.strip('\n').splitlines())
+        if self.ext_source:
+            lines.extend(self.ext_source.strip('\n').splitlines())
         return lines
 
     def _generate_runtime_constants(self, project: ProjectIR) -> List[str]:
@@ -234,6 +307,7 @@ class PythonGenerator:
         lines.append(f"STAGE_COSTUME = {stage_costume!r}")
         lines.append(f"BACKDROPS = {backdrops!r}")
         lines.append(f"GLOBALS = {self.stage_globals!r}")
+        lines.append(extension_registrations_source(self.ext_registrations))
         lines.append("")
 
         def monitor_attr(owner, name, kind):
@@ -271,6 +345,13 @@ class PythonGenerator:
                 })
             else:
                 name = str(params.get('VARIABLE', ''))
+                mode = str(monitor.get('mode') or 'default').lower()
+                if mode == 'slider':
+                    width = monitor.get('width') or 160
+                    height = monitor.get('height') or 46
+                else:
+                    width = monitor.get('width') or 120
+                    height = monitor.get('height') or 20
                 monitors.append({
                     'kind': 'var', 'name': name,
                     'sprite': owner,
@@ -279,8 +360,11 @@ class PythonGenerator:
                              else f"{owner}: {name}",
                     'attr': monitor_attr(owner, name, 'var'),
                     'x': monitor.get('x', 0), 'y': monitor.get('y', 0),
-                    'width': monitor.get('width') or 120,
-                    'height': monitor.get('height') or 20,
+                    'width': width, 'height': height,
+                    'mode': mode,
+                    'slider_min': monitor.get('sliderMin', 0),
+                    'slider_max': monitor.get('sliderMax', 100),
+                    'discrete': bool(monitor.get('isDiscrete', True)),
                 })
         lines.append(f"MONITORS = {monitors!r}")
         lines.append("")

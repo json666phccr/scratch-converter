@@ -3,7 +3,7 @@
 
 HELPERS = r'''
 _SCRATCH_LIST_LIMIT = 200000
-_RUNTIME_VERSION = '0.9.20'
+_RUNTIME_VERSION = '0.9.25'
 
 
 class _FairLock:
@@ -567,6 +567,11 @@ def _svg_attr(tag, name, default=''):
     return match.group(1) if match else default
 
 
+def _svg_parse_attrs(text):
+    """一次扫描解析标签属性，避免对超大的 base64 属性反复 search"""
+    return dict(re.findall(r'([\w:-]+)\s*=\s*"([^"]*)"', text or ''))
+
+
 def _svg_mul(first, second):
     a1, b1, c1, d1, e1, f1 = first
     a2, b2, c2, d2, e2, f2 = second
@@ -710,33 +715,121 @@ def _svg_path_points(data):
 
 
 def _svg_color(value, default=None):
-    if not value or value == 'none':
+    """解析SVG颜色，返回 (r, g, b, a)
+
+    支持 #rgb/#rgba/#rrggbb/#rrggbbaa、rgb()/rgba()、transparent、
+    常见颜色名与 Scratch 的整数颜色。
+    """
+    if value is None or value == '' or value == 'none':
         return None
-    text = _sc_str(value).strip()
+    text = _sc_str(value).strip().lower()
+    if text == 'transparent':
+        return (0, 0, 0, 0)
     if text.startswith('#'):
         digits = text[1:]
         try:
             if len(digits) == 3:
+                return tuple(int(ch * 2, 16) for ch in digits) + (255,)
+            if len(digits) == 4:
                 return tuple(int(ch * 2, 16) for ch in digits)
-            if len(digits) >= 6:
-                return (int(digits[0:2], 16), int(digits[2:4], 16), int(digits[4:6], 16))
+            if len(digits) == 6:
+                return (int(digits[0:2], 16), int(digits[2:4], 16),
+                        int(digits[4:6], 16), 255)
+            if len(digits) == 8:
+                return (int(digits[0:2], 16), int(digits[2:4], 16),
+                        int(digits[4:6], 16), int(digits[6:8], 16))
         except ValueError:
             return default
         return default
-    if text.startswith('rgb'):
+    if text.startswith('rgb') or text.startswith('rgba'):
         body = text[text.find('(') + 1:text.rfind(')')] if '(' in text else ''
-        parts = [part for part in body.replace(' ', '').split(',') if part]
+        parts = [part.strip() for part in body.replace('/', ',').split(',')
+                 if part.strip()]
         if len(parts) >= 3:
+            channels = []
             try:
-                return tuple(max(0, min(255, int(float(part)))) for part in parts[:3])
+                for part in parts[:3]:
+                    if part.endswith('%'):
+                        channels.append(int(round(float(part[:-1]) * 2.55)))
+                    else:
+                        channels.append(int(round(float(part))))
+                alpha = 255
+                if len(parts) >= 4:
+                    part = parts[3]
+                    value_alpha = float(part[:-1]) / 100.0 \
+                        if part.endswith('%') else float(part)
+                    alpha = int(round(max(0.0, min(1.0, value_alpha)) * 255))
+                return (max(0, min(255, channels[0])),
+                        max(0, min(255, channels[1])),
+                        max(0, min(255, channels[2])),
+                        max(0, min(255, alpha)))
             except ValueError:
                 return default
     named = {
-        'white': (255, 255, 255), 'black': (0, 0, 0), 'red': (255, 0, 0),
-        'green': (0, 128, 0), 'blue': (0, 0, 255), 'yellow': (255, 255, 0),
-        'gray': (128, 128, 128), 'grey': (128, 128, 128),
+        'white': (255, 255, 255, 255), 'black': (0, 0, 0, 255),
+        'red': (255, 0, 0, 255), 'green': (0, 128, 0, 255),
+        'lime': (0, 255, 0, 255), 'blue': (0, 0, 255, 255),
+        'yellow': (255, 255, 0, 255), 'orange': (255, 165, 0, 255),
+        'purple': (128, 0, 128, 255), 'pink': (255, 192, 203, 255),
+        'brown': (165, 42, 42, 255), 'cyan': (0, 255, 255, 255),
+        'magenta': (255, 0, 255, 255), 'gray': (128, 128, 128, 255),
+        'grey': (128, 128, 128, 255), 'silver': (192, 192, 192, 255),
+        'navy': (0, 0, 128, 255), 'teal': (0, 128, 128, 255),
+        'olive': (128, 128, 0, 255), 'maroon': (128, 0, 0, 255),
+        'gold': (255, 215, 0, 255), 'violet': (238, 130, 238, 255),
+        'indigo': (75, 0, 130, 255),
     }
-    return named.get(text.lower(), default)
+    if text in named:
+        return named[text]
+    try:
+        number = int(_sc_num(text))
+    except (ValueError, TypeError):
+        return default
+    return ((number >> 16) & 255, (number >> 8) & 255, number & 255, 255)
+
+
+def _svg_style_value(style_text, name, default=None):
+    """从 style="fill:#fff;opacity:0.5" 中取值"""
+    if not style_text:
+        return default
+    for part in style_text.split(';'):
+        if ':' not in part:
+            continue
+        key, value = part.split(':', 1)
+        if key.strip() == name:
+            return value.strip()
+    return default
+
+
+def _svg_prop(attrs, name, default=None):
+    """优先读元素属性，其次读 style 内联样式"""
+    value = _svg_attr(attrs, name, None)
+    if value is None:
+        value = _svg_style_value(_svg_attr(attrs, 'style', ''), name, None)
+    return default if value is None else value
+
+
+def _svg_get(attrs, name, default=None):
+    """元素属性读取：支持已解析的 dict 或原始标签字符串"""
+    if isinstance(attrs, dict):
+        value = attrs.get(name)
+        if value is None:
+            value = _svg_style_value(attrs.get('style'), name, None)
+        return default if value is None else value
+    return _svg_prop(attrs, name, default)
+
+
+def _svg_opacity(value, default=1.0):
+    """解析透明度：0~1 或百分比"""
+    if value is None or value == '':
+        return default
+    text = _sc_str(value).strip()
+    try:
+        number = float(text[:-1]) / 100.0 if text.endswith('%') \
+            else float(text)
+    except (ValueError, TypeError):
+        return default
+    return max(0.0, min(1.0, number))
 
 
 def _svg_resolve_paint(value, gradients):

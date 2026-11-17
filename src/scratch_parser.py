@@ -456,6 +456,7 @@ class ScratchParser:
             project.add_sprite(sprite)
 
         project.warnings = dict(self.unsupported)
+        project.extensions = set(self.extensions)
         return project
 
     def parse_sprite(self, data: Dict) -> SpriteIR:

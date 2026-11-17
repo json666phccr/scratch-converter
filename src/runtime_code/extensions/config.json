@@ -1,0 +1,99 @@
+{
+  "version": 1,
+  "core": [
+    "shared.py"
+  ],
+  "core_roots": [
+    "_hsv_to_rgb",
+    "_ext_color"
+  ],
+  "extensions": {
+    "pen": {
+      "handler": "_extension_pen",
+      "aliases": ["pen"],
+      "files": ["pen.py"]
+    },
+    "runtimeoptions": {
+      "handler": "_extension_runtimeoptions",
+      "aliases": ["runtimeoptions", "runtime-options", "turbowarp", "tw"],
+      "files": ["runtime_options.py"]
+    },
+    "music": {
+      "handler": "_extension_music",
+      "aliases": ["music"],
+      "files": ["music.py"]
+    },
+    "text2speech": {
+      "handler": "_extension_text2speech",
+      "aliases": ["text2speech", "speech"],
+      "files": ["text2speech.py"]
+    },
+    "stretch": {
+      "handler": "_extension_stretch",
+      "aliases": ["stretch"],
+      "files": ["stretch.py"]
+    },
+    "text": {
+      "handler": "_extension_text",
+      "aliases": ["text"],
+      "files": ["text.py"]
+    },
+    "skyhigh173json": {
+      "handler": "_extension_skyhigh_json",
+      "aliases": ["skyhigh173JSON", "skyhigh173json"],
+      "files": ["json_ext.py"]
+    },
+    "lmsclonesplus": {
+      "handler": "_extension_clones_plus",
+      "aliases": ["lmsclonesplus", "lmsClonesPlus"],
+      "files": ["clones_plus.py"]
+    },
+    "lmslooksplus": {
+      "handler": "_extension_looks_plus",
+      "aliases": ["lmsLooksPlus", "lmslooksplus"],
+      "files": ["looks_plus.py"]
+    },
+    "lmsmoreevents": {
+      "handler": "_extension_more_events",
+      "aliases": ["lmsMoreEvents", "lmsmoreevents"],
+      "files": ["more_events.py"]
+    },
+    "lmstempvars2": {
+      "handler": "_extension_temp_vars",
+      "aliases": ["lmsTempVars2", "lmstempvars2", "lmstempvars"],
+      "files": ["temp_vars.py"],
+      "extra_roots": ["_ext_thread_vars"]
+    },
+    "jeremygamertweening": {
+      "handler": "_extension_tween",
+      "aliases": ["jeremygamerTweening", "jeremygamertweening"],
+      "files": ["tween.py"]
+    },
+    "lmslisttools": {
+      "handler": "_extension_list_tools",
+      "aliases": ["lmsListTools", "lmslisttools"],
+      "files": ["list_tools.py"],
+      "extra_roots": ["_ext_list_object", "_ext_thread_vars"]
+    },
+    "localstorage": {
+      "handler": "_extension_local_storage",
+      "aliases": ["localstorage", "localStorage"],
+      "files": ["local_storage.py"]
+    },
+    "clipboard": {
+      "handler": "_extension_clipboard",
+      "aliases": ["clipboard", "Clipboard"],
+      "files": ["clipboard.py"]
+    },
+    "mousecursor": {
+      "handler": "_extension_mouse_cursor",
+      "aliases": ["MouseCursor", "mousecursor", "cursor"],
+      "files": ["mouse_cursor.py"]
+    },
+    "cubesterwindowcontrols": {
+      "handler": "_extension_window_controls",
+      "aliases": ["cubesterWindowControls", "cubesterwindowcontrols"],
+      "files": ["window_controls.py"]
+    }
+  }
+}

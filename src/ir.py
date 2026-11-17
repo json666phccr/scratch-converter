@@ -10,7 +10,7 @@ import json
 import copy
 import re
 import hashlib
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Set, Union
 from dataclasses import dataclass, field
 from enum import Enum, auto
 import uuid
@@ -822,6 +822,11 @@ class SpriteIR:
     list_attrs: Dict[str, str] = field(default_factory=dict)
     variable_id_attrs: Dict[str, str] = field(default_factory=dict)
     list_id_attrs: Dict[str, str] = field(default_factory=dict)
+    # 反向解析时恢复的全局变量/列表信息：区分舞台全局与角色局部，
+    # 避免把全局列表方法（clear/append）误当成自制积木，也避免写回时生成同名的角色局部列表
+    global_variable_names: Set[str] = field(default_factory=set)
+    global_list_names: Set[str] = field(default_factory=set)
+    global_values: Dict[str, Any] = field(default_factory=dict)
     broadcasts: List[str] = field(default_factory=list)
     costumes: List[Dict[str, Any]] = field(default_factory=list)
     sounds: List[Dict[str, Any]] = field(default_factory=list)
@@ -864,6 +869,8 @@ class ProjectIR:
     warnings: Dict[str, int] = field(default_factory=dict)
     monitors: List[Dict[str, Any]] = field(default_factory=list)
     runtime_options: Dict[str, Any] = field(default_factory=dict)
+    # project.json 中声明的扩展 ID（用于按需拼装运行时扩展）
+    extensions: Any = field(default_factory=set)
     # 需要随 .sb3 一起写入的额外资源（文件名 -> 字节内容）
     assets: Dict[str, bytes] = field(default_factory=dict)
 

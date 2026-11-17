@@ -151,16 +151,18 @@ SPRITE_BASE = r'''class ScratchSprite:
         text_image = self._text_image()
         if text_image is not None:
             image = text_image[0]
+            image_scale = 1.0
         else:
             image = self._costume_surface()
+            image_scale = self._costume_scale()
         if image is None:
             return max(1.0, 20 * abs(_sc_num(self.size)) / 200.0), \
                 max(1.0, 20 * abs(_sc_num(self.size)) / 200.0)
         scale = max(1.0, _sc_num(self.size)) / 100.0
         stretch_x = abs(_sc_num(getattr(self, '_stretch_x', 100))) / 100.0
         stretch_y = abs(_sc_num(getattr(self, '_stretch_y', 100))) / 100.0
-        width = image.get_width() * scale * stretch_x
-        height = image.get_height() * scale * stretch_y
+        width = image.get_width() / image_scale * scale * stretch_x
+        height = image.get_height() / image_scale * scale * stretch_y
         angle = math.radians(90 - _sc_num(self.direction))
         if self.rotation_style in ('left-right', "don't rotate"):
             angle = 0.0
@@ -522,6 +524,9 @@ SPRITE_BASE = r'''class ScratchSprite:
         self._local.depth = getattr(self._local, 'depth', 0) + 1
         if warp:
             self._local.warp_depth = getattr(self._local, 'warp_depth', 0) + 1
+            if self._local.warp_depth == 1 and self._runtime is not None:
+                # 不刷新屏幕：warp 期间其他脚本暂停，画面延后到 warp 结束再绘制
+                self._runtime.warp_begin()
 
     def _leave_procedure(self, warp=False):
         self._local.depth = max(0, getattr(self._local, 'depth', 0) - 1)
@@ -529,6 +534,8 @@ SPRITE_BASE = r'''class ScratchSprite:
             self._local.warp_depth = max(0, getattr(self._local, 'warp_depth', 0) - 1)
             if self._local.warp_depth == 0:
                 self._local.warp_start = None
+                if self._runtime is not None:
+                    self._runtime.warp_end()
 
     def _register(self, event, func):
         handlers = self._handlers.setdefault(event, [])
@@ -626,9 +633,10 @@ SPRITE_BASE = r'''class ScratchSprite:
         rect = getattr(self, '_screen_rect', None)
         if rect is None:
             return False
-        width = self._runtime.stage_width // 2 if self._runtime else 240
-        height = self._runtime.stage_height // 2 if self._runtime else 180
-        return rect.collidepoint(width + x, height - y)
+        scale = self._runtime.render_scale if self._runtime else 1.0
+        width = (self._runtime.stage_width / 2 if self._runtime else 240) * scale
+        height = (self._runtime.stage_height / 2 if self._runtime else 180) * scale
+        return rect.collidepoint(width + x * scale, height - y * scale)
 
     def _costume_info(self):
         if not self.costumes:
@@ -642,6 +650,14 @@ SPRITE_BASE = r'''class ScratchSprite:
         costume = self._costume_info()
         name = costume.get('md5ext') or costume.get('name')
         return self._runtime.get_sprite_image(name)
+
+    def _costume_scale(self):
+        """造型位图的栅格化倍率（SVG 在放大窗口时会重新按高分辨率渲染）"""
+        if self._runtime is None or not self.costumes:
+            return 1.0
+        costume = self._costume_info()
+        name = costume.get('md5ext') or costume.get('name')
+        return self._runtime.get_sprite_image_scale(name)
 
     def _placeholder_color(self):
         seed = sum(ord(ch) for ch in self.name) if self.name else 0
@@ -813,10 +829,13 @@ SPRITE_BASE = r'''class ScratchSprite:
         text_image = self._text_image()
         if text_image is not None:
             image, center_x, center_y = text_image
+            image_scale = 1.0
         else:
             image = self._costume_surface()
             center_x = center_y = None
+            image_scale = self._costume_scale()
         runtime = self._runtime
+        runtime_scale = runtime.render_scale if runtime is not None else 1.0
         use_interp = runtime is not None and runtime.interpolation and getattr(self, '_render_x', None) is not None
         draw_x = self._render_x if use_interp else _sc_num(self.x)
         draw_y = self._render_y if use_interp else _sc_num(self.y)
@@ -825,8 +844,8 @@ SPRITE_BASE = r'''class ScratchSprite:
         stage_width = runtime.stage_width if runtime else 480
         stage_height = runtime.stage_height if runtime else 360
         scale = max(1.0, draw_size) / 100.0
-        x = int(stage_width / 2 + draw_x)
-        y = int(stage_height / 2 - draw_y)
+        x = int((stage_width / 2 + draw_x) * runtime_scale)
+        y = int((stage_height / 2 - draw_y) * runtime_scale)
         if image is None:
             return None, None, x, y, scale, draw_direction
         angle = 90 - draw_direction
@@ -847,55 +866,73 @@ SPRITE_BASE = r'''class ScratchSprite:
         # TurboWarp 角色拉伸：在角色自身坐标轴上非等比缩放，再旋转
         stretch_x = _sc_num(getattr(self, '_stretch_x', 100)) / 100.0
         stretch_y = _sc_num(getattr(self, '_stretch_y', 100)) / 100.0
-        if stretch_x != 1.0 or stretch_y != 1.0:
-            base = pygame.transform.scale(
-                base, (max(1, int(base.get_width() * stretch_x)),
-                       max(1, int(base.get_height() * stretch_y))))
         surface_width = base.get_width()
         surface_height = base.get_height()
-        # 无旋转/无缩放时直接复用缓存的Surface，避免每帧rotozoom拷贝
-        if angle == 0 and scale == 1.0:
+        # 位图可能已经是高分辨率（SVG 按窗口倍率栅格化），换算回逻辑尺寸
+        logical_width = surface_width * stretch_x / max(1e-6, image_scale)
+        logical_height = surface_height * stretch_y / max(1e-6, image_scale)
+        draw_scale = scale * runtime_scale / max(1e-6, image_scale)
+        flip = (self.rotation_style == 'left-right' and
+                math.cos(math.radians(draw_direction)) < 0)
+        # 拉伸/旋转/翻转/幽灵在造型与参数不变时结果相同，缓存后克隆体/静止角色
+        # 不再每帧做 rotozoom（大窗口下这是主要开销之一）。
+        cache = getattr(self, '_transform_cache', None)
+        if cache is None:
+            cache = self._transform_cache = {}
+        key = (id(base), round(draw_scale, 3), round(angle % 360.0, 2),
+               round(stretch_x, 4), round(stretch_y, 4), flip,
+               round(ghost, 2))
+        transformed = cache.get(key)
+        if transformed is None:
             transformed = base
-            fresh = False
-        else:
-            transformed = pygame.transform.rotozoom(base, angle, scale)
-            fresh = True
-        if self.rotation_style == 'left-right' and math.cos(math.radians(draw_direction)) < 0:
-            transformed = pygame.transform.flip(transformed, True, False)
-            fresh = True
-        # 幽灵特效需要修改Surface，不能污染缓存
-        if ghost > 0:
-            if not fresh:
+            if stretch_x != 1.0 or stretch_y != 1.0:
+                transformed = pygame.transform.scale(
+                    transformed,
+                    (max(1, int(transformed.get_width() * stretch_x)),
+                     max(1, int(transformed.get_height() * stretch_y))))
+            if angle != 0 or abs(draw_scale - 1.0) >= 1e-6:
+                transformed = pygame.transform.rotozoom(
+                    transformed, angle, draw_scale)
+            if flip:
+                transformed = pygame.transform.flip(transformed, True, False)
+            # 幽灵特效需要修改Surface，不能污染造型/特效缓存
+            if ghost > 0:
                 transformed = transformed.copy()
-            transformed.set_alpha(int(255 * (1 - ghost / 100.0)))
+                transformed.set_alpha(int(255 * (1 - ghost / 100.0)))
+            if len(cache) >= 6:
+                cache.clear()
+            cache[key] = transformed
         rect = transformed.get_rect(center=(x, y))
         if center_x is None:
             info = self._costume_info()
             center_x = info.get('rotationCenterX')
             center_y = info.get('rotationCenterY')
-            center_x = (surface_width / 2 if center_x is None
+            center_x = (logical_width / 2 if center_x is None
                         else _sc_num(center_x) * stretch_x)
-            center_y = (surface_height / 2 if center_y is None
+            center_y = (logical_height / 2 if center_y is None
                         else _sc_num(center_y) * stretch_y)
         else:
             center_x *= stretch_x
             center_y *= stretch_y
         if angle == 0:
             # Scratch的position对应旋转中心，旋转中心坐标以图片左上角为原点(y向下)
-            rect.center = (x - int((center_x - surface_width / 2) * scale),
-                           y - int((center_y - surface_height / 2) * scale))
+            offset_x = (center_x - logical_width / 2) * scale * runtime_scale
+            offset_y = (center_y - logical_height / 2) * scale * runtime_scale
+            rect.center = (x - int(offset_x), y - int(offset_y))
         return transformed, rect, x, y, scale, draw_direction
 
     def _draw(self, screen, font):
         transformed, rect, x, y, scale, direction = self._rendered_image()
+        runtime_scale = self._runtime.render_scale if self._runtime else 1.0
         if transformed is not None:
             screen.blit(transformed, rect)
         else:
-            radius = max(6, int(20 * scale))
+            radius = max(6, int(20 * scale * runtime_scale))
             pygame.draw.circle(screen, self._placeholder_color(), (x, y), radius)
             end = (x + int(math.sin(math.radians(direction)) * radius),
                    y - int(math.cos(math.radians(direction)) * radius))
-            pygame.draw.line(screen, (40, 40, 40), (x, y), end, 2)
+            pygame.draw.line(screen, (40, 40, 40), (x, y), end,
+                             max(1, int(2 * runtime_scale)))
             rect = pygame.Rect(x - radius, y - radius, radius * 2, radius * 2)
         self._screen_rect = rect
         self._draw_bubble(screen, font)
@@ -904,20 +941,27 @@ SPRITE_BASE = r'''class ScratchSprite:
         text = self._say_text
         if not text:
             return
+        scale = self._runtime.render_scale if self._runtime else 1.0
         chunk = 16
         lines = [text[i:i + chunk] for i in range(0, len(text), chunk)] or ['']
-        width = max(font.size(line)[0] for line in lines) + 12
-        height = len(lines) * 15 + 8
+        width = max(font.size(line)[0] for line in lines) + int(12 * scale)
+        line_height = max(1, int(15 * scale))
+        height = len(lines) * line_height + int(8 * scale)
         rect = getattr(self, '_screen_rect', pygame.Rect(220, 160, 40, 40))
-        stage_width = self._runtime.stage_width if self._runtime else 480
-        x = max(2, min(stage_width - width - 2, rect.centerx - width // 2))
-        y = max(2, rect.top - height - 8)
+        stage_width = (self._runtime.stage_width if self._runtime else 480) * scale
+        x = max(int(2 * scale),
+                min(stage_width - width - int(2 * scale),
+                    rect.centerx - width // 2))
+        y = max(int(2 * scale), rect.top - height - int(8 * scale))
         bubble = pygame.Rect(x, y, width, height)
-        pygame.draw.rect(screen, (255, 255, 255), bubble, border_radius=6)
-        pygame.draw.rect(screen, (120, 120, 120), bubble, 1, border_radius=6)
+        pygame.draw.rect(screen, (255, 255, 255), bubble,
+                         border_radius=max(1, int(6 * scale)))
+        pygame.draw.rect(screen, (120, 120, 120), bubble,
+                         max(1, int(scale)), border_radius=max(1, int(6 * scale)))
         for index, line in enumerate(lines):
             surface = font.render(line, True, (30, 30, 30))
-            screen.blit(surface, (x + 6, y + 4 + index * 15))
+            screen.blit(surface, (x + int(6 * scale),
+                                  y + int(4 * scale) + index * line_height))
 
     # ===================== 艺术字（Animated Text） =====================
 
@@ -1157,6 +1201,20 @@ SPRITE_BASE = r'''class ScratchSprite:
             return None
         state = view['state']
         animation = view['animation']
+        cache_key = None
+        text_cache = None
+        if animation not in ('rainbow', 'shake', 'zoom'):
+            # 静态/打字动画的同一段文字只渲染一次
+            cache_key = (view['displayed'], state.get('font'),
+                         state.get('width'), state.get('outline_width'),
+                         state.get('color'), state.get('outline_color'),
+                         state.get('align'))
+            text_cache = getattr(self, '_text_cache', None)
+            if text_cache is None:
+                text_cache = self._text_cache = {}
+            cached = text_cache.get(cache_key)
+            if cached is not None:
+                return cached
         font_size = 24.0
         if animation == 'zoom':
             font_size = max(1.0, 24.0 * max(0.02, view['progress']))
@@ -1207,7 +1265,12 @@ SPRITE_BASE = r'''class ScratchSprite:
             pad = max(0.0, _sc_num(state.get('shake_intensity', 100)) / 20.0)
             center_x += random.uniform(-pad, pad)
             center_y += random.uniform(-pad, pad)
-        return surface, center_x, center_y
+        result = (surface, center_x, center_y)
+        if cache_key is not None and text_cache is not None:
+            if len(text_cache) >= 4:
+                text_cache.clear()
+            text_cache[cache_key] = result
+        return result
 
     def _make_clone(self, initial_vars=None):
         if self._runtime is None:

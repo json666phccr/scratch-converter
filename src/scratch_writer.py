@@ -363,12 +363,22 @@ class ScratchWriter:
         # 收集脚本中引用但未在IR里声明的变量/列表，避免生成悬空引用
         used_vars, used_lists = self._collect_var_list_names(sprite.statements)
 
+        # 舞台全局变量/列表只应写在舞台上；角色侧引用它们时不要生成同名局部副本
+        skip_vars = set() if sprite.is_stage \
+            else set(getattr(sprite, 'global_variable_names', ()) or ())
+        skip_lists = set() if sprite.is_stage \
+            else set(getattr(sprite, 'global_list_names', ()) or ())
+
         # 构建变量字典
         variables = {}
         for name, value in sprite.variables.items():
+            if name in skip_vars:
+                continue
             var_id = f"var_{name}"
             variables[var_id] = [name, value]
         for name in used_vars:
+            if name in skip_vars:
+                continue
             var_id = f"var_{name}"
             if var_id not in variables:
                 variables[var_id] = [name, 0]
@@ -376,9 +386,13 @@ class ScratchWriter:
         # 构建列表字典
         lists = {}
         for name, items in sprite.lists.items():
+            if name in skip_lists:
+                continue
             list_id = f"list_{name}"
             lists[list_id] = [name, items]
         for name in used_lists:
+            if name in skip_lists:
+                continue
             list_id = f"list_{name}"
             if list_id not in lists:
                 lists[list_id] = [name, []]

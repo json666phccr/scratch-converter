@@ -7,6 +7,10 @@
 
 from .helpers import HELPERS as RUNTIME_HELPERS
 from .extensions import EXTENSIONS as RUNTIME_EXTENSIONS
+from .ext_assembly import (
+    assemble_extensions,
+    extension_registrations_source,
+)
 from .runtime_class import RUNTIME_CLASS
 from .sprite_base import SPRITE_BASE
 
@@ -15,4 +19,6 @@ __all__ = [
     "RUNTIME_EXTENSIONS",
     "RUNTIME_CLASS",
     "SPRITE_BASE",
+    "assemble_extensions",
+    "extension_registrations_source",
 ]
