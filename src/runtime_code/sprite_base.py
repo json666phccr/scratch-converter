@@ -54,6 +54,9 @@ SPRITE_BASE = r'''class ScratchSprite:
         self._pen_cap = True
         self._effects = {}
         self._sound_effects = {'pitch': 0.0, 'pan': 0.0}
+        # Clipping & Blending 扩展：裁剪框（Scratch 坐标）与混合模式
+        self._clipbox = None
+        self._blend_mode = 'default'
         # TurboWarp 角色拉伸（百分比）与艺术字状态
         self._stretch_x = 100.0
         self._stretch_y = 100.0
@@ -207,7 +210,7 @@ SPRITE_BASE = r'''class ScratchSprite:
             runtime.pen_draw_segment(
                 last, current, color,
                 max(1, int(_sc_num(getattr(self, '_pen_size', 1)))),
-                getattr(self, '_pen_cap', False))
+                getattr(self, '_pen_cap', False), self)
             self._pen_cap = False
         self._pen_last = current
 
@@ -924,16 +927,29 @@ SPRITE_BASE = r'''class ScratchSprite:
     def _draw(self, screen, font):
         transformed, rect, x, y, scale, direction = self._rendered_image()
         runtime_scale = self._runtime.render_scale if self._runtime else 1.0
-        if transformed is not None:
-            screen.blit(transformed, rect)
-        else:
-            radius = max(6, int(20 * scale * runtime_scale))
-            pygame.draw.circle(screen, self._placeholder_color(), (x, y), radius)
-            end = (x + int(math.sin(math.radians(direction)) * radius),
-                   y - int(math.cos(math.radians(direction)) * radius))
-            pygame.draw.line(screen, (40, 40, 40), (x, y), end,
-                             max(1, int(2 * runtime_scale)))
-            rect = pygame.Rect(x - radius, y - radius, radius * 2, radius * 2)
+        # Clipping & Blending：裁剪框只作用于角色自身，绘制后立刻恢复
+        clip_applied, previous_clip = False, None
+        if self._clipbox is not None and self._runtime is not None:
+            clip_applied, previous_clip = _clipbox_apply(
+                screen, self._runtime, self)
+        try:
+            if transformed is not None:
+                mode = getattr(self, '_blend_mode', 'default')
+                if mode and mode != 'default':
+                    _blend_blit(screen, transformed, rect, mode)
+                else:
+                    screen.blit(transformed, rect)
+            else:
+                radius = max(6, int(20 * scale * runtime_scale))
+                pygame.draw.circle(screen, self._placeholder_color(), (x, y), radius)
+                end = (x + int(math.sin(math.radians(direction)) * radius),
+                       y - int(math.cos(math.radians(direction)) * radius))
+                pygame.draw.line(screen, (40, 40, 40), (x, y), end,
+                                 max(1, int(2 * runtime_scale)))
+                rect = pygame.Rect(x - radius, y - radius, radius * 2, radius * 2)
+        finally:
+            if clip_applied:
+                screen.set_clip(previous_clip)
         self._screen_rect = rect
         self._draw_bubble(screen, font)
 
@@ -1300,6 +1316,9 @@ SPRITE_BASE = r'''class ScratchSprite:
                 setattr(clone, attr, value)
         clone._stretch_x = self._stretch_x
         clone._stretch_y = self._stretch_y
+        # Clipping & Blending：克隆体继承当前裁剪框与混合模式
+        clone._clipbox = dict(self._clipbox) if self._clipbox else None
+        clone._blend_mode = getattr(self, '_blend_mode', 'default')
         clone._text_state = dict(self._text_state) if self._text_state else None
         clone._runtime = self._runtime
         clone._running = True

@@ -187,6 +187,120 @@ def _ext_stop_target(runtime, sprite, target):
         raise StopIteration('stop scripts')
 
 
+# ===================== Clipping & Blending 渲染辅助 =====================
+
+def _clipbox_rect(runtime, clipbox):
+    """把 Scratch 坐标的裁剪框换算成舞台像素矩形"""
+    if not clipbox or runtime is None:
+        return None
+    scale = runtime.render_scale
+    width = runtime.stage_width
+    height = runtime.stage_height
+    x1 = int(round((width / 2 + _sc_num(clipbox.get('x_min', 0))) * scale))
+    y1 = int(round((height / 2 - _sc_num(clipbox.get('y_max', 0))) * scale))
+    x2 = int(round((width / 2 + _sc_num(clipbox.get('x_max', 0))) * scale))
+    y2 = int(round((height / 2 - _sc_num(clipbox.get('y_min', 0))) * scale))
+    return pygame.Rect(x1, y1, max(0, x2 - x1), max(0, y2 - y1))
+
+
+def _clipbox_apply(screen, runtime, sprite):
+    """给屏幕设置角色的裁剪框，返回 (是否设置, 原裁剪区)"""
+    box = getattr(sprite, '_clipbox', None)
+    if box is None:
+        return False, None
+    rect = _clipbox_rect(runtime, box)
+    if rect is None:
+        return False, None
+    previous = screen.get_clip()
+    if previous is not None:
+        rect = previous.clip(rect)
+    screen.set_clip(rect)
+    return True, previous
+
+
+def _blend_blit(dest, src, rect, mode):
+    """按 Clipping & Blending 的混合模式把 src 画到 dest 上"""
+    mode = _sc_str(mode or 'default').strip().lower()
+    if mode in ('', 'default'):
+        dest.blit(src, rect)
+        return
+    flags = {
+        'additive': pygame.BLEND_RGB_ADD,
+        'additive with alpha': pygame.BLEND_RGBA_ADD,
+        'additive legacy': pygame.BLEND_RGBA_ADD,
+        'subtract': pygame.BLEND_RGB_SUB,
+        'subtract with alpha': pygame.BLEND_RGBA_SUB,
+        'subtract legacy': pygame.BLEND_RGBA_SUB,
+        'multiply': pygame.BLEND_RGB_MULT,
+    }.get(mode)
+    if flags is not None:
+        dest.blit(src, rect, special_flags=flags)
+        return
+    _blend_blit_numpy(dest, src, rect, mode)
+
+
+def _blend_blit_numpy(dest, src, rect, mode):
+    """behind/invert/mask/erase 需要逐像素运算，有 numpy 时精确实现"""
+    try:
+        import numpy
+    except Exception:
+        return
+    area = dest.get_rect().clip(rect)
+    if area.width <= 0 or area.height <= 0:
+        return
+    src_part = src.subsurface(pygame.Rect(
+        area.x - rect.x, area.y - rect.y, area.width, area.height))
+    try:
+        # array3d/array_alpha 返回拷贝，不锁 Surface；结果用 blit_array 写回
+        source_rgb = pygame.surfarray.array3d(src_part).astype(numpy.float32)
+        if src_part.get_flags() & pygame.SRCALPHA:
+            source_a = pygame.surfarray.array_alpha(src_part).astype(
+                numpy.float32) / 255.0
+        else:
+            source_a = numpy.ones(source_rgb.shape[:2], dtype=numpy.float32)
+        dst_part = dest.subsurface(area)
+        has_alpha = bool(dest.get_flags() & pygame.SRCALPHA)
+        target_view = None
+        alpha_view = None
+        try:
+            target_view = pygame.surfarray.pixels3d(dst_part)
+            target_n = target_view.astype(numpy.float32) / 255.0
+            if has_alpha:
+                alpha_view = pygame.surfarray.pixels_alpha(dst_part)
+                alpha = alpha_view.astype(numpy.float32) / 255.0
+            else:
+                alpha = numpy.ones(target_n.shape[:2], dtype=numpy.float32)
+            source = source_rgb / 255.0
+            if mode == 'default behind':
+                result = (source * source_a[..., None]
+                          * (1.0 - alpha[..., None]) + target_n)
+                out_alpha = source_a * (1.0 - alpha) + alpha
+            elif mode == 'invert':
+                result = source * (1.0 - target_n) + target_n * (1.0 - source)
+                out_alpha = alpha
+            elif mode == 'mask':
+                result = target_n * source_a[..., None]
+                out_alpha = alpha * source_a
+            elif mode == 'erase':
+                result = target_n * (1.0 - source_a[..., None])
+                out_alpha = alpha * (1.0 - source_a)
+            else:
+                return
+            target_view[...] = numpy.clip(
+                result * 255.0, 0, 255).astype(numpy.uint8)
+            if alpha_view is not None:
+                alpha_view[...] = numpy.clip(
+                    out_alpha * 255.0, 0, 255).astype(numpy.uint8)
+        finally:
+            # 必须显式删除视图解锁 Surface，否则后续 blit 会报“画面已锁定”
+            if target_view is not None:
+                del target_view
+            if alpha_view is not None:
+                del alpha_view
+    except Exception:
+        return
+
+
 def _ext_touching_targets(runtime, sprite, targets):
     """角色是否碰到给定目标列表中的任意一个（按像素遮罩判定）"""
     rect = runtime._sprite_rect(sprite)

@@ -11,6 +11,7 @@ Python 代码生成器
 - Scratch事件 -> 装饰器标记的函数
 """
 
+import json
 import math
 from typing import Dict, List, Optional, Set
 from ir import (
@@ -33,6 +34,36 @@ def _walk_container(value, walk_expr, seen):
                 _walk_container(item[1], walk_expr, seen)
             else:
                 _walk_container(item, walk_expr, seen)
+
+
+# 超过这个元素数量的大列表改用 JSON 字符串解析：
+# 百万级元素的 Python 列表字面量会让解释器编译阶段非常慢，
+# 而单个字符串字面量只需线性扫描，解析开销低一个数量级。
+_JSON_LIST_THRESHOLD = 256
+
+
+def _json_literal(value):
+    """把值序列化为源码；大列表用 json.loads 延迟解析"""
+    if isinstance(value, float):
+        # repr(inf) 会生成无法执行的 "inf"，必须写成 float('inf')
+        if math.isinf(value):
+            return "float('inf')" if value > 0 else "float('-inf')"
+        if math.isnan(value):
+            return "float('nan')"
+    if isinstance(value, list) and len(value) >= _JSON_LIST_THRESHOLD:
+        try:
+            return f"json.loads({json.dumps(value)!r})"
+        except (TypeError, ValueError):
+            # 含不可 JSON 序列化的对象时退回普通字面量
+            pass
+    return repr(value)
+
+
+def _dict_literal(mapping):
+    """字典字面量，其中大列表值同样走 JSON 解析"""
+    parts = [f"{key!r}: {_json_literal(value)}"
+             for key, value in mapping.items()]
+    return "{" + ", ".join(parts) + "}"
 
 
 class PythonGenerator:
@@ -306,7 +337,7 @@ class PythonGenerator:
             ]
         lines.append(f"STAGE_COSTUME = {stage_costume!r}")
         lines.append(f"BACKDROPS = {backdrops!r}")
-        lines.append(f"GLOBALS = {self.stage_globals!r}")
+        lines.append(f"GLOBALS = {_dict_literal(self.stage_globals)}")
         lines.append(extension_registrations_source(self.ext_registrations))
         lines.append("")
 
@@ -604,6 +635,20 @@ class PythonGenerator:
         lines.append(f"    LIST_ATTRS = {list_attrs!r}")
         lines.append("")
 
+        # 大列表初始值放到类属性里，导入时只解析一次；
+        # 实例化时浅拷贝，克隆体多次创建也不必重复解析
+        big_lists = {}
+        if not sprite.is_stage:
+            for name, items in sprite.lists.items():
+                if len(items) >= _JSON_LIST_THRESHOLD:
+                    # 双下划线名字会被类名改写，不会与用户变量撞名
+                    big_lists[name] = f"__sc_init_list_{len(big_lists)}"
+            for name, const in big_lists.items():
+                lines.append(
+                    f"    {const} = {_json_literal(list(sprite.lists[name]))}")
+            if big_lists:
+                lines.append("")
+
         lines.append("    def __init__(self):")
         lines.append("        super().__init__()")
         lines.append(f"        self.x = {sprite.x!r}")
@@ -642,14 +687,18 @@ class PythonGenerator:
             for name, value in sprite.variables.items():
                 attr = sprite.variable_attrs.get(name) \
                     or sanitize_name(name, 'var')
-                lines.append(f"        self.{attr} = {value!r}")
+                lines.append(f"        self.{attr} = {_json_literal(value)}")
             if sprite.variables:
                 lines.append("")
 
             for name, items in sprite.lists.items():
                 attr = sprite.list_attrs.get(name) \
                     or sanitize_name(name, 'lst')
-                lines.append(f"        self.{attr} = {list(items)!r}")
+                if name in big_lists:
+                    lines.append(
+                        f"        self.{attr} = list(self.{big_lists[name]})")
+                else:
+                    lines.append(f"        self.{attr} = {list(items)!r}")
             if sprite.lists:
                 lines.append("")
 
@@ -717,6 +766,75 @@ class PythonGenerator:
         return lines
 
     # ===================== 语句 =====================
+
+    # 纯计算块：不产生画面/声音/事件/等待等副作用
+    _PURE_STATEMENT_TYPES = {
+        BlockType.SET_VARIABLE, BlockType.CHANGE_VARIABLE,
+        BlockType.ADD_TO_LIST, BlockType.DELETE_FROM_LIST,
+        BlockType.DELETE_ALL_FROM_LIST, BlockType.INSERT_IN_LIST,
+        BlockType.REPLACE_IN_LIST, BlockType.COMMENT,
+    }
+
+    @staticmethod
+    def _repeat_count_is_small(stmt: Statement) -> bool:
+        """循环次数是较小字面量时才允许跳过让帧，避免长时间冻结界面"""
+        value = stmt.value
+        return (value is not None
+                and value.type == ExprType.NUMBER
+                and isinstance(value.value, (int, float))
+                and not isinstance(value.value, bool)
+                and 0 <= value.value <= 20000)
+
+    def _expr_is_pure(self, expr: Optional[Expr]) -> bool:
+        """表达式不包含自制积木/扩展调用（可能阻塞或产生副作用）"""
+        if expr is None:
+            return True
+        if expr.type in (ExprType.EXTENSION_CALL, ExprType.PROCEDURE_CALL):
+            return False
+        for child in (expr.left, expr.right):
+            if not self._expr_is_pure(child):
+                return False
+        for child in list(expr.children) + list(expr.args):
+            if not self._expr_is_pure(child):
+                return False
+        for value in (expr.extra or {}).values():
+            if isinstance(value, Expr):
+                if not self._expr_is_pure(value):
+                    return False
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    if isinstance(item, tuple) and len(item) == 2:
+                        if not self._expr_is_pure(item[1]):
+                            return False
+                    elif isinstance(item, Expr) and not self._expr_is_pure(item):
+                        return False
+        return True
+
+    def _statement_is_pure(self, stmt: Optional[Statement]) -> bool:
+        if stmt is None:
+            return True
+        if not self._expr_is_pure(stmt.value) \
+                or not self._expr_is_pure(stmt.condition):
+            return False
+        if stmt.type == BlockType.REPEAT:
+            if not self._repeat_count_is_small(stmt):
+                return False
+            return (self._body_is_pure_computation(stmt.body)
+                    and self._statement_is_pure(stmt.next))
+        if stmt.type in (BlockType.IF, BlockType.IF_ELSE,
+                         BlockType.ALL_AT_ONCE):
+            return (self._body_is_pure_computation(stmt.body)
+                    and self._body_is_pure_computation(stmt.else_body)
+                    and self._statement_is_pure(stmt.next))
+        if stmt.type in self._PURE_STATEMENT_TYPES:
+            for value in (stmt.extra or {}).values():
+                if isinstance(value, Expr) and not self._expr_is_pure(value):
+                    return False
+            return self._statement_is_pure(stmt.next)
+        return False
+
+    def _body_is_pure_computation(self, body: List[Statement]) -> bool:
+        return all(self._statement_is_pure(stmt) for stmt in body)
 
     def _generate_statement(self, stmt: Statement, indent: int) -> List[str]:
         spaces = "    " * indent
@@ -864,7 +982,11 @@ class PythonGenerator:
             lines = [f"{spaces}for _repeat in range(_sc_repeat_count({times})):"]
             body = self._emit_body(stmt.body, indent + 1)
             lines.extend(body if body else [f"{spaces}    pass"])
-            lines.append(f"{spaces}    self._yield_frame()")
+            # 纯计算循环（只读写变量/列表）不需要逐帧让出：
+            # 编译型大项目仅初始化列表就可能循环上千次，逐次等待会慢到无法使用。
+            if not (self._repeat_count_is_small(stmt)
+                    and self._body_is_pure_computation(stmt.body)):
+                lines.append(f"{spaces}    self._yield_frame()")
             return lines
 
         if stmt.type == BlockType.FOREVER:

@@ -19,12 +19,13 @@ from test_general_python import TESTS as GENERAL_TESTS
 from test_runtime_io import TESTS as IO_TESTS
 from test_extensions_a import TESTS as EXTENSION_A_TESTS
 from test_extensions_b import TESTS as EXTENSION_B_TESTS
+from test_extensions_c import TESTS as EXTENSION_C_TESTS
 from test_regressions import TESTS as REGRESSION_TESTS
 
 TESTS = (
     BASIC_TESTS + PROCEDURE_TESTS + RUNTIME_TESTS + TURBOWARP_TESTS
     + VISUAL_TESTS + GENERAL_TESTS + IO_TESTS + EXTENSION_A_TESTS
-    + EXTENSION_B_TESTS + REGRESSION_TESTS
+    + EXTENSION_B_TESTS + EXTENSION_C_TESTS + REGRESSION_TESTS
 )
 
 

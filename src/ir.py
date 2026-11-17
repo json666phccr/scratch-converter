@@ -8,6 +8,7 @@ Scratch <-> 高级语言 双向转换的核心数据结构
 from __future__ import annotations
 import json
 import copy
+import math
 import re
 import hashlib
 from typing import Any, Dict, List, Optional, Set, Union
@@ -344,9 +345,16 @@ class Expr:
         所有涉及类型转换/比较的运算都走 _sc_* 辅助函数，以复刻Scratch运行时语义。
         """
         if self.type == ExprType.NUMBER:
-            if isinstance(self.value, float) and self.value == int(self.value):
-                return str(int(self.value))
-            return str(self.value)
+            value = self.value
+            if isinstance(value, float):
+                # JSON 里可能出现 Infinity/NaN（如 1e999），直接 int() 会抛 OverflowError
+                if math.isinf(value):
+                    return "float('inf')" if value > 0 else "float('-inf')"
+                if math.isnan(value):
+                    return "float('nan')"
+                if value == int(value):
+                    return str(int(value))
+            return str(value)
         elif self.type == ExprType.STRING:
             return repr(self.value)
         elif self.type == ExprType.BOOLEAN:

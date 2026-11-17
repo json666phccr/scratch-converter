@@ -1060,6 +1060,74 @@ def test_asset_preload_and_scale_caps():
     return True
 
 
+def test_broadcast_input_order():
+    """广播发送端必须写成 [11, 名字, ID]，否则消息名会被解析成ID"""
+    print("[测试87] 广播发送端名字/ID顺序")
+
+    code = '''class Cat(ScratchSprite):
+    def when_green_flag(self):
+        self.broadcast("go")
+        self.broadcast_and_wait("done")
+
+    def when_broadcast_go(self):
+        self.say("received")
+'''
+    sprite = parse_python_code(code, "Cat")
+    data = write_scratch_project(python_to_project(sprite))
+    blocks = get_sprite(data["targets"])["blocks"]
+    sends = [item for item in blocks.values()
+             if item.get("opcode") in ("event_broadcast",
+                                       "event_broadcastandwait")]
+    assert len(sends) == 2, "应有普通广播与等待广播各一个"
+    for item in sends:
+        payload = item["inputs"]["BROADCAST_INPUT"][1]
+        assert payload[0] == 11
+        assert payload[2] == "bc_" + payload[1], "第三项应为 bc_<名字>"
+    assert sorted(item["inputs"]["BROADCAST_INPUT"][1][1]
+                  for item in sends) == ["done", "go"]
+
+    # 重新解析回来，发送端与接收端的消息名必须一致
+    regenerated = generate_python(parse_scratch_project(data))
+    assert "self.broadcast('go')" in regenerated
+    assert "self.broadcast_and_wait('done')" in regenerated
+    assert "def when_broadcast_go(self):" in regenerated
+
+    # 非标准变体：消息只写在 fields 里时也要能解析
+    legacy = make_project({
+        "b1": block("event_whenflagclicked", "b2", None, top_level=True),
+        "b2": block("event_broadcast", None, "b1",
+                    fields={"BROADCAST_OPTION": ["legacy", "bc_legacy"]}),
+        "h1": block("event_whenbroadcastreceived", None, None, top_level=True,
+                    fields={"BROADCAST_INPUT": ["legacy", "bc_legacy"]}),
+    }, name="LegacyBc")
+    legacy_code = generate_python(parse_scratch_project(legacy))
+    assert "self.broadcast('legacy')" in legacy_code
+    assert "def when_broadcast_legacy(self):" in legacy_code
+
+    # 实际运行：广播接收端必须被触发
+    import time
+    namespace = {}
+    exec(compile(regenerated, "<generated>", "exec"), namespace)
+    runtime = namespace["ScratchRuntime"](headless=True, audio=False)
+    cat = namespace["Cat"]()
+    runtime.add_sprite(cat)
+    try:
+        cat.run()
+        runtime.green_flag()
+        for _ in range(20):
+            runtime.step()
+            time.sleep(0.004)
+            if cat._say_text == 'received':
+                break
+        assert cat._say_text == 'received', "广播接收端应收到 go"
+    finally:
+        runtime.running = False
+        runtime.shutdown()
+
+    print("  [PASS] 广播发送端名字/ID顺序通过")
+    return True
+
+
 TESTS = [
     test_variable_shadowing_fidelity,
     test_scheduler_fairness_with_clones,
@@ -1077,4 +1145,5 @@ TESTS = [
     test_mouse_cursor_stage_scope,
     test_bundle_output_layout,
     test_asset_preload_and_scale_caps,
+    test_broadcast_input_order,
 ]

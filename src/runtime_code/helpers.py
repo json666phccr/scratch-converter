@@ -3,7 +3,7 @@
 
 HELPERS = r'''
 _SCRATCH_LIST_LIMIT = 200000
-_RUNTIME_VERSION = '0.9.25'
+_RUNTIME_VERSION = '0.9.30'
 
 
 class _FairLock:

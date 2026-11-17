@@ -1,6 +1,6 @@
 # Scratch 3.0 <-> Python 双向转换器
 
-> 版本 **0.9.25** · [MIT License](LICENSE)
+> 版本 **0.9.30** · [MIT License](LICENSE)
 
 一个强大的 Scratch 3.0 与 Python 之间的双向转换工具，支持**一比一对应**的转换，同时支持高级 Python 语法。
 
@@ -337,8 +337,14 @@ python converter.py demo
 - [x] 列表 (添加、删除、插入、替换、查询)
 - [x] 变量模型按 ID 解析：角色局部变量/列表与全局同名时互不覆盖，写回 sb3 时仍保留原变量名
 - [x] 往返解析恢复 `GLOBALS` / `GLOBAL_NAMES`：非舞台角色引用舞台全局列表时，`clear()`/`append()` 等仍写回列表积木，不会误降级成自制积木
+- [x] 兼容 JSON 中的 `Infinity` / `-Infinity` / `NaN` 数值字面量（生成 `float('inf')` 等，不再触发 OverflowError）
+- [x] 纯变量/列表计算循环不再逐帧让出，编译型大项目（如 LLVM→Scratch 推理程序）的初始化与计算速度显著提升
+- [x] 超大列表初始值（≥256 项）改以 JSON 字符串写入并在导入时解析一次，十万级列表的大项目启动编译时间从数秒降到毫秒级
+- [x] Files 文件扩展：打开本地文件（文本 / data URL）、把文本或 URL 下载到系统“下载”文件夹
+- [x] Clipping & Blending 裁剪与颜色混合扩展：矩形裁剪框，以及默认/加法/减法/正片叠底/反色/遮罩/擦除等混合模式，角色与画笔均生效
+- [x] Asset Manager 资源管理扩展：造型/声音的 URL 添加、删除、改名、排序与格式/dataURI/编号/资源 ID 查询
 - [x] 公平脚本调度：FIFO 执行权 + 轻量脚本线程，大量克隆同时运行时不会互相饿死
-- [x] 广播 (发送、接收、等待)
+- [x] 广播 (发送、接收、等待)，写回 sb3 时使用标准 `[11, 名字, ID]` 输入顺序，往返后发送端与接收端消息名一致
 - [x] 自制积木 (定义、调用、参数)
 - [x] 克隆 (创建、删除)
 - [x] 表达式嵌套 (运算符、函数调用)
@@ -387,8 +393,10 @@ python converter.py demo
 10. **变量模型**: 解析时按变量/列表 ID 判断归属；角色局部变量与全局变量同名时，局部变量会自动生成独立属性名（如 `local_score`），IR 与写回的 sb3 仍使用原始名字。扩展积木的变量菜单仍按变量名访问，同名遮蔽时优先访问局部变量
 11. **调度性能**: 执行权锁改为 FIFO 公平锁，脚本线程启动不再等待线程就绪，避免大量克隆创建时卡住创建者；每个脚本每帧执行一次，变量/列表访问保持 Python 原生属性速度。数百个同时运行的脚本仍受 Python 线程调度限制，帧率会随活动脚本数上升而下降
 12. **扩展**: 未注册的第三方扩展会保留调用但返回 0，不会中断脚本
-13. **新扩展细节**: `localstorage` 数据存放在 `~/.scratch-converter/localstorage/<命名空间>.json`（默认命名空间为生成脚本名），写入使用临时文件加 `os.replace` 原子替换；“当本地存储变化”类跨窗口帽子未实现。`clipboard` 优先使用 `pygame.scrap`（需要 SDL），不可用时退回到内存字符串，只能在同一个程序内复制粘贴。`MouseCursor` 用当前造型生成的系统光标限制在 8–128 像素。`cubesterWindowControls` 依赖 `pygame.display.set_window_position`，在 headless 或部分平台上是空操作。Files 扩展（读写本地文件）未实现
-14. **渲染倍率与扩展拼装**: 舞台内部按窗口大小以 0.25 步进在 1–3 倍之间超采样（`SCRATCH_RENDER_SCALE_MAX` 可提高到 4），并依据每帧耗时自适应降低；窗口中缩放稳定后才切换倍率，切换时保留画笔内容与按倍率缓存的造型。大体积（>512KB）的 SVG 通常是包裹内嵌 PNG 的截图，固定最多按 2 倍栅格化以控制内存与切换开销；PNG/JPG 造型仍按原始像素绘制。启动预加载按约 12ms/帧分批进行并显示进度条，单个超大 SVG 仍可能占用较长时间。SVG 的渐变填充支持 linear/radial 与多 stop（含 stop 透明度），描边渐变按平均色近似；透明度按元素/组叠加近似。生成脚本只拼装项目实际使用的扩展（含依赖函数），未注册扩展仍返回 0。扩展源码位于 `runtime_code/extensions/`，新增内置扩展时添加子文件并在 `config.json` 登记处理器、别名与依赖即可，无需修改 `ext_assembly.py`
+13. **新扩展细节**: `localstorage` 数据存放在 `~/.scratch-converter/localstorage/<命名空间>.json`（默认命名空间为生成脚本名），写入使用临时文件加 `os.replace` 原子替换；“当本地存储变化”类跨窗口帽子未实现。`clipboard` 优先使用 `pygame.scrap`（需要 SDL），不可用时退回到内存字符串，只能在同一个程序内复制粘贴。`MouseCursor` 用当前造型生成的系统光标限制在 8–128 像素。`cubesterWindowControls` 依赖 `pygame.display.set_window_position`，在 headless 或部分平台上是空操作。`Files` 扩展用系统文件选择框读取本地文件，`download`/`download URL` 保存到系统“下载”文件夹（可用环境变量 `SCRATCH_DOWNLOAD_DIR` 覆盖）；无图形界面时选择文件返回空字符串
+14. **裁剪与颜色混合**: 裁剪框与混合模式按角色的 `_clipbox`/`_blend_mode` 生效，克隆体继承、停止全部时重置；画笔线段与图章同样受裁剪/混合影响。加法/减法/正片叠底用 pygame 混合标志实现，`default behind`/反色/遮罩/擦除需要 numpy 做逐像素运算，未安装 numpy 时这些模式不产生效果。混合模式是逐角色绘制时合成，与原始扩展在 WebGL 帧缓冲上的结果在边缘抗锯齿上可能略有差异；舞台背景按不透明处理，`default behind` 在背景上不可见
+15. **资源管理**: 造型/声音会下载到素材目录并按内容哈希命名；舞台造型变化会同步背景菜单。`add sprite from URL`、`open project from URL`、`load extension from URL` 与作品 JSON/导出需要完整 Scratch VM，在生成的 Python 程序中是空操作；角色的 `dataURI` 导出同样返回空字符串
+16. **渲染倍率与扩展拼装**: 舞台内部按窗口大小以 0.25 步进在 1–3 倍之间超采样（`SCRATCH_RENDER_SCALE_MAX` 可提高到 4），并依据每帧耗时自适应降低；窗口中缩放稳定后才切换倍率，切换时保留画笔内容与按倍率缓存的造型。大体积（>512KB）的 SVG 通常是包裹内嵌 PNG 的截图，固定最多按 2 倍栅格化以控制内存与切换开销；PNG/JPG 造型仍按原始像素绘制。启动预加载按约 12ms/帧分批进行并显示进度条，单个超大 SVG 仍可能占用较长时间。SVG 的渐变填充支持 linear/radial 与多 stop（含 stop 透明度），描边渐变按平均色近似；透明度按元素/组叠加近似。生成脚本只拼装项目实际使用的扩展（含依赖函数），未注册扩展仍返回 0。扩展源码位于 `runtime_code/extensions/`，新增内置扩展时添加子文件并在 `config.json` 登记处理器、别名与依赖即可，无需修改 `ext_assembly.py`
 
 ## 运行转换后的脚本
 

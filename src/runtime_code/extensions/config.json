@@ -94,6 +94,23 @@
       "handler": "_extension_window_controls",
       "aliases": ["cubesterWindowControls", "cubesterwindowcontrols"],
       "files": ["window_controls.py"]
+    },
+    "files": {
+      "handler": "_extension_files",
+      "aliases": ["files"],
+      "files": ["files_ext.py"]
+    },
+    "xeltallivclipblend": {
+      "handler": "_extension_clipping_blending",
+      "aliases": ["xeltallivclipblend"],
+      "files": ["clipping_blending.py"],
+      "extra_roots": ["_clipbox_rect", "_clipbox_apply",
+                      "_blend_blit", "_blend_blit_numpy"]
+    },
+    "lmsassets": {
+      "handler": "_extension_asset_manager",
+      "aliases": ["lmsAssets", "lmsassets"],
+      "files": ["asset_manager.py"]
     }
   }
 }

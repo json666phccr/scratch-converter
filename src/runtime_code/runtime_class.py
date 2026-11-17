@@ -606,7 +606,8 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
         self._pen_color_cache[key] = color
         return color
 
-    def pen_draw_segment(self, start, end, color, size, cap_start=False):
+    def pen_draw_segment(self, start, end, color, size, cap_start=False,
+                         sprite=None):
         size = max(1, int(round(_sc_num(size) * self.render_scale)))
         if len(color) > 3 and color[3] <= 0:
             # 完全透明（透明度 100）的线段不会改变画面
@@ -617,24 +618,70 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
         ex = int((self.stage_width / 2 + end[0]) * scale)
         ey = int((self.stage_height / 2 - end[1]) * scale)
         self._pen_used = True
-        pygame.draw.line(self.pen_layer, color, (sx, sy), (ex, ey), size)
+        # Clipping & Blending：画笔线段同样受角色裁剪框/混合模式影响
+        clip_applied, previous_clip = (False, None)
+        if sprite is not None and getattr(sprite, '_clipbox', None) is not None:
+            clip_applied, previous_clip = _clipbox_apply(
+                self.pen_layer, self, sprite)
+        mode = getattr(sprite, '_blend_mode', 'default') if sprite else 'default'
+        try:
+            if mode and mode != 'default':
+                self._pen_segment_blended(
+                    color, sx, sy, ex, ey, size, cap_start, mode)
+            else:
+                pygame.draw.line(self.pen_layer, color, (sx, sy), (ex, ey), size)
+                if size > 1:
+                    radius = size // 2
+                    # 起点圆帽通常已被上一段终点圆帽覆盖，只画终点即可
+                    if cap_start:
+                        pygame.draw.circle(self.pen_layer, color, (sx, sy), radius)
+                    pygame.draw.circle(self.pen_layer, color, (ex, ey), radius)
+                if self.hq_pen:
+                    pygame.draw.aaline(self.pen_layer, color, (sx, sy), (ex, ey))
+        finally:
+            if clip_applied:
+                self.pen_layer.set_clip(previous_clip)
+
+    def _pen_segment_blended(self, color, sx, sy, ex, ey, size, cap_start, mode):
+        """混合模式线段：先画到临时小图，再按混合模式贴回画笔层"""
+        radius = size // 2 if size > 1 else 0
+        left = min(sx, ex) - radius
+        top = min(sy, ey) - radius
+        width = max(1, abs(ex - sx) + radius * 2 + 1)
+        height = max(1, abs(sy - ey) + radius * 2 + 1)
+        temp = pygame.Surface((width, height), pygame.SRCALPHA)
+        lx, ly = sx - left, sy - top
+        rx, ry = ex - left, ey - top
+        pygame.draw.line(temp, color, (lx, ly), (rx, ry), size)
         if size > 1:
-            radius = size // 2
-            # 起点圆帽通常已被上一段终点圆帽覆盖，只画终点即可
             if cap_start:
-                pygame.draw.circle(self.pen_layer, color, (sx, sy), radius)
-            pygame.draw.circle(self.pen_layer, color, (ex, ey), radius)
+                pygame.draw.circle(temp, color, (lx, ly), radius)
+            pygame.draw.circle(temp, color, (rx, ry), radius)
         if self.hq_pen:
-            pygame.draw.aaline(self.pen_layer, color, (sx, sy), (ex, ey))
+            pygame.draw.aaline(temp, color, (lx, ly), (rx, ry))
+        _blend_blit(self.pen_layer, temp,
+                    pygame.Rect(left, top, width, height), mode)
 
     def pen_stamp(self, sprite):
         # 图章使用角色当前外观：颜色/亮度/透明度/形状特效都会一起盖上去
         transformed, rect, x, y, scale, _direction = sprite._rendered_image()
-        if transformed is not None:
-            self.pen_layer.blit(transformed, rect)
-        else:
-            pygame.draw.circle(self.pen_layer, sprite._placeholder_color(),
-                               (x, y), max(6, int(20 * scale)))
+        clip_applied, previous_clip = (False, None)
+        if sprite._clipbox is not None:
+            clip_applied, previous_clip = _clipbox_apply(
+                self.pen_layer, self, sprite)
+        mode = getattr(sprite, '_blend_mode', 'default')
+        try:
+            if transformed is not None:
+                if mode and mode != 'default':
+                    _blend_blit(self.pen_layer, transformed, rect, mode)
+                else:
+                    self.pen_layer.blit(transformed, rect)
+            else:
+                pygame.draw.circle(self.pen_layer, sprite._placeholder_color(),
+                                   (x, y), max(6, int(20 * scale)))
+        finally:
+            if clip_applied:
+                self.pen_layer.set_clip(previous_clip)
         self._pen_used = True
 
     def add_sprite(self, sprite):
@@ -885,6 +932,9 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
             context.running = False
         for sprite in self.sprites:
             sprite._global_running = False
+            # Clipping & Blending：停止全部时清除裁剪框与混合模式
+            sprite._clipbox = None
+            sprite._blend_mode = 'default'
         with self.frame_condition:
             self.frame_condition.notify_all()
 

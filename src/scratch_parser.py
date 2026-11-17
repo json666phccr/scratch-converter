@@ -907,13 +907,13 @@ class ScratchParser:
             stmt.extra['name'] = list_name
             stmt.extra['attr'] = self._list_attr(list_name, list_id)
 
-        elif block_type == BlockType.BROADCAST:
-            msg = self.parse_input(raw, 'BROADCAST_INPUT', '')
-            stmt.value = msg
-
-        elif block_type == BlockType.BROADCAST_AND_WAIT:
-            msg = self.parse_input(raw, 'BROADCAST_INPUT', '')
-            stmt.value = msg
+        elif block_type in (BlockType.BROADCAST, BlockType.BROADCAST_AND_WAIT):
+            if 'BROADCAST_INPUT' in raw.inputs:
+                stmt.value = self.parse_input(raw, 'BROADCAST_INPUT', '')
+            else:
+                # 非标准变体可能只把消息写在 fields 里
+                stmt.value = make_string(self.parse_menu(
+                    raw, 'BROADCAST_INPUT', 'BROADCAST_OPTION', ''))
 
         elif block_type == BlockType.CREATE_CLONE_OF:
             stmt.value = make_string(
@@ -1218,9 +1218,11 @@ class ScratchParser:
         注意：输入里可能是压缩原始值（如 [12, 变量名, 变量ID]）。
         绝不能把变量ID当作菜单文本返回，否则产物里会出现随机字符串。
         """
-        field = raw.fields.get(field_name)
-        if field:
-            return str(field[0])
+        # 标准字段名优先；部分工具会把同一个菜单写成输入名
+        for name in (field_name, input_name):
+            field = raw.fields.get(name)
+            if field:
+                return str(field[0])
 
         input_data = raw.inputs.get(input_name)
         if not isinstance(input_data, list) or len(input_data) < 2:

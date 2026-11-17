@@ -791,12 +791,13 @@ class ScratchWriter:
         elif stmt.type == BlockType.BROADCAST:
             bc_name = stmt.value.to_scratch_value() if stmt.value else ''
             bc_id = f"bc_{bc_name}"
-            block_data["inputs"]["BROADCAST_INPUT"] = [1, [11, bc_id, bc_name]]
+            # 类型码 11 的标准顺序是 [11, 广播名, 广播ID]，名字在前
+            block_data["inputs"]["BROADCAST_INPUT"] = [1, [11, bc_name, bc_id]]
 
         elif stmt.type == BlockType.BROADCAST_AND_WAIT:
             bc_name = stmt.value.to_scratch_value() if stmt.value else ''
             bc_id = f"bc_{bc_name}"
-            block_data["inputs"]["BROADCAST_INPUT"] = [1, [11, bc_id, bc_name]]
+            block_data["inputs"]["BROADCAST_INPUT"] = [1, [11, bc_name, bc_id]]
 
         elif stmt.type == BlockType.CREATE_CLONE_OF:
             target = stmt.value.to_scratch_value() if stmt.value else '_myself_'

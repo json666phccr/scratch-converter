@@ -578,6 +578,97 @@ def test_event_script_wrapper():
     return True
 
 
+def test_infinite_number_literals():
+    """Infinity/NaN 数值字面量不应导致转换崩溃"""
+    print("[测试81] 无限与 NaN 数值字面量")
+
+    infinite = Expr(ExprType.NUMBER, value=float('inf'))
+    negative = Expr(ExprType.NUMBER, value=float('-inf'))
+    nan = Expr(ExprType.NUMBER, value=float('nan'))
+    assert infinite.to_python_source() == "float('inf')"
+    assert negative.to_python_source() == "float('-inf')"
+    assert nan.to_python_source() == "float('nan')"
+
+    expression = make_binary_op(
+        '>', make_variable('x'), infinite)
+    source = expression.to_python_source()
+    assert "float('inf')" in source
+    assert 'OverflowError' not in source
+
+    print("  [PASS] 无限与 NaN 数值字面量通过")
+    return True
+
+
+def test_pure_computation_loop_no_yield():
+    """纯变量/列表计算循环不应逐帧让出"""
+    print("[测试82] 纯计算循环不逐帧让出")
+
+    pure = make_project({
+        "b1": block("event_whenflagclicked", "b2", None, top_level=True),
+        "b2": block("control_repeat", None, "b1",
+                    inputs={"TIMES": [1, "100"],
+                            "SUBSTACK": [2, "b3"]}),
+        "b3": block("data_setvariableto", None, "b2",
+                    inputs={"VALUE": [1, "1"]},
+                    fields={"VARIABLE": ["x", "x1"]}),
+    }, name="PureLoop")
+    pure["targets"][0]["variables"] = {"x1": ["x", 0]}
+    pure_code = generate_python(parse_scratch_project(pure))
+    start = pure_code.index('for _repeat in range')
+    segment = pure_code[start:start + 400]
+    assert 'self._yield_frame()' not in segment, \
+        "纯计算循环不应让出帧"
+
+    motion = make_project({
+        "b1": block("event_whenflagclicked", "b2", None, top_level=True),
+        "b2": block("control_repeat", None, "b1",
+                    inputs={"TIMES": [1, "100"],
+                            "SUBSTACK": [2, "b3"]}),
+        "b3": block("motion_movesteps", None, "b2",
+                    inputs={"STEPS": [1, "1"]}),
+    }, name="MotionLoop")
+    motion_code = generate_python(parse_scratch_project(motion))
+    start = motion_code.index('for _repeat in range')
+    segment = motion_code[start:start + 400]
+    assert 'self._yield_frame()' in segment, \
+        "有画面副作用的循环仍应逐帧让出"
+
+    print("  [PASS] 纯计算循环不逐帧让出通过")
+    return True
+
+
+def test_large_list_json_initialization():
+    """超大列表初始值改用 JSON 解析，避免拖慢编译"""
+    print("[测试83] 超大列表 JSON 初始化")
+
+    import json as _json
+    from python_generator import _json_literal
+
+    big = list(range(300))
+    source = _json_literal(big)
+    assert source.startswith("json.loads("), "大列表应使用 JSON 字符串"
+    assert eval(source, {"json": _json}) == big, "JSON 解析结果应保持一致"
+
+    assert _json_literal(float('inf')) == "float('inf')"
+    assert _json_literal([1, 2, 3]) == "[1, 2, 3]", "小列表保持普通字面量"
+
+    scratch_json = make_project({
+        "b1": block("event_whenflagclicked", None, None, top_level=True),
+    }, name="BigList")
+    scratch_json["targets"][0]["lists"] = {
+        "l1": ["data", list(range(300))],
+        "l2": ["small", [1, 2, 3]],
+    }
+    code = generate_python(parse_scratch_project(scratch_json))
+    assert "json.loads(" in code, "大列表应生成 JSON 解析"
+    assert "__sc_init_list_0" in code, "大列表应作为类属性只解析一次"
+    assert "self.data = list(self.__sc_init_list_0)" in code
+    assert "self.small = [1, 2, 3]" in code, "小列表保持普通字面量"
+
+    print("  [PASS] 超大列表 JSON 初始化通过")
+    return True
+
+
 TESTS = [
     test_basic_scratch_to_python,
     test_scratch_loop_to_python,
@@ -588,4 +679,7 @@ TESTS = [
     test_if_else,
     test_real_sb3_literal_formats,
     test_event_script_wrapper,
+    test_infinite_number_literals,
+    test_pure_computation_loop_no_yield,
+    test_large_list_json_initialization,
 ]
