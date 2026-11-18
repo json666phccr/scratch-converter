@@ -451,7 +451,7 @@ when timer > 5:
     say("timer")
 
 when clicked:
-    say("clicked")
+    say(join(username(), backdrop_name()))
 """,
         }, assets={'bg.svg': _BG_SVG, 'cat.svg': _CAT_SVG})
         sb3 = _export(root)
@@ -475,6 +475,8 @@ when clicked:
         assert 'event_whenbackdropswitchesto' in opcodes
         assert 'event_whengreaterthan' in opcodes
         assert 'event_whenthisspriteclicked' in opcodes
+        assert 'sensing_username' in opcodes
+        assert 'looks_backdropnumbername' in opcodes
 
     print("  [PASS] ScPython 事件头与 init 通过")
     return True

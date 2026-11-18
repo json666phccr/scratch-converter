@@ -1274,6 +1274,8 @@ class ScratchWriter:
                 obj = expr.args[0].value if expr.args else '_mouse_'
                 block_data["inputs"]["DISTANCEMENU"] = self.write_menu_input(
                     "sensing_distancetomenu", "DISTANCEMENU", obj, block_id)
+            elif expr.name == 'username':
+                block_data["opcode"] = "sensing_username"
 
         elif expr.type == ExprType.PROPERTY:
             prop = expr.name
@@ -1289,6 +1291,12 @@ class ScratchWriter:
                 block_data["fields"]["NUMBER_NAME"] = ["number", None]
             elif prop_l == 'costume_name':
                 block_data["opcode"] = "looks_costumenumbername"
+                block_data["fields"]["NUMBER_NAME"] = ["name", None]
+            elif prop_l in ('backdrop_#', 'backdrop_number', 'backdrop'):
+                block_data["opcode"] = "looks_backdropnumbername"
+                block_data["fields"]["NUMBER_NAME"] = ["number", None]
+            elif prop_l == 'backdrop_name':
+                block_data["opcode"] = "looks_backdropnumbername"
                 block_data["fields"]["NUMBER_NAME"] = ["name", None]
             elif prop_l == 'size':
                 block_data["opcode"] = "looks_size"
