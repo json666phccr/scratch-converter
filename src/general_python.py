@@ -7,20 +7,27 @@ Scratch DSL（``ScratchSprite`` 类、``when_green_flag``、``self.move()`` 等�
 支持的核心子集：
 - 顶层语句 -> 绿旗脚本
 - ``def`` 函数 -> 自制积木；返回值写入 ``__py_ret_<函数名>`` 变量
-- 变量、赋值/增量赋值、算术/比较/布尔表达式
+- **递归/互相递归**：递归函数的参数、局部变量与临时变量改为列表帧栈，
+  进入函数压栈、返回/结束时出栈，多层递归互不覆盖
+- 变量、赋值/增量赋值、算术/比较/布尔表达式、链式比较
 - ``if/elif/else``、``while``、``for ... in range(...)``、``for ... in 列表``、
-  ``for ... in 字符串``、``for i, v in enumerate(...)``
+  ``for ... in 字符串``、``for i, v in enumerate(...)``、
+  ``for a, b in zip(xs, ys)``
 - ``break`` / ``continue``（循环标志变量 + 条件包裹）
 - 列表字面量、``append/insert/clear/pop/remove/index/count/reverse/sort``、
-  ``extend/copy``、``sorted(...)`` / ``reversed(...)``、下标读写
+  ``extend/copy``、``sorted(...)`` / ``reversed(...)``、下标读写、列表切片
+- 简单列表推导式 ``[表达式 for x in 列表/range(...) [if 条件]]``
+- 字符串下标（含负下标）、切片、``"x" * n`` 重复
+- ``random.shuffle(列表)``
 - ``print`` -> 说话；``input`` -> 询问并等待
 - ``len``、``str/int/float``、``abs/round(x, n)``、``min/max/sum``、``pow``、``**``
 - ``math`` 常量与函数（``sqrt/floor/ceil/sin/cos/...``、``fabs``、``pow``）
 - ``random.randint/random/uniform/random/choice``、``time.sleep``
 - 条件表达式 ``a if cond else b``、``"分隔符".join(列表)``、``f"{x:.2f}"``
 - 元组交换赋值 ``a, b = b, a``、``enumerate(列表, start)``
+- 与运行时属性重名的变量（如 ``answer``）自动改用隐藏属性，不会被覆盖
 
-不支持：类、异常、生成器、装饰器、多返回值、``match``、
+不支持：类、异常、生成器、装饰器、多返回值、``match``、把列表作为函数参数、
 大部分字符串方法（``upper/lower/replace/split`` 等），会记入转换报告，
 而不是静默丢失。
 """
@@ -92,6 +99,40 @@ def default_backdrop() -> Tuple[Dict[str, Any], Dict[str, bytes]]:
 class GeneralPythonParser(PythonParser):
     """把普通 Python 脚本解析为 Scratch IR"""
 
+    # 这些名字与运行时角色属性/方法冲突（如 answer 每帧会被询问结果覆盖），
+    # 普通脚本里的同名变量改用 var_/lst_ 前缀存到角色属性，Scratch 变量名不变
+    # 只避开运行时每帧回写/会遮蔽方法的属性；x/y/size 等仍按原样映射，
+    # 保持与旧项目“变量名即角色属性”的行为一致
+    _RESERVED_VARS = {
+        'answer', 'mouse_x', 'mouse_y', 'mouse_down', 'timer', 'loudness',
+        'days_since_2000', 'ext_legacy_vars', 'ext_runtime_vars',
+    }
+    _RESERVED_METHODS = {
+        'move', 'turn_right', 'turn_left', 'goto_xy', 'goto_random',
+        'glide_to', 'glide_secs_to', 'point_in_direction', 'point_towards',
+        'change_x', 'change_y', 'set_x', 'set_y', 'if_on_edge_bounce',
+        'say', 'say_for', 'think', 'think_for', 'show', 'hide',
+        'switch_costume', 'next_costume', 'switch_backdrop', 'change_size',
+        'set_size', 'change_effect', 'set_effect', 'clear_effects',
+        'go_to_front', 'go_to_back', 'play_sound', 'stop_all_sounds',
+        'wait', 'wait_until', 'stop', 'stop_all', 'stop_other_scripts',
+        'create_clone', 'delete_this_clone', 'ask_and_wait', 'reset_timer',
+        'broadcast', 'broadcast_and_wait', 'extension', 'run',
+    }
+    _VAR_STATEMENTS = {
+        BlockType.SET_VARIABLE, BlockType.CHANGE_VARIABLE,
+        BlockType.SHOW_VARIABLE, BlockType.HIDE_VARIABLE,
+    }
+    _LIST_STATEMENTS = {
+        BlockType.ADD_TO_LIST, BlockType.DELETE_FROM_LIST,
+        BlockType.DELETE_ALL_FROM_LIST, BlockType.INSERT_IN_LIST,
+        BlockType.REPLACE_IN_LIST, BlockType.SHOW_LIST, BlockType.HIDE_LIST,
+    }
+    _LIST_EXPRESSIONS = {
+        ExprType.LIST_ACCESS, ExprType.ITEM_OF_LIST, ExprType.ITEM_NUMBER_OF_LIST,
+        ExprType.LENGTH_OF_LIST, ExprType.LIST_CONTAINS,
+    }
+
     # 这些调用可以交给父类的DSL表达式解析器（math/类型转换等）
     PASSTHROUGH_CALLS = {
         'abs', 'round', 'str', 'int', 'float',
@@ -111,6 +152,11 @@ class GeneralPythonParser(PythonParser):
         self._loop_stack: List[Dict[str, Any]] = []
         self._temp_serial = 0
         self._string_vars: set = set()
+        # 返回字符串的函数（用于把 f(...)[0]、f(...) + "x" 按字符串处理）
+        self._string_functions: set = set()
+        # 递归函数集合与每个函数的“每调用一帧”变量表
+        self._recursive_functions: set = set()
+        self._frame_vars: Dict[str, Dict[str, str]] = {}
 
     # ---------- 基础工具 ----------
 
@@ -228,13 +274,14 @@ class GeneralPythonParser(PythonParser):
             return True
         if isinstance(node, ast.Name):
             return node.id in self._string_vars
-        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mult)):
             return self._is_string_expr(node.left) \
                 or self._is_string_expr(node.right)
         if isinstance(node, ast.Call):
             func = node.func
             if isinstance(func, ast.Name):
-                return func.id in ('str', 'input')
+                return func.id in ('str', 'input') \
+                    or func.id in self._string_functions
             if isinstance(func, ast.Attribute):
                 return func.attr in ('join', 'format', 'upper', 'lower')
         return False
@@ -280,8 +327,11 @@ class GeneralPythonParser(PythonParser):
         self._loop_stack = []
         self._temp_serial = 0
         self._string_vars = set()
+        self._string_functions = set()
         self._current_function = None
         self.warnings = {}
+        self._recursive_functions = set()
+        self._frame_vars = {}
 
         try:
             tree = ast.parse(code)
@@ -336,9 +386,42 @@ class GeneralPythonParser(PythonParser):
                         and value.args and isinstance(value.args[0], ast.Name):
                     self._list_vars.add(target)
                     self._list_vars.add(value.args[0].id)
+                elif isinstance(value, ast.ListComp) \
+                        and value.generators \
+                        and isinstance(value.generators[0].target, ast.Name):
+                    self._list_vars.add(target)
+                elif isinstance(value, ast.Subscript) \
+                        and isinstance(value.slice, ast.Slice) \
+                        and isinstance(value.value, ast.Name):
+                    self._list_vars.add(target)
             # 注意：不能因为 for x in name 就把 name 当成列表，
             # 它也可能是字符串（for ch in text）。具体类型在解析循环时判断。
 
+        # 预扫描字符串变量：函数体先于顶层语句解析，提前记录字面量字符串，
+        # 避免函数里把全局字符串当成列表做下标
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) \
+                    else [node.target]
+                value = node.value
+                if len(targets) == 1 and isinstance(targets[0], ast.Name) \
+                        and value is not None:
+                    if isinstance(value, ast.Constant) \
+                            and isinstance(value.value, str):
+                        self._string_vars.add(targets[0].id)
+                    elif isinstance(value, ast.JoinedStr):
+                        self._string_vars.add(targets[0].id)
+                    elif isinstance(value, ast.Call) \
+                            and isinstance(value.func, ast.Name) \
+                            and value.func.id in ('str', 'input'):
+                        self._string_vars.add(targets[0].id)
+
+        # 先登记所有函数（含返回变量），再解析函数体：这样前向调用与
+        # 互相递归（如 is_even/is_odd）都能找到目标
+        self._recursive_functions = self._detect_recursive_functions(functions)
+        for node in functions:
+            self._register_general_function(node)
+        self._infer_string_functions(functions)
         for node in functions:
             self._parse_general_function(node)
 
@@ -349,11 +432,89 @@ class GeneralPythonParser(PythonParser):
                 hat.next = self._chain(body)
                 self.sprite.statements.insert(0, hat)
 
+        self._remap_reserved_names()
         return self.sprite
+
+    # ---------- 与运行时属性重名 ----------
+
+    def _reserved_attr(self, name: str, is_list: bool = False) -> str:
+        attr = ('lst_' if is_list else 'var_') + name
+        if is_list:
+            self.sprite.list_attrs[name] = attr
+        else:
+            self.sprite.variable_attrs[name] = attr
+        return attr
+
+    def _remap_reserved_names(self):
+        """把与 ScratchSprite 属性/方法重名的变量改成隐藏属性名
+
+        例如用户脚本里的 ``answer`` 会被运行时的询问结果覆盖，
+        ``x``/``size`` 会直接改变角色位置或大小。Scratch 侧变量名保持不变，
+        只调整生成 Python 的属性名，并在 __init__ 里正常初始化。
+        """
+        names = self._RESERVED_VARS | self._RESERVED_METHODS
+
+        def remap_value(value):
+            if isinstance(value, Expr):
+                remap_expr(value)
+            elif isinstance(value, list):
+                return [remap_value(item) for item in value]
+            elif isinstance(value, tuple):
+                return tuple(remap_value(item) for item in value)
+            return value
+
+        def remap_expr(expr: Optional[Expr]):
+            if expr is None:
+                return
+            if expr.type == ExprType.VARIABLE and str(expr.name) in names:
+                expr.extra.setdefault('attr', self._reserved_attr(
+                    str(expr.name)))
+            elif expr.type in self._LIST_EXPRESSIONS \
+                    and str(expr.name) in names:
+                expr.extra.setdefault('attr', self._reserved_attr(
+                    str(expr.name), True))
+            remap_expr(expr.left)
+            remap_expr(expr.right)
+            for item in expr.children:
+                remap_expr(item)
+            for item in expr.args:
+                remap_expr(item)
+            for key, value in list((expr.extra or {}).items()):
+                if key == 'attr':
+                    continue
+                expr.extra[key] = remap_value(value)
+
+        def remap_stmt(stmt: Optional[Statement]):
+            if stmt is None:
+                return
+            if stmt.type in self._VAR_STATEMENTS:
+                name = stmt.extra.get('name')
+                if name in names:
+                    stmt.extra.setdefault('attr', self._reserved_attr(name))
+            elif stmt.type in self._LIST_STATEMENTS:
+                name = stmt.extra.get('name')
+                if name in names:
+                    stmt.extra.setdefault('attr',
+                                          self._reserved_attr(name, True))
+            remap_expr(stmt.value)
+            remap_expr(stmt.condition)
+            for key, value in list((stmt.extra or {}).items()):
+                if key in ('name', 'attr'):
+                    continue
+                stmt.extra[key] = remap_value(value)
+            for child in stmt.body:
+                remap_stmt(child)
+            for child in stmt.else_body:
+                remap_stmt(child)
+            remap_stmt(stmt.next)
+
+        for statement in self.sprite.statements:
+            remap_stmt(statement)
 
     # ---------- 函数定义 ----------
 
-    def _parse_general_function(self, node: ast.FunctionDef):
+    def _register_general_function(self, node: ast.FunctionDef):
+        """登记函数签名与返回变量（解析函数体之前调用）"""
         if node.args.vararg or node.args.kwarg or node.args.kwonlyargs:
             self.warn('可变参数函数')
             return
@@ -372,18 +533,361 @@ class GeneralPythonParser(PythonParser):
         }
         self._user_functions[name] = meta
         self._procedure_meta[name] = meta
+
+    def _infer_string_functions(self, functions: List[ast.FunctionDef]):
+        """粗略推断哪些用户函数返回字符串（供下标/拼接判断类型）"""
+
+        def returns_string(value: Optional[ast.expr]) -> bool:
+            if value is None:
+                return False
+            if isinstance(value, ast.Constant):
+                return isinstance(value.value, str)
+            if isinstance(value, ast.JoinedStr):
+                return True
+            if isinstance(value, ast.Call):
+                func = value.func
+                if isinstance(func, ast.Name):
+                    return func.id in ('str', 'input') \
+                        or func.id in self._string_functions
+                if isinstance(func, ast.Attribute):
+                    return func.attr in ('join', 'format', 'upper', 'lower')
+            if isinstance(value, ast.BinOp) and isinstance(value.op, ast.Add):
+                return self._is_string_expr(value.left) \
+                    or self._is_string_expr(value.right)
+            if isinstance(value, ast.IfExp):
+                return self._is_string_expr(value.body) \
+                    or self._is_string_expr(value.orelse)
+            return False
+
+        changed = True
+        while changed:
+            changed = False
+            for node in functions:
+                if node.name in self._string_functions:
+                    continue
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Return) \
+                            and returns_string(sub.value):
+                        self._string_functions.add(node.name)
+                        changed = True
+                        break
+
+    @staticmethod
+    def _infer_string_args(node: ast.FunctionDef, arg_names: set) -> set:
+        """从切片、与字符串常量比较/拼接推断哪些参数是字符串"""
+        result = set()
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Subscript) \
+                    and isinstance(sub.value, ast.Name) \
+                    and sub.value.id in arg_names \
+                    and isinstance(sub.slice, ast.Slice):
+                result.add(sub.value.id)
+            elif isinstance(sub, ast.Compare):
+                operands = [sub.left] + list(sub.comparators)
+                for index, operator in enumerate(sub.ops):
+                    if not isinstance(operator, (ast.Eq, ast.NotEq)):
+                        continue
+                    left = operands[index]
+                    right = operands[index + 1]
+                    for name_node, other in ((left, right), (right, left)):
+                        if isinstance(name_node, ast.Name) \
+                                and name_node.id in arg_names \
+                                and isinstance(other, ast.Constant) \
+                                and isinstance(other.value, str):
+                            result.add(name_node.id)
+            elif isinstance(sub, ast.BinOp) and isinstance(sub.op, ast.Add):
+                for name_node, other in ((sub.left, sub.right),
+                                         (sub.right, sub.left)):
+                    if isinstance(name_node, ast.Name) \
+                            and name_node.id in arg_names \
+                            and isinstance(other, ast.Constant) \
+                            and isinstance(other.value, str):
+                        result.add(name_node.id)
+        return result
+
+    def _parse_general_function(self, node: ast.FunctionDef):
+        if node.args.vararg or node.args.kwarg or node.args.kwonlyargs:
+            return
+        name = node.name
+        meta = self._user_functions.get(name)
+        if meta is None:
+            return
         stmt = Statement(type=BlockType.PROCEDURE_DEFINE, extra=meta)
 
         previous_args = self._procedure_args
         previous_function = self._current_function
-        self._procedure_args = {arg: arg for arg in args}
+        self._procedure_args = {arg: arg for arg in meta['args']}
         self._current_function = name
+        global_names = {
+            item for sub in ast.walk(node)
+            if isinstance(sub, ast.Global) for item in sub.names
+        }
+        # 参数类型只在当前函数内生效，避免把一个函数的字符串参数
+        # 误当成另一个函数/顶层同名变量的类型
+        saved_strings = set(self._string_vars)
+        self._string_vars |= self._infer_string_args(node, set(meta['args']))
         try:
             stmt.body = self._parse_stmt_list(node.body)
         finally:
+            self._string_vars = saved_strings
             self._procedure_args = previous_args
             self._current_function = previous_function
+        self._isolate_function_variables(
+            name, stmt, list(meta['args']), global_names)
         self.sprite.add_statement(stmt)
+
+    # ---------- 递归 / 每调用一帧的局部变量 ----------
+
+    @staticmethod
+    def _detect_recursive_functions(functions: List[ast.FunctionDef]) -> set:
+        """找出直接或互相递归的函数名（能沿调用图回到自身）"""
+        names = {node.name for node in functions}
+        graph: Dict[str, set] = {}
+        for node in functions:
+            called = set()
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) \
+                        and sub.func.id in names:
+                    called.add(sub.func.id)
+            graph[node.name] = called
+        recursive = set()
+        for name in names:
+            pending = list(graph.get(name, ()))
+            seen = set()
+            while pending:
+                current = pending.pop()
+                if current == name:
+                    recursive.add(name)
+                    break
+                if current in seen:
+                    continue
+                seen.add(current)
+                pending.extend(graph.get(current, ()))
+        return recursive
+
+    @staticmethod
+    def _assigned_names(body: List[Statement]) -> set:
+        """收集语句树里所有被赋值的目标变量名"""
+        names = set()
+        seen = set()
+
+        def scan(stmt: Optional[Statement]):
+            if stmt is None or id(stmt) in seen:
+                return
+            seen.add(id(stmt))
+            if stmt.type in (BlockType.SET_VARIABLE, BlockType.CHANGE_VARIABLE):
+                target = stmt.extra.get('name') or stmt.extra.get('attr')
+                if target:
+                    names.add(str(target))
+            for child in stmt.body:
+                scan(child)
+            for child in stmt.else_body:
+                scan(child)
+            scan(stmt.next)
+
+        for statement in body:
+            scan(statement)
+        return names
+
+    @staticmethod
+    def _flatten_chain(statements: List[Statement]) -> List[Statement]:
+        """把 next 链展开成平铺列表，便于插入入栈/出栈语句"""
+        result: List[Statement] = []
+        for head in statements:
+            stmt = head
+            while stmt is not None:
+                following = stmt.next
+                stmt.next = None
+                result.append(stmt)
+                stmt = following
+        return result
+
+    @staticmethod
+    def _frame_read(stack: str) -> Expr:
+        """读取帧栈顶（Scratch: 列表最后一项）"""
+        return Expr(ExprType.ITEM_OF_LIST, name=stack,
+                    left=Expr(ExprType.LENGTH_OF_LIST, name=stack))
+
+    def _frame_pops(self, frames: Dict[str, str]) -> List[Statement]:
+        pops = []
+        for stack in frames.values():
+            pops.append(Statement(
+                type=BlockType.DELETE_FROM_LIST,
+                value=Expr(ExprType.LENGTH_OF_LIST, name=stack),
+                extra={'name': stack}))
+        return pops
+
+    def _isolate_function_variables(self, name: str, stmt: Statement,
+                                    args: List[str], global_names: set):
+        """为递归函数生成每调用一帧的局部变量栈
+
+        Scratch 自制积木的参数本身是每次调用独立的，但普通变量是角色级
+        共享的；递归调用会互相覆盖局部变量与结果临时变量。这里把递归函数
+        的参数和所有赋值目标都改成“列表栈的栈顶”，进入函数时压栈、
+        返回/结束时出栈，克隆体与多层递归因此互不干扰。
+        """
+        assigned = self._assigned_names(stmt.body)
+        shadow_args = {}
+        if name not in self._recursive_functions:
+            # 非递归函数里被重新赋值的参数：用一个隐藏变量承接，
+            # 避免写入角色变量而读取仍拿到参数报告值
+            for arg in args:
+                if arg in assigned:
+                    hidden = f'__py_arg_{name}_{arg}'
+                    self.sprite.variables[hidden] = 0
+                    shadow_args[arg] = hidden
+            if shadow_args:
+                self._rewrite_shadow_args(stmt, shadow_args, args)
+            return
+
+        frames: Dict[str, str] = {}
+        candidates = list(args) + [item for item in sorted(assigned)
+                                   if item not in args]
+        for item in candidates:
+            if item in global_names or item.startswith('__py_ret_'):
+                continue
+            if item in self._list_vars:
+                # 列表在 Scratch 里本身就是共享的，递归帧不支持整表快照
+                self.warn('递归函数内的列表局部变量')
+                continue
+            stack = f'__py_frame_{name}_{item}'
+            if stack in self.sprite.lists:
+                continue
+            self.sprite.lists[stack] = []
+            frames[item] = stack
+        if not frames:
+            return
+        self._frame_vars[name] = frames
+
+        body = self._transform_frame_body(stmt.body, frames)
+        entry: List[Statement] = []
+        for arg_name, stack in frames.items():
+            if arg_name in args:
+                value: Expr = Expr(ExprType.ARGUMENT, name=arg_name)
+            else:
+                value = make_number(0)
+            entry.append(Statement(type=BlockType.ADD_TO_LIST,
+                                   value=value, extra={'name': stack}))
+        exit_statements = [Statement(
+            type=BlockType.SET_VARIABLE,
+            extra={'name': self._result_vars[name]},
+            value=make_string(''))] + self._frame_pops(frames)
+        stmt.body = entry + body + exit_statements
+
+    def _transform_frame_body(self, statements: List[Statement],
+                              frames: Dict[str, str]) -> List[Statement]:
+        result: List[Statement] = []
+        for stmt in self._flatten_chain(statements):
+            stmt = self._rewrite_frame_stmt(stmt, frames)
+            if stmt.type == BlockType.STOP \
+                    and str(stmt.extra.get('option', '')) == 'this script':
+                result.extend(self._frame_pops(frames))
+            result.append(stmt)
+        return result
+
+    def _rewrite_frame_expr(self, expr: Optional[Expr],
+                            frames: Dict[str, str]) -> Optional[Expr]:
+        if expr is None:
+            return None
+        if expr.type == ExprType.VARIABLE and str(expr.name) in frames:
+            return self._frame_read(frames[str(expr.name)])
+        if expr.type == ExprType.ARGUMENT and str(expr.name) in frames:
+            return self._frame_read(frames[str(expr.name)])
+        expr.left = self._rewrite_frame_expr(expr.left, frames)
+        expr.right = self._rewrite_frame_expr(expr.right, frames)
+        expr.children = [self._rewrite_frame_expr(item, frames)
+                         for item in expr.children]
+        expr.args = [self._rewrite_frame_expr(item, frames)
+                     for item in expr.args]
+        for key, value in list((expr.extra or {}).items()):
+            expr.extra[key] = self._rewrite_frame_value(value, frames)
+        return expr
+
+    def _rewrite_frame_value(self, value: Any,
+                             frames: Dict[str, str]) -> Any:
+        if isinstance(value, Expr):
+            return self._rewrite_frame_expr(value, frames)
+        if isinstance(value, list):
+            return [self._rewrite_frame_value(item, frames) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._rewrite_frame_value(item, frames)
+                         for item in value)
+        return value
+
+    def _rewrite_frame_stmt(self, stmt: Statement,
+                            frames: Dict[str, str]) -> Statement:
+        target = stmt.extra.get('name') or stmt.extra.get('attr') \
+            if stmt.type in (BlockType.SET_VARIABLE, BlockType.CHANGE_VARIABLE) \
+            else None
+        if target is not None and str(target) in frames:
+            stack = frames[str(target)]
+            value = self._rewrite_frame_expr(stmt.value, frames)
+            if stmt.type == BlockType.CHANGE_VARIABLE:
+                value = make_binary_op('+', self._frame_read(stack),
+                                       value or make_number(1))
+            return Statement(
+                type=BlockType.REPLACE_IN_LIST,
+                value=Expr(ExprType.LENGTH_OF_LIST, name=stack),
+                extra={'name': stack, 'item': value or make_number(0)})
+        stmt.value = self._rewrite_frame_expr(stmt.value, frames)
+        stmt.condition = self._rewrite_frame_expr(stmt.condition, frames)
+        for key, value in list((stmt.extra or {}).items()):
+            stmt.extra[key] = self._rewrite_frame_value(value, frames)
+        stmt.body = self._transform_frame_body(stmt.body, frames)
+        stmt.else_body = self._transform_frame_body(stmt.else_body, frames)
+        return stmt
+
+    def _rewrite_shadow_args(self, stmt: Statement,
+                             shadow_args: Dict[str, str], args: List[str]):
+        """非递归函数：把被重新赋值的参数重定向到隐藏变量"""
+        entry = [
+            Statement(type=BlockType.SET_VARIABLE,
+                      extra={'name': hidden},
+                      value=Expr(ExprType.ARGUMENT, name=arg))
+            for arg, hidden in shadow_args.items()
+        ]
+
+        def rewrite_expr(expr: Optional[Expr]) -> Optional[Expr]:
+            if expr is None:
+                return None
+            if expr.type == ExprType.ARGUMENT \
+                    and str(expr.name) in shadow_args:
+                return make_variable(shadow_args[str(expr.name)])
+            expr.left = rewrite_expr(expr.left)
+            expr.right = rewrite_expr(expr.right)
+            expr.children = [rewrite_expr(item) for item in expr.children]
+            expr.args = [rewrite_expr(item) for item in expr.args]
+            for key, value in list((expr.extra or {}).items()):
+                expr.extra[key] = rewrite_value(value)
+            return expr
+
+        def rewrite_value(value: Any) -> Any:
+            if isinstance(value, Expr):
+                return rewrite_expr(value)
+            if isinstance(value, list):
+                return [rewrite_value(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(rewrite_value(item) for item in value)
+            return value
+
+        def rewrite_stmt(current: Statement) -> Statement:
+            if current.type in (BlockType.SET_VARIABLE,
+                                BlockType.CHANGE_VARIABLE):
+                target = current.extra.get('name') or current.extra.get('attr')
+                if target in shadow_args:
+                    current.extra['name'] = shadow_args[str(target)]
+            current.value = rewrite_expr(current.value)
+            current.condition = rewrite_expr(current.condition)
+            for key, value in list((current.extra or {}).items()):
+                current.extra[key] = rewrite_value(value)
+            current.body = [rewrite_stmt(item)
+                            for item in self._flatten_chain(current.body)]
+            current.else_body = [rewrite_stmt(item)
+                                 for item in self._flatten_chain(current.else_body)]
+            return current
+
+        stmt.body = entry + [rewrite_stmt(item)
+                             for item in self._flatten_chain(stmt.body)]
 
     # ---------- 语句 ----------
 
@@ -533,6 +1037,22 @@ class GeneralPythonParser(PythonParser):
             return None
 
         iterable = node.iter
+
+        # for a, b in zip(xs, ys)
+        if enumerate_var is not None and isinstance(iterable, ast.Call) \
+                and isinstance(iterable.func, ast.Name) \
+                and iterable.func.id == 'zip':
+            sources = []
+            for argument in iterable.args:
+                if not isinstance(argument, ast.Name):
+                    self.warn('zip 参数')
+                    return None
+                sources.append(argument.id)
+            if len(sources) != 2:
+                self.warn('zip 参数数量')
+                return None
+            return self._parse_zip_loop(
+                enumerate_var, var, sources, node.body)
 
         # for x in range(...)
         if isinstance(iterable, ast.Call) and isinstance(iterable.func, ast.Name) \
@@ -921,6 +1441,398 @@ class GeneralPythonParser(PythonParser):
         init.next = loop
         return init
 
+    # ---------- 更多常见语法 ----------
+
+    def _shuffle_list(self, list_name: str) -> Statement:
+        """random.shuffle：倒序 Fisher-Yates，原地交换"""
+        self._ensure_list(list_name)
+        index = self._new_temp()
+        other = self._new_temp()
+        value = self._new_temp()
+        length = Expr(ExprType.LENGTH_OF_LIST, name=list_name)
+        loop = Statement(type=BlockType.REPEAT, value=length)
+        loop.body = [
+            Statement(type=BlockType.SET_VARIABLE, extra={'name': other},
+                      value=make_random(make_number(1),
+                                        make_binary_op('+', make_variable(index),
+                                                       make_number(1)))),
+            Statement(type=BlockType.SET_VARIABLE, extra={'name': value},
+                      value=make_list_access(
+                          list_name,
+                          make_binary_op('+', make_variable(index),
+                                         make_number(1)))),
+            Statement(type=BlockType.REPLACE_IN_LIST,
+                      value=make_binary_op('+', make_variable(index),
+                                           make_number(1)),
+                      extra={'name': list_name, 'item': make_list_access(
+                          list_name, make_variable(other))}),
+            Statement(type=BlockType.REPLACE_IN_LIST,
+                      value=make_variable(other),
+                      extra={'name': list_name,
+                             'item': make_variable(value)}),
+            Statement(type=BlockType.CHANGE_VARIABLE,
+                      extra={'name': index}, value=make_number(-1)),
+        ]
+        return self._chain_list([
+            Statement(type=BlockType.SET_VARIABLE, extra={'name': index},
+                      value=make_binary_op('-', length, make_number(1))),
+            loop,
+        ])
+
+    def _string_repeat(self, text_node: ast.expr, count_node: ast.expr) -> Expr:
+        """字符串 * 次数：常量直接折叠，动态次数用循环重复连接"""
+        fixed = self._const_int(count_node)
+        text_value = None
+        if isinstance(text_node, ast.Constant) and isinstance(text_node.value, str):
+            text_value = text_node.value
+        if fixed is not None and text_value is not None:
+            if fixed <= 0:
+                return make_string('')
+            if len(text_value) * fixed <= 4096:
+                return make_string(text_value * fixed)
+            self.warn('字符串重复过长')
+            return make_string('')
+        result = self._new_temp()
+        text_temp = self._new_temp()
+        self._string_vars.add(result)
+        loop = Statement(type=BlockType.REPEAT, value=(
+            make_number(fixed) if fixed is not None
+            else self._parse_expr_to_ir(count_node)))
+        loop.body = [
+            Statement(type=BlockType.SET_VARIABLE, extra={'name': result},
+                      value=Expr(ExprType.JOIN, left=make_variable(result),
+                                 right=make_variable(text_temp))),
+        ]
+        self._pending.extend([
+            Statement(type=BlockType.SET_VARIABLE, extra={'name': result},
+                      value=make_string('')),
+            Statement(type=BlockType.SET_VARIABLE, extra={'name': text_temp},
+                      value=self._parse_expr_to_ir(text_node)),
+            loop,
+        ])
+        return make_variable(result)
+
+    def _string_index_expr(self, text_node: ast.expr,
+                           index_node: ast.expr) -> Expr:
+        """s[i]：Python 0 起下标 / 负数从末尾 -> Scratch 第 n 个字符"""
+        fixed = self._const_int(index_node)
+        text = self._parse_expr_to_ir(text_node)
+        if fixed is not None:
+            if fixed >= 0:
+                return Expr(ExprType.LETTER_OF, left=make_number(fixed + 1),
+                            right=text)
+            return Expr(
+                ExprType.LETTER_OF,
+                left=make_binary_op(
+                    '+', Expr(ExprType.LENGTH_OF_STRING, right=text),
+                    make_number(fixed + 1)),
+                right=text)
+        text_temp = self._new_temp()
+        index_temp = self._new_temp()
+        pos_temp = self._new_temp()
+        self._string_vars.add(text_temp)
+        negative = Statement(
+            type=BlockType.IF,
+            condition=Expr(ExprType.LESS_THAN, left=make_variable(index_temp),
+                           right=make_number(0)))
+        negative.body = [Statement(
+            type=BlockType.SET_VARIABLE, extra={'name': pos_temp},
+            value=make_binary_op(
+                '+', Expr(ExprType.LENGTH_OF_STRING,
+                          right=make_variable(text_temp)),
+                make_binary_op('+', make_variable(index_temp),
+                               make_number(1))))]
+        self._pending.extend([
+            Statement(type=BlockType.SET_VARIABLE, extra={'name': text_temp},
+                      value=text),
+            Statement(type=BlockType.SET_VARIABLE, extra={'name': index_temp},
+                      value=self._parse_expr_to_ir(index_node)),
+            Statement(type=BlockType.SET_VARIABLE, extra={'name': pos_temp},
+                      value=make_binary_op('+', make_variable(index_temp),
+                                           make_number(1))),
+            negative,
+        ])
+        return Expr(ExprType.LETTER_OF, left=make_variable(pos_temp),
+                    right=make_variable(text_temp))
+
+    def _clamp_slice_index(self, value_node: Optional[ast.expr],
+                           length_var: str, default: str) -> Expr:
+        """把切片下标规范到 [0, len]：负数表示从末尾，并夹紧越界"""
+        temp = self._new_temp()
+        if value_node is None:
+            self._pending.append(Statement(
+                type=BlockType.SET_VARIABLE, extra={'name': temp},
+                value=(make_variable(length_var) if default == 'length'
+                       else make_number(0))))
+        else:
+            self._pending.append(Statement(
+                type=BlockType.SET_VARIABLE, extra={'name': temp},
+                value=self._parse_expr_to_ir(value_node)))
+        length = Expr(ExprType.LENGTH_OF_STRING, right=make_variable(length_var))
+        negative = Statement(
+            type=BlockType.IF,
+            condition=Expr(ExprType.LESS_THAN, left=make_variable(temp),
+                           right=make_number(0)))
+        negative.body = [Statement(
+            type=BlockType.SET_VARIABLE, extra={'name': temp},
+            value=make_binary_op('+', length, make_variable(temp)))]
+        below = Statement(
+            type=BlockType.IF,
+            condition=Expr(ExprType.LESS_THAN, left=make_variable(temp),
+                           right=make_number(0)))
+        below.body = [Statement(type=BlockType.SET_VARIABLE,
+                                extra={'name': temp}, value=make_number(0))]
+        above = Statement(
+            type=BlockType.IF,
+            condition=Expr(ExprType.GREATER_THAN, left=make_variable(temp),
+                           right=length))
+        above.body = [Statement(type=BlockType.SET_VARIABLE,
+                                extra={'name': temp},
+                                value=length)]
+        self._pending.extend([negative, below, above])
+        return make_variable(temp)
+
+    def _string_slice_expr(self, text_node: ast.expr,
+                           slice_node: ast.Slice) -> Expr:
+        """s[a:b]：先缓存文本与起止下标，再逐字符拼接"""
+        text_temp = self._new_temp()
+        self._string_vars.add(text_temp)
+        self._pending.append(Statement(
+            type=BlockType.SET_VARIABLE, extra={'name': text_temp},
+            value=self._parse_expr_to_ir(text_node)))
+        start = self._clamp_slice_index(slice_node.lower, text_temp, 'zero')
+        stop = self._clamp_slice_index(slice_node.upper, text_temp, 'length')
+        result = self._new_temp()
+        cursor = self._new_temp()
+        self._string_vars.add(result)
+        loop = Statement(type=BlockType.REPEAT, value=make_binary_op(
+            '-', stop, start))
+        loop.body = [
+            Statement(type=BlockType.SET_VARIABLE, extra={'name': result},
+                      value=Expr(ExprType.JOIN, left=make_variable(result),
+                                 right=Expr(
+                                     ExprType.LETTER_OF,
+                                     left=make_binary_op(
+                                         '+', make_variable(cursor),
+                                         make_number(1)),
+                                     right=make_variable(text_temp)))),
+            Statement(type=BlockType.CHANGE_VARIABLE,
+                      extra={'name': cursor}, value=make_number(1)),
+        ]
+        self._pending.extend([
+            Statement(type=BlockType.SET_VARIABLE, extra={'name': result},
+                      value=make_string('')),
+            Statement(type=BlockType.SET_VARIABLE, extra={'name': cursor},
+                      value=start),
+            loop,
+        ])
+        return make_variable(result)
+
+    def _list_slice_copy(self, source: str, target: str,
+                         slice_node: ast.Slice) -> Optional[Statement]:
+        """b = a[a:b]：把区间内的项复制到目标列表"""
+        self._ensure_list(source)
+        self.sprite.lists[target] = []
+        self._list_vars.add(target)
+        def length_expr() -> Expr:
+            return Expr(ExprType.LENGTH_OF_LIST, name=source)
+
+        start = self._new_temp()
+        stop = self._new_temp()
+        cursor = self._new_temp()
+        statements = [
+            Statement(type=BlockType.DELETE_ALL_FROM_LIST,
+                      extra={'name': target}),
+        ]
+        if slice_node.lower is None:
+            statements.append(Statement(
+                type=BlockType.SET_VARIABLE, extra={'name': start},
+                value=make_number(0)))
+        else:
+            statements.append(Statement(
+                type=BlockType.SET_VARIABLE, extra={'name': start},
+                value=self._parse_expr_to_ir(slice_node.lower)))
+            negative = Statement(
+                type=BlockType.IF,
+                condition=Expr(ExprType.LESS_THAN,
+                               left=make_variable(start),
+                               right=make_number(0)))
+            negative.body = [Statement(
+                type=BlockType.SET_VARIABLE, extra={'name': start},
+                value=make_binary_op('+', length_expr(),
+                                     make_variable(start)))]
+            statements.append(negative)
+        if slice_node.upper is None:
+            statements.append(Statement(
+                type=BlockType.SET_VARIABLE, extra={'name': stop},
+                value=length_expr()))
+        else:
+            statements.append(Statement(
+                type=BlockType.SET_VARIABLE, extra={'name': stop},
+                value=self._parse_expr_to_ir(slice_node.upper)))
+            negative = Statement(
+                type=BlockType.IF,
+                condition=Expr(ExprType.LESS_THAN,
+                               left=make_variable(stop),
+                               right=make_number(0)))
+            negative.body = [Statement(
+                type=BlockType.SET_VARIABLE, extra={'name': stop},
+                value=make_binary_op('+', length_expr(),
+                                     make_variable(stop)))]
+            statements.append(negative)
+        for name in (start, stop):
+            below = Statement(
+                type=BlockType.IF,
+                condition=Expr(ExprType.LESS_THAN,
+                               left=make_variable(name),
+                               right=make_number(0)))
+            below.body = [Statement(type=BlockType.SET_VARIABLE,
+                                    extra={'name': name}, value=make_number(0))]
+            above = Statement(
+                type=BlockType.IF,
+                condition=Expr(ExprType.GREATER_THAN,
+                               left=make_variable(name),
+                               right=length_expr()))
+            above.body = [Statement(type=BlockType.SET_VARIABLE,
+                                    extra={'name': name},
+                                    value=length_expr())]
+            statements.extend([below, above])
+        loop = Statement(type=BlockType.REPEAT, value=make_binary_op(
+            '-', make_variable(stop), make_variable(start)))
+        loop.body = [
+            Statement(type=BlockType.ADD_TO_LIST, extra={'name': target},
+                      value=make_list_access(source, make_binary_op(
+                          '+', make_variable(cursor), make_number(1)))),
+            Statement(type=BlockType.CHANGE_VARIABLE,
+                      extra={'name': cursor}, value=make_number(1)),
+        ]
+        statements.extend([
+            Statement(type=BlockType.SET_VARIABLE, extra={'name': cursor},
+                      value=make_variable(start)),
+            loop,
+        ])
+        return self._chain_list(statements)
+
+    def _parse_list_comp_assignment(self, target: str,
+                                    node: ast.ListComp) -> Optional[Statement]:
+        """nums2 = [表达式 for x in 列表/range(...) if 条件]"""
+        if len(node.generators) != 1 or node.generators[0].is_async:
+            self.warn('列表推导式多循环')
+            return None
+        generator = node.generators[0]
+        if len(generator.ifs) > 1:
+            self.warn('列表推导式多条件')
+            return None
+        if not isinstance(generator.target, ast.Name):
+            self.warn('列表推导式解构目标')
+            return None
+        if self._is_string_expr(node.elt):
+            self._string_vars.add(generator.target.id)
+        hidden = f'__py_comp_{self._loop_serial + 1}'
+        self.sprite.lists[hidden] = []
+        self._list_vars.add(hidden)
+        append = ast.Expr(value=ast.Call(
+            func=ast.Attribute(value=ast.Name(id=hidden, ctx=ast.Load()),
+                               attr='append', ctx=ast.Load()),
+            args=[node.elt], keywords=[]))
+        ast.copy_location(append, node)
+        body: List[ast.stmt] = [append]
+        if generator.ifs:
+            branch = ast.If(test=generator.ifs[0], body=[append], orelse=[])
+            ast.copy_location(branch, node)
+            body = [branch]
+        var = generator.target.id
+        iterable = generator.iter
+        if isinstance(iterable, ast.Call) and isinstance(iterable.func, ast.Name) \
+                and iterable.func.id == 'range':
+            loop = self._parse_range_loop(var, iterable.args, body)
+        elif isinstance(iterable, ast.Name) and self._is_list(iterable.id):
+            loop = self._parse_list_loop(var, iterable.id, body)
+        elif isinstance(iterable, ast.List):
+            source = self._literal_list(iterable)
+            if source is None:
+                return None
+            loop = self._parse_list_loop(var, source, body)
+        else:
+            self.warn('列表推导式迭代对象')
+            return None
+        if loop is None:
+            return None
+        self.sprite.lists.setdefault(target, [])
+        self._list_vars.add(target)
+        # 用 _chain 串接：loop 可能是 init.next=loop 的链，直接改 next 会覆盖循环体
+        return self._chain([
+            Statement(type=BlockType.DELETE_ALL_FROM_LIST,
+                      extra={'name': hidden}),
+            loop,
+            Statement(type=BlockType.DELETE_ALL_FROM_LIST,
+                      extra={'name': target}),
+        ] + self._copy_list_statements(hidden, target))
+
+    def _parse_zip_loop(self, first_var: str, second_var: str,
+                        sources: List[str],
+                        body: List[ast.stmt]) -> Optional[Statement]:
+        """for a, b in zip(xs, ys)：按最短列表逐项遍历"""
+        for source in sources:
+            if not self._is_list(source):
+                self.warn('zip 非列表参数')
+                return None
+        context = self._new_loop_context()
+        parsed_body = self._parse_loop_body(body, context)
+        index_var = self._new_temp()
+        length_temp = self._new_temp()
+        prefix = [Statement(
+            type=BlockType.SET_VARIABLE, extra={'name': length_temp},
+            value=Expr(ExprType.LENGTH_OF_LIST, name=sources[0]))]
+        for source in sources[1:]:
+            shorter = Statement(
+                type=BlockType.IF,
+                condition=Expr(
+                    ExprType.LESS_THAN,
+                    left=Expr(ExprType.LENGTH_OF_LIST, name=source),
+                    right=make_variable(length_temp)))
+            shorter.body = [Statement(
+                type=BlockType.SET_VARIABLE, extra={'name': length_temp},
+                value=Expr(ExprType.LENGTH_OF_LIST, name=source))]
+            prefix.append(shorter)
+        assign = []
+        for var, source in zip((first_var, second_var), sources[:2]):
+            assign.append(Statement(
+                type=BlockType.SET_VARIABLE, extra={'name': var},
+                value=make_list_access(source, make_binary_op(
+                    '+', make_variable(index_var), make_number(1)))))
+        init = [
+            Statement(type=BlockType.SET_VARIABLE,
+                      extra={'name': index_var}, value=make_number(0)),
+        ] + prefix
+        if context['used']:
+            statements = self._loop_flags_init(context)
+            statements = init + statements
+            loop = Statement(
+                type=BlockType.REPEAT_UNTIL,
+                condition=Expr(
+                    ExprType.OR,
+                    left=Expr(ExprType.NOT, right=Expr(
+                        ExprType.LESS_THAN, left=make_variable(index_var),
+                        right=make_variable(length_temp))),
+                    right=make_variable(context['break'])))
+            loop.body = assign + parsed_body + [
+                Statement(type=BlockType.SET_VARIABLE,
+                          extra={'name': context['continue']},
+                          value=make_number(0)),
+                Statement(type=BlockType.CHANGE_VARIABLE,
+                          extra={'name': index_var}, value=make_number(1)),
+            ]
+            statements.append(loop)
+            return self._chain_list(statements)
+        loop = Statement(type=BlockType.REPEAT,
+                         value=make_variable(length_temp))
+        loop.body = assign + parsed_body + [
+            Statement(type=BlockType.CHANGE_VARIABLE,
+                      extra={'name': index_var}, value=make_number(1)),
+        ]
+        return self._chain_list(init + [loop])
+
     def _parse_assignment(self, node: ast.Assign) -> Optional[Statement]:
         if len(node.targets) > 1:
             # a = b = 0：右侧只求值一次，再依次赋值
@@ -991,6 +1903,19 @@ class GeneralPythonParser(PythonParser):
                     return None
                 return self._chain_list(
                     self._copy_list_statements(prepared, target.id))
+
+        # 列表推导式：nums2 = [x * 2 for x in nums]
+        if isinstance(target, ast.Name) and isinstance(node.value, ast.ListComp):
+            return self._parse_list_comp_assignment(target.id, node.value)
+
+        # 列表切片：part = nums[1:3]
+        if isinstance(target, ast.Name) \
+                and isinstance(node.value, ast.Subscript) \
+                and isinstance(node.value.value, ast.Name) \
+                and self._is_list(node.value.value.id) \
+                and isinstance(node.value.slice, ast.Slice):
+            return self._list_slice_copy(
+                node.value.value.id, target.id, node.value.slice)
 
         # 列表字面量：nums = [1, 2, 3]
         if isinstance(target, ast.Name) and isinstance(node.value, ast.List):
@@ -1488,6 +2413,15 @@ class GeneralPythonParser(PythonParser):
                 if call.args else make_number(1)
             return Statement(type=BlockType.WAIT, value=seconds)
 
+        # random.shuffle(列表)：原地 Fisher-Yates 洗牌
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) \
+                and func.value.id == 'random' and func.attr == 'shuffle':
+            if call.args and isinstance(call.args[0], ast.Name) \
+                    and self._is_list(call.args[0].id):
+                return self._shuffle_list(call.args[0].id)
+            self.warn('random.shuffle')
+            return None
+
         if func_name == 'print':
             return Statement(type=BlockType.SAY, value=self._print_value(call.args))
 
@@ -1544,6 +2478,12 @@ class GeneralPythonParser(PythonParser):
                     return Expr(ExprType.JOIN,
                                 left=self._parse_expr_to_ir(node.left),
                                 right=self._parse_expr_to_ir(node.right))
+            if isinstance(node.op, ast.Mult):
+                # 字符串重复："-" * 20、text * n
+                if self._is_string_expr(node.left):
+                    return self._string_repeat(node.left, node.right)
+                if self._is_string_expr(node.right):
+                    return self._string_repeat(node.right, node.left)
 
         if isinstance(node, ast.Compare):
             if len(node.ops) > 1:
@@ -1562,11 +2502,17 @@ class GeneralPythonParser(PythonParser):
         if isinstance(node, ast.Call):
             return self._parse_call_expr(node)
 
-        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
-            list_name = node.value.id
-            if self._is_list(list_name):
-                index = self._py_index(self._parse_expr_to_ir(node.slice))
-                return make_list_access(list_name, index)
+        if isinstance(node, ast.Subscript):
+            # 字符串切片 s[a:b] / 下标 s[i] / 负下标 s[-1]
+            if self._is_string_expr(node.value):
+                if isinstance(node.slice, ast.Slice):
+                    return self._string_slice_expr(node.value, node.slice)
+                return self._string_index_expr(node.value, node.slice)
+            if isinstance(node.value, ast.Name):
+                list_name = node.value.id
+                if self._is_list(list_name):
+                    index = self._py_index(self._parse_expr_to_ir(node.slice))
+                    return make_list_access(list_name, index)
 
         if isinstance(node, ast.List):
             self.warn('列表字面量（仅赋值时支持）')
@@ -1698,13 +2644,21 @@ class GeneralPythonParser(PythonParser):
         elif isinstance(func, ast.Attribute):
             func_name = func.attr
 
-        # 用户函数：先调用，再从结果变量读取（Scratch自制积木没有返回值）
+        # 用户函数：先调用，再立刻把返回值抄到独立临时变量
+        # （Scratch自制积木没有返回值；同一表达式里有多个调用或递归时，
+        #  结果变量会被后续调用覆盖，必须逐个捕获）
         if func_name in self._user_functions:
             args = [self._parse_expr_to_ir(arg) for arg in node.args]
-            self._pending.append(Statement(
-                type=BlockType.PROCEDURE_CALL,
-                extra={'name': func_name, 'args': args}))
-            return make_variable(self._result_vars[func_name])
+            result_var = self._result_vars[func_name]
+            temp = self._new_temp('__py_call')
+            self._pending.extend([
+                Statement(type=BlockType.PROCEDURE_CALL,
+                          extra={'name': func_name, 'args': args}),
+                Statement(type=BlockType.SET_VARIABLE,
+                          extra={'name': temp},
+                          value=make_variable(result_var)),
+            ])
+            return make_variable(temp)
 
         if func_name == 'input':
             prompt = self._parse_expr_to_ir(node.args[0]) if node.args else make_string('')

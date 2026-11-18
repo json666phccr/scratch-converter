@@ -311,10 +311,155 @@ print(f"{y:.2f}")
     return True
 
 
+def test_general_python_recursion_and_more_syntax():
+    """递归（含互递归与局部变量）以及切片/推导式/zip 等常见语法"""
+    print("[测试88] 通用Python递归与更多语法")
+    from general_python import parse_general_project
+    from python_generator import generate_python
+
+    code = '''
+data = [1, 2, 3, 4]
+
+def fact(n):
+    if n <= 1:
+        return 1
+    return n * fact(n - 1)
+
+def fib(n):
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+def sum_list(n):
+    if n <= 0:
+        return 0
+    total = data[n - 1]
+    return total + sum_list(n - 1)
+
+def is_even(n):
+    if n == 0:
+        return 1
+    return is_odd(n - 1)
+
+def is_odd(n):
+    if n == 0:
+        return 0
+    return is_even(n - 1)
+
+def digits(n):
+    result = ""
+    while n > 0:
+        result = str(n) + result
+        n = n - 1
+    return result
+
+def reverse_text(s):
+    if s == "":
+        return ""
+    return reverse_text(s[1:]) + s[0]
+
+def count_char(s, ch):
+    if s == "":
+        return 0
+    hit = 1 if s[0] == ch else 0
+    return hit + count_char(s[1:], ch)
+
+text = "hello"
+first = text[0]
+last = text[-1]
+mid = text[1:4]
+line = "-" * 3
+
+nums = [1, 2, 3]
+doubled = [x * 2 for x in nums]
+positive = [n + 10 for n in range(3) if n > 0]
+part = nums[1:3]
+shuffle_nums = [1, 2, 3, 4]
+random.shuffle(shuffle_nums)
+
+xs = [1, 2]
+ys = [3, 4]
+total_xy = 0
+for a, b in zip(xs, ys):
+    total_xy += a * b
+
+answer = fact(5)
+f6 = fib(6)
+s = sum_list(4)
+even = is_even(6)
+digits_text = digits(3)
+reversed_text = reverse_text("abcde")
+hits = count_char("banana", "a")
+'''
+    project = parse_general_project(code, 'Recursion')
+    assert not project.warnings, f"不应有未支持特性: {project.warnings}"
+
+    generated = generate_python(project)
+    assert 'var_answer' in generated, "answer 与运行时属性重名，应改用隐藏属性"
+    assert generated.count('__py_frame_') > 0, "递归函数应生成帧栈"
+
+    data = write_scratch_project(project)
+    opcodes = set()
+    for target in data['targets']:
+        for block in target['blocks'].values():
+            opcodes.add(block['opcode'])
+    for expected in ('data_addtolist', 'data_replaceitemoflist',
+                     'data_deleteoflist', 'data_itemoflist', 'procedures_call'):
+        assert expected in opcodes, f"缺少积木: {expected}"
+
+    def run_green(source):
+        namespace = {}
+        exec(compile(source, '<generated>', 'exec'), namespace)
+        runtime = namespace['ScratchRuntime'](headless=True, audio=False)
+        sprite = namespace['Recursion']()
+        runtime.add_sprite(sprite)
+        try:
+            sprite.run()
+            runtime.green_flag()
+            for _ in range(120):
+                runtime.step()
+                import time
+                time.sleep(0.004)
+                if getattr(sprite, 'digits_text', None) \
+                        and getattr(sprite, 'hits', 0) == 3:
+                    break
+            return sprite
+        finally:
+            runtime.running = False
+            runtime.shutdown()
+
+    sprite = run_green(generated)
+    assert sprite.var_answer == 120, "递归阶乘结果"
+    assert sprite.f6 == 8, "递归斐波那契结果"
+    assert sprite.s == 10, "递归函数的局部变量应按每次调用隔离"
+    assert sprite.even == 1, "互递归结果"
+    assert sprite.digits_text == '123'
+    assert sprite.reversed_text == 'edcba', "递归 + 字符串切片"
+    assert sprite.hits == 3, "递归 + 字符串下标"
+    assert sprite.first == 'h' and sprite.last == 'o'
+    assert sprite.mid == 'ell' and sprite.line == '---'
+    assert sprite.doubled == [2, 4, 6]
+    assert sprite.positive == [11, 12]
+    assert sprite.part == [2, 3]
+    assert sorted(sprite.shuffle_nums) == [1, 2, 3, 4]
+    assert sprite.total_xy == 11
+
+    # 写回 sb3 后再转换，帧栈与递归语义仍要成立
+    roundtrip = generate_python(parse_scratch_project(data))
+    sprite = run_green(roundtrip)
+    assert sprite.var_answer == 120
+    assert sprite.f6 == 8
+    assert sprite.s == 10
+
+    print("  [PASS] 通用Python递归与更多语法通过")
+    return True
+
+
 TESTS = [
     test_general_python_mode,
     test_general_python_more_syntax,
     test_general_python_break_continue,
     test_general_python_builtins_and_methods,
     test_general_python_extended_syntax,
+    test_general_python_recursion_and_more_syntax,
 ]

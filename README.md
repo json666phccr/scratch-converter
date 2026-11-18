@@ -1,6 +1,6 @@
 # Scratch 3.0 <-> Python 双向转换器
 
-> 版本 **0.9.30** · [MIT License](LICENSE)
+> 版本 **0.10.0** · [MIT License](LICENSE)
 
 一个强大的 Scratch 3.0 与 Python 之间的双向转换工具，支持**一比一对应**的转换，同时支持高级 Python 语法。
 
@@ -14,6 +14,7 @@
 - **变量保持**: Scratch变量 -> Python实例变量
 - **列表保持**: Scratch列表 -> Python列表
 - **自制积木**: Scratch自制积木 -> Python类方法
+- **Scratch VM**: 内置纯 IR 解释器，可直接读取 sb3 并执行，无需先生成 Python；支持命令行调试器与窗口内可视化调试面板
 - **两种 Python -> Scratch 模式**: DSL 模式保证高保真往返；通用模式可转换普通 Python 脚本（实验性）
 - **语义说明**: 空输入、缺失参数与类型转换的完整规则见 [docs/scratch-semantics.md](docs/scratch-semantics.md)
 - **图形特效**: 颜色、亮度、透明度、鱼眼、旋涡、像素化、马赛克（与 scratch-render 的变换公式一致）
@@ -36,6 +37,7 @@ Scratch JSON  <--->  中间表示(IR)  <--->  Python 代码
 | `runtime_code/` | 生成脚本使用的运行时模板；`extensions/` 下按扩展拆分子文件，由 `config.json` 描述处理器、别名与依赖，生成时按需拼装 |
 | `python_parser.py` | Python DSL -> IR 解析器（高保真） |
 | `general_python.py` | 通用 Python -> IR 解析器（实验性） |
+| `scratch_vm/` | 纯 IR 解释器：直接执行 sb3，支持断点、单步、trace、变量查看与可视化调试 |
 | `convert_log.py` | 转换日志（阶段、中间状态、异常定位） |
 | `converter.py` | 主转换器入口 |
 
@@ -103,6 +105,131 @@ scratch_json = converter.python_code_to_scratch_json(python_code_string)
 converter.python_to_scratch('script.py', 'project.sb3', mode='general')
 ```
 
+## Scratch VM（解释执行与调试）
+
+除转换之外，`src/scratch_vm/` 还提供一台**纯 IR 解释器**：直接读取 `.sb3`
+并逐块执行，不需要先生成 Python 文件。它复用现有 pygame 运行时，因此渲染、
+画笔、克隆、音频、询问框和内置扩展的行为与生成脚本一致。
+
+### 运行
+
+```bash
+# 在 src 目录下执行（或把 src 加入 PYTHONPATH）
+cd src
+
+# 窗口运行
+python -m scratch_vm ..\example\general_demo.sb3
+
+# 无窗口运行 60 帧并输出统计
+python -m scratch_vm ..\example\general_demo.sb3 --headless --frames 60 --no-audio --stats
+
+# 启用交互调试
+python -m scratch_vm ..\example\general_demo.sb3 --debug
+
+# 启动即暂停，并在指定 opcode 上断点
+python -m scratch_vm game.sb3 --debug --pause-on-start --break-opcode data_setvariableto
+
+# 条件断点 + watch
+python -m scratch_vm game.sb3 --debug --break-if "var('分数') > 10" --watch "var('分数')"
+```
+
+### 运行参数
+
+| 参数 | 说明 |
+|------|------|
+| `--headless` | 无窗口（SDL dummy），适合自动化 |
+| `--fps N` | 覆盖帧率 |
+| `--frames N` / `--seconds N` | 运行上限 |
+| `--seed N` | 随机种子 |
+| `--turbo` | 立即模式（循环尽量不让帧） |
+| `--no-fencing` | 关闭舞台边界限制 |
+| `--no-audio` | 关闭声音 |
+| `--stage-size WxH` | 自定义舞台尺寸 |
+| `--infinite-clones` | 解除 300 克隆上限 |
+
+### 调试参数
+
+| 参数 | 说明 |
+|------|------|
+| `--debug` | 交互调试，从 stdin 读取命令 |
+| `--pause-on-start` | 启动后立即暂停 |
+| `--trace` | 打印每条执行的积木 |
+| `--trace-size N` | trace 环形缓冲大小（默认 2000） |
+| `--break-opcode OP` | 按 opcode 设断点，可逗号分隔或重复指定 |
+| `--break-sprite NAME` | 按角色名设断点（克隆体写作 `名字#clone`） |
+| `--break-block ID` | 按 block id 设断点 |
+| `--break-if EXPR` | 条件断点，可用 `sprite`/`runtime`/`frame`/`var()`/`lst()` |
+| `--watch EXPR` | watch 表达式，退出前可反复查看 |
+| `--no-overlay` | 关闭窗口内可视化面板 |
+| `--stats` | 退出时打印执行统计 |
+| `--dump-vars` | 退出时打印变量/列表 |
+
+### 交互命令
+
+`--debug` 模式下输入：
+
+| 命令 | 别名 | 说明 |
+|------|------|------|
+| `help` | `h` | 命令列表 |
+| `continue` | `c` | 继续运行 |
+| `pause` | `p` | 暂停 |
+| `step` | `s` | 单步一个积木 |
+| `frame` | `sf` | 单步一帧 |
+| `trace [n]` | `t` | 最近 n 条执行记录 |
+| `stack` | `bt` | 所有线程的调用栈 |
+| `threads` | `th` | 活动线程列表 |
+| `vars [角色]` | `v` | 查看变量/列表 |
+| `watch [表达式]` | `w` | 查看或添加 watch |
+| `break opcode/sprite/block/if 值` | `b` | 设置断点 |
+| `breaks` | `bl` | 断点列表 |
+| `delete N\|all` | `bd` | 删除断点 |
+| `stats` | `st` | 执行统计 |
+| `overlay` | `o` | 切换可视化面板 |
+| `quit` | `q` | 退出 |
+
+### 可视化调试面板
+
+窗口模式下默认在左上角显示半透明面板（F2 开关）：
+
+```text
+[VM] PAUSED  frame 123  fps 30  threads 4  clones 2
+位置: Cat  motion_movesteps  block=abc123
+栈: 当绿旗被点击 > 我的积木 add %s %s
+变量: 分数=10  速度=3
+断点 2  trace 2000  语句 15352  错误 0
+```
+
+面板不会暂停 pygame 主循环；暂停的只是脚本线程。
+
+### Python API
+
+```python
+from scratch_vm import run_project
+
+result = run_project(
+    "game.sb3",
+    headless=True,
+    max_frames=60,
+    audio=False,
+)
+print(result["variables"])   # 变量/列表快照
+print(result["stats"])       # opcode / 角色执行统计
+```
+
+### 实现文档
+
+- [SB3 文件结构详解](docs/sb3-format.md)
+- [Scratch VM 执行语义](docs/scratch-vm-execution.md)
+- [Scratch VM 实现设计](docs/scratch-vm-design.md)
+- [Scratch 输入与参数语义](docs/scratch-semantics.md)
+
+### 已知限制
+
+- 只支持内置扩展；未知扩展返回 0 并记录警告；
+- 递归深度受 Python 栈限制；
+- SVG 使用内置简化渲染器，复杂矢量图可能失真；
+- 与官方 JS VM 的字符串长度（UTF-16 vs 码点）、超大整数精度存在差异。
+
 ## 两种 Python -> Scratch 模式
 
 ### DSL 模式（默认自动识别，高保真）
@@ -121,6 +248,7 @@ converter.python_to_scratch('script.py', 'project.sb3', mode='general')
 |--------|---------|
 | 顶层语句 | 绿旗脚本 |
 | `def f(a):` + `return x` | 自制积木，返回值写入 `__py_ret_f` 变量 |
+| 递归 / 互相递归 | 参数与局部变量改用列表帧栈（进入压栈、返回出栈），多层调用互不覆盖 |
 | `if / elif / else` | `如果…否则` |
 | `while cond:` | `重复执行直到 <not cond>` |
 | `for i in range(...)` | `重复执行 N 次` + 维护循环变量 |
@@ -136,6 +264,10 @@ converter.python_to_scratch('script.py', 'project.sb3', mode='general')
 | `nums.reverse()` / `sort()` | 交换循环 / 冒泡排序 |
 | `nums[i]` / `nums[i] = x` | 自动把 0 起始下标转换为 Scratch 的 1 起始 |
 | `del nums[i]` | 删除列表第 i 项 |
+| `part = nums[1:3]` | 复制区间内的项到新列表（支持负下标与省略端点） |
+| `[x * 2 for x in nums if x > 0]` | 简单列表推导式（单循环 + 可选条件） |
+| `for a, b in zip(xs, ys):` | 按最短列表逐项遍历 |
+| `random.shuffle(nums)` | 原地 Fisher-Yates 洗牌 |
 | `a = b = 0` | 连续赋值（右侧只求值一次） |
 | `a, b = b, a` | 临时变量解构交换 |
 | `a -= x` / `*= x` / `/= x` / `//= x` / `%= x` / `**= x` | 增加/设值 + 对应运算 |
@@ -145,6 +277,9 @@ converter.python_to_scratch('script.py', 'project.sb3', mode='general')
 | `0 < a <= 3` 链式比较 | `与` 组合的多个比较 |
 | `x in nums` / `x not in nums` | 列表包含 / 不包含 |
 | `"ell" in "hello"` | `包含` 积木（字符串包含） |
+| `s[0]` / `s[-1]` | `第 n 个字符`，负下标自动换算到末尾 |
+| `s[1:4]` / `s[-3:]` | 逐字符拼接出切片结果 |
+| `"-" * 3` / `s * n` | 常量折叠或循环重复连接 |
 | `f"count={count}"` | 连接积木（忽略格式说明） |
 | `"a=" + str(a)` / `s += ch` | 含字符串操作数的 `+` 自动使用连接 |
 | `a // b` | `floor(a / b)` |
@@ -168,8 +303,11 @@ converter.python_to_scratch('script.py', 'project.sb3', mode='general')
 
 **通用模式限制**：类、异常、生成器、装饰器、多返回值、
 `match`、大部分字符串方法（`upper/lower/strip/replace/split` 等）、
-文件/网络等不支持；遇到时会在命令行打印“转换报告”，
+把列表作为函数参数、文件/网络等不支持；遇到时会在命令行打印“转换报告”，
 并把这些特性记录到 `ProjectIR.warnings`，不会静默改变语义。
+递归函数通过列表帧栈隔离参数/局部变量，但递归深度仍受 Scratch 自制积木
+调用栈限制；与运行时属性重名的变量（如 `answer`、`timer`）会改用
+`var_answer` 之类的隐藏属性，Scratch 中显示的变量名保持不变。
 条件表达式和 `if` 一样，两条分支都会先求值，含副作用的表达式结果可能不同。
 
 ## 转换映射表
@@ -343,6 +481,7 @@ python converter.py demo
 - [x] Files 文件扩展：打开本地文件（文本 / data URL）、把文本或 URL 下载到系统“下载”文件夹
 - [x] Clipping & Blending 裁剪与颜色混合扩展：矩形裁剪框，以及默认/加法/减法/正片叠底/反色/遮罩/擦除等混合模式，角色与画笔均生效
 - [x] Asset Manager 资源管理扩展：造型/声音的 URL 添加、删除、改名、排序与格式/dataURI/编号/资源 ID 查询
+- [x] 通用 Python 转换支持递归/互递归（列表帧栈隔离参数与局部变量）、字符串下标/切片/重复、简单列表推导式、`zip` 遍历、`random.shuffle` 与重名变量隔离
 - [x] 公平脚本调度：FIFO 执行权 + 轻量脚本线程，大量克隆同时运行时不会互相饿死
 - [x] 广播 (发送、接收、等待)，写回 sb3 时使用标准 `[11, 名字, ID]` 输入顺序，往返后发送端与接收端消息名一致
 - [x] 自制积木 (定义、调用、参数)

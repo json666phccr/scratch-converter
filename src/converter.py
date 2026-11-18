@@ -30,7 +30,7 @@ from python_parser import (parse_python_code, parse_python_file,
 from general_python import parse_general_project
 from convert_log import LOG
 
-__version__ = "0.9.30"
+__version__ = "0.10.0"
 
 
 def _count_statements(project: ProjectIR) -> int:

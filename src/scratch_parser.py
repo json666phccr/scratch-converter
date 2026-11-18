@@ -269,6 +269,29 @@ class ScratchParser:
         self.current_list_names: Dict[str, str] = {}
         self.current_list_ids: Dict[str, str] = {}
 
+    # 与运行时角色属性/方法重名的变量必须换属性名，否则会覆盖
+    # answer/x/y/size 等 Scratch 内置属性，或遮蔽同名方法
+    RESERVED_ATTRS = {
+        'answer', 'mouse_x', 'mouse_y', 'mouse_down', 'timer', 'loudness',
+        'days_since_2000',
+        'move', 'turn_right', 'turn_left', 'goto_xy', 'goto_random',
+        'glide_to', 'glide_secs_to', 'point_in_direction', 'point_towards',
+        'change_x', 'change_y', 'set_x', 'set_y', 'if_on_edge_bounce',
+        'say', 'say_for', 'think', 'think_for', 'show', 'hide',
+        'switch_costume', 'next_costume', 'switch_backdrop', 'change_size',
+        'set_size', 'change_effect', 'set_effect', 'clear_effects',
+        'go_to_front', 'go_to_back', 'play_sound', 'stop_all_sounds',
+        'wait', 'wait_until', 'stop', 'stop_all', 'create_clone',
+        'delete_this_clone', 'ask_and_wait', 'reset_timer',
+        'broadcast', 'broadcast_and_wait', 'extension', 'run',
+    }
+
+    @classmethod
+    def _safe_attr(cls, attr: str, prefix: str) -> str:
+        if attr in cls.RESERVED_ATTRS:
+            return f"{prefix}_{attr}"
+        return attr
+
     @staticmethod
     def _unique_attr(base: str, used: set, prefix: str) -> str:
         """为冲突的变量/列表生成唯一属性名"""
@@ -300,7 +323,7 @@ class ScratchParser:
             return self.current_var_names[name]
         if name in self.global_var_names:
             return self.global_var_names[name]
-        return sanitize_name(name, 'var')
+        return self._safe_attr(sanitize_name(name, 'var'), 'var')
 
     def _list_attr(self, name: str, list_id: str = '') -> str:
         key = str(list_id or '')
@@ -312,7 +335,7 @@ class ScratchParser:
             return self.current_list_names[name]
         if name in self.global_list_names:
             return self.global_list_names[name]
-        return sanitize_name(name, 'lst')
+        return self._safe_attr(sanitize_name(name, 'lst'), 'lst')
 
     def _extension_namespace(self, opcode: str) -> Optional[str]:
         prefix = opcode.split('_', 1)[0]
@@ -417,7 +440,9 @@ class ScratchParser:
             if not isinstance(var_data, list) or not var_data:
                 continue
             name = str(var_data[0])
-            attr = self._unique_attr(sanitize_name(name, 'var'), used, 'global')
+            attr = self._unique_attr(
+                self._safe_attr(sanitize_name(name, 'var'), 'var'),
+                used, 'global')
             used.add(attr)
             self.global_var_names[name] = attr
             self.global_var_ids[str(var_id)] = attr
@@ -425,7 +450,9 @@ class ScratchParser:
             if not isinstance(list_data, list) or not list_data:
                 continue
             name = str(list_data[0])
-            attr = self._unique_attr(sanitize_name(name, 'lst'), used, 'global')
+            attr = self._unique_attr(
+                self._safe_attr(sanitize_name(name, 'lst'), 'lst'),
+                used, 'global')
             used.add(attr)
             self.global_list_names[name] = attr
             self.global_list_ids[str(list_id)] = attr
@@ -488,7 +515,9 @@ class ScratchParser:
                 if not isinstance(var_data, list) or not var_data:
                     continue
                 name = str(var_data[0])
-                attr = self._unique_attr(sanitize_name(name, 'var'), used, 'local')
+                attr = self._unique_attr(
+                    self._safe_attr(sanitize_name(name, 'var'), 'var'),
+                    used, 'local')
                 used.add(attr)
                 sprite.variable_attrs[name] = attr
                 sprite.variable_id_attrs[str(var_id)] = attr
@@ -496,7 +525,9 @@ class ScratchParser:
                 if not isinstance(list_data, list) or not list_data:
                     continue
                 name = str(list_data[0])
-                attr = self._unique_attr(sanitize_name(name, 'lst'), used, 'local')
+                attr = self._unique_attr(
+                    self._safe_attr(sanitize_name(name, 'lst'), 'lst'),
+                    used, 'local')
                 used.add(attr)
                 sprite.list_attrs[name] = attr
                 sprite.list_id_attrs[str(list_id)] = attr
@@ -594,6 +625,7 @@ class ScratchParser:
             stmt = Statement(type=block_type, extra={
                 'namespace': namespace,
                 'opcode': opcode,
+                'block_id': raw.id,
             })
             stmt.extra['inputs'], stmt.extra['fields'] = \
                 self._parse_extension_inputs(raw)
@@ -612,6 +644,9 @@ class ScratchParser:
                 return None
 
         stmt = Statement(type=block_type)
+        # 调试器需要原始积木 ID / opcode；生成器不会读取这两个键
+        stmt.extra['block_id'] = raw.id
+        stmt.extra['opcode'] = opcode
 
         # 根据块类型解析参数
         if block_type == BlockType.WHEN_FLAG_CLICKED:

@@ -935,6 +935,11 @@ RUNTIME_CLASS = r'''class ScratchRuntime:
             # Clipping & Blending：停止全部时清除裁剪框与混合模式
             sprite._clipbox = None
             sprite._blend_mode = 'default'
+            # 递归函数的局部变量栈：停止时清空，避免被中断的递归留下残帧
+            for name, value in list(sprite.__dict__.items()):
+                if name.startswith(('lst__py_frame_', '__py_frame_')) \
+                        and isinstance(value, list):
+                    value.clear()
         with self.frame_condition:
             self.frame_condition.notify_all()
 

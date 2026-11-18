@@ -531,9 +531,19 @@ class PythonGenerator:
         return lines
 
     def _emit_body(self, body: List[Statement], indent: int) -> List[str]:
+        """生成语句列表；每条语句后继续沿 next 链输出
+
+        循环/返回等语句会在内部用 next 串接后续语句（例如 for 的初始化
+        语句 next 指向循环体），旧实现只看列表元素会丢掉这些链上的积木。
+        """
         lines = []
+        seen = set()
         for child in body:
-            lines.extend(self._generate_statement(child, indent))
+            stmt = child
+            while stmt is not None and id(stmt) not in seen:
+                seen.add(id(stmt))
+                lines.extend(self._generate_statement(stmt, indent))
+                stmt = stmt.next
         return lines
 
     # ===================== 自制积木定义 =====================
