@@ -22,12 +22,13 @@ from test_extensions_b import TESTS as EXTENSION_B_TESTS
 from test_extensions_c import TESTS as EXTENSION_C_TESTS
 from test_regressions import TESTS as REGRESSION_TESTS
 from test_scratch_vm import TESTS as VM_TESTS
+from test_scpython import TESTS as SCPYTHON_TESTS
 
 TESTS = (
     BASIC_TESTS + PROCEDURE_TESTS + RUNTIME_TESTS + TURBOWARP_TESTS
     + VISUAL_TESTS + GENERAL_TESTS + IO_TESTS + EXTENSION_A_TESTS
     + EXTENSION_B_TESTS + EXTENSION_C_TESTS + REGRESSION_TESTS
-    + VM_TESTS
+    + VM_TESTS + SCPYTHON_TESTS
 )
 
 

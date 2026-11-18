@@ -30,7 +30,7 @@ from python_parser import (parse_python_code, parse_python_file,
 from general_python import parse_general_project
 from convert_log import LOG
 
-__version__ = "0.10.0"
+__version__ = "0.11.0"
 
 
 def _count_statements(project: ProjectIR) -> int:
@@ -475,6 +475,7 @@ def _dispatch(converter, args):
         print("用法:")
         print("  python converter.py scratch2py <input.sb3> [output.py] [--split] [--no-bundle]")
         print("  python converter.py py2scratch <input.py> [output.sb3] [--mode dsl|general|auto]")
+        print("  python converter.py scpy2scratch <工程目录> [output.sb3]")
         print("  python converter.py roundtrip-sb3 <input.sb3> [output.sb3]")
         print("  python converter.py roundtrip-py <input.py> [output.py]")
         print("  python converter.py demo")
@@ -517,6 +518,18 @@ def _dispatch(converter, args):
         input_path = args[0]
         output_path = args[1] if len(args) > 1 else input_path.replace('.py', '.sb3')
         converter.python_to_scratch(input_path, output_path, mode)
+
+    elif command == 'scpy2scratch':
+        args = args[1:]
+        if not args:
+            print("用法: python converter.py scpy2scratch <工程目录> [output.sb3]")
+            sys.exit(1)
+        from scpython import export_project
+        folder = args[0]
+        output_path = args[1] if len(args) > 1 else (
+            os.path.abspath(folder.rstrip('\\/')) + '.sb3')
+        path = export_project(folder, output_path)
+        print(f"  ScPython 工程已导出: {path}")
 
     elif command == 'roundtrip-sb3':
         if len(args) < 2:

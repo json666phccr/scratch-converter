@@ -290,6 +290,10 @@ class ScratchWriter:
             if name and name not in names:
                 names.append(name)
 
+        # 项目声明但暂未使用的扩展也要保留（ScPython 的 extensions 声明）
+        for name in getattr(project, 'extensions', ()) or ():
+            add(str(name))
+
         def walk_expr(expr: Optional[Expr]):
             if not isinstance(expr, Expr):
                 return
@@ -371,29 +375,31 @@ class ScratchWriter:
 
         # 构建变量字典
         variables = {}
+        variable_ids = getattr(sprite, 'variable_ids', {}) or {}
         for name, value in sprite.variables.items():
             if name in skip_vars:
                 continue
-            var_id = f"var_{name}"
+            var_id = variable_ids.get(name) or f"var_{name}"
             variables[var_id] = [name, value]
         for name in used_vars:
             if name in skip_vars:
                 continue
-            var_id = f"var_{name}"
+            var_id = variable_ids.get(name) or f"var_{name}"
             if var_id not in variables:
                 variables[var_id] = [name, 0]
 
         # 构建列表字典
         lists = {}
+        list_ids = getattr(sprite, 'list_ids', {}) or {}
         for name, items in sprite.lists.items():
             if name in skip_lists:
                 continue
-            list_id = f"list_{name}"
+            list_id = list_ids.get(name) or f"list_{name}"
             lists[list_id] = [name, items]
         for name in used_lists:
             if name in skip_lists:
                 continue
-            list_id = f"list_{name}"
+            list_id = list_ids.get(name) or f"list_{name}"
             if list_id not in lists:
                 lists[list_id] = [name, []]
 
@@ -746,47 +752,56 @@ class ScratchWriter:
 
         elif stmt.type == BlockType.SHOW_VARIABLE:
             var_name = stmt.extra.get('name', 'var')
-            block_data["fields"]["VARIABLE"] = [var_name, f"var_{var_name}"]
+            block_data["fields"]["VARIABLE"] = [
+                var_name, stmt.extra.get('id') or f"var_{var_name}"]
 
         elif stmt.type == BlockType.HIDE_VARIABLE:
             var_name = stmt.extra.get('name', 'var')
-            block_data["fields"]["VARIABLE"] = [var_name, f"var_{var_name}"]
+            block_data["fields"]["VARIABLE"] = [
+                var_name, stmt.extra.get('id') or f"var_{var_name}"]
 
         elif stmt.type == BlockType.ADD_TO_LIST:
             list_name = stmt.extra.get('name', 'list')
-            block_data["fields"]["LIST"] = [list_name, f"list_{list_name}"]
+            block_data["fields"]["LIST"] = [
+                list_name, stmt.extra.get('id') or f"list_{list_name}"]
             block_data["inputs"]["ITEM"] = self.write_any_input(stmt.value)
 
         elif stmt.type == BlockType.DELETE_FROM_LIST:
             list_name = stmt.extra.get('name', 'list')
-            block_data["fields"]["LIST"] = [list_name, f"list_{list_name}"]
+            block_data["fields"]["LIST"] = [
+                list_name, stmt.extra.get('id') or f"list_{list_name}"]
             block_data["inputs"]["INDEX"] = self.write_any_input(stmt.value)
 
         elif stmt.type == BlockType.DELETE_ALL_FROM_LIST:
             list_name = stmt.extra.get('name', 'list')
-            block_data["fields"]["LIST"] = [list_name, f"list_{list_name}"]
+            block_data["fields"]["LIST"] = [
+                list_name, stmt.extra.get('id') or f"list_{list_name}"]
 
         elif stmt.type == BlockType.INSERT_IN_LIST:
             list_name = stmt.extra.get('name', 'list')
-            block_data["fields"]["LIST"] = [list_name, f"list_{list_name}"]
+            block_data["fields"]["LIST"] = [
+                list_name, stmt.extra.get('id') or f"list_{list_name}"]
             block_data["inputs"]["ITEM"] = self.write_any_input(
                 stmt.extra.get('item'))
             block_data["inputs"]["INDEX"] = self.write_any_input(stmt.value)
 
         elif stmt.type == BlockType.REPLACE_IN_LIST:
             list_name = stmt.extra.get('name', 'list')
-            block_data["fields"]["LIST"] = [list_name, f"list_{list_name}"]
+            block_data["fields"]["LIST"] = [
+                list_name, stmt.extra.get('id') or f"list_{list_name}"]
             block_data["inputs"]["ITEM"] = self.write_any_input(
                 stmt.extra.get('item'))
             block_data["inputs"]["INDEX"] = self.write_any_input(stmt.value)
 
         elif stmt.type == BlockType.SHOW_LIST:
             list_name = stmt.extra.get('name', 'list')
-            block_data["fields"]["LIST"] = [list_name, f"list_{list_name}"]
+            block_data["fields"]["LIST"] = [
+                list_name, stmt.extra.get('id') or f"list_{list_name}"]
 
         elif stmt.type == BlockType.HIDE_LIST:
             list_name = stmt.extra.get('name', 'list')
-            block_data["fields"]["LIST"] = [list_name, f"list_{list_name}"]
+            block_data["fields"]["LIST"] = [
+                list_name, stmt.extra.get('id') or f"list_{list_name}"]
 
         elif stmt.type == BlockType.BROADCAST:
             bc_name = stmt.value.to_scratch_value() if stmt.value else ''
@@ -1177,34 +1192,40 @@ class ScratchWriter:
         elif expr.type == ExprType.VARIABLE:
             block_data["opcode"] = "data_variable"
             var_name = expr.name
-            block_data["fields"]["VARIABLE"] = [var_name, f"var_{var_name}"]
+            block_data["fields"]["VARIABLE"] = [
+                var_name, expr.extra.get('id') or f"var_{var_name}"]
 
         elif expr.type == ExprType.LIST_ACCESS:
             block_data["opcode"] = "data_listcontents"
             list_name = expr.name
-            block_data["fields"]["LIST"] = [list_name, f"list_{list_name}"]
+            block_data["fields"]["LIST"] = [
+                list_name, expr.extra.get('id') or f"list_{list_name}"]
 
         elif expr.type == ExprType.ITEM_OF_LIST:
             block_data["opcode"] = "data_itemoflist"
             list_name = expr.name
-            block_data["fields"]["LIST"] = [list_name, f"list_{list_name}"]
+            block_data["fields"]["LIST"] = [
+                list_name, expr.extra.get('id') or f"list_{list_name}"]
             block_data["inputs"]["INDEX"] = self.write_any_input(expr.left)
 
         elif expr.type == ExprType.ITEM_NUMBER_OF_LIST:
             block_data["opcode"] = "data_itemnumoflist"
             list_name = expr.name
-            block_data["fields"]["LIST"] = [list_name, f"list_{list_name}"]
+            block_data["fields"]["LIST"] = [
+                list_name, expr.extra.get('id') or f"list_{list_name}"]
             block_data["inputs"]["ITEM"] = self.write_any_input(expr.left)
 
         elif expr.type == ExprType.LENGTH_OF_LIST:
             block_data["opcode"] = "data_lengthoflist"
             list_name = expr.name
-            block_data["fields"]["LIST"] = [list_name, f"list_{list_name}"]
+            block_data["fields"]["LIST"] = [
+                list_name, expr.extra.get('id') or f"list_{list_name}"]
 
         elif expr.type == ExprType.LIST_CONTAINS:
             block_data["opcode"] = "data_listcontainsitem"
             list_name = expr.name
-            block_data["fields"]["LIST"] = [list_name, f"list_{list_name}"]
+            block_data["fields"]["LIST"] = [
+                list_name, expr.extra.get('id') or f"list_{list_name}"]
             block_data["inputs"]["ITEM"] = self.write_any_input(expr.left)
 
         elif expr.type == ExprType.ANSWER:
@@ -1297,7 +1318,10 @@ class ScratchWriter:
             block_data["fields"]["CURRENTMENU"] = [expr.name, None]
 
         elif expr.type == ExprType.ARGUMENT:
-            block_data["opcode"] = "argument_reporter_string_number"
+            block_data["opcode"] = (
+                "argument_reporter_boolean"
+                if expr.extra.get('boolean')
+                else "argument_reporter_string_number")
             block_data["fields"]["VALUE"] = [expr.name, None]
 
         elif expr.type == ExprType.NUMBER:

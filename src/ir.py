@@ -835,6 +835,10 @@ class SpriteIR:
     global_variable_names: Set[str] = field(default_factory=set)
     global_list_names: Set[str] = field(default_factory=set)
     global_values: Dict[str, Any] = field(default_factory=dict)
+    # 变量/列表名 -> Scratch ID；为空时写入器回退到 var_<name>/list_<name>。
+    # ScPython 用它区分全局变量与各角色的同名局部变量。
+    variable_ids: Dict[str, str] = field(default_factory=dict)
+    list_ids: Dict[str, str] = field(default_factory=dict)
     broadcasts: List[str] = field(default_factory=list)
     costumes: List[Dict[str, Any]] = field(default_factory=list)
     sounds: List[Dict[str, Any]] = field(default_factory=list)

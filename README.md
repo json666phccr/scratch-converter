@@ -1,6 +1,6 @@
 # Scratch 3.0 <-> Python 双向转换器
 
-> 版本 **0.10.0** · [MIT License](LICENSE)
+> 版本 **0.11.0** · [MIT License](LICENSE)
 
 一个强大的 Scratch 3.0 与 Python 之间的双向转换工具，支持**一比一对应**的转换，同时支持高级 Python 语法。
 
@@ -15,6 +15,7 @@
 - **列表保持**: Scratch列表 -> Python列表
 - **自制积木**: Scratch自制积木 -> Python类方法
 - **Scratch VM**: 内置纯 IR 解释器，可直接读取 sb3 并执行，无需先生成 Python；支持命令行调试器与窗口内可视化调试面板
+- **ScPython**: 新语言 `.scpy`，Python 风格语法 + Scratch 语义；一个工程文件夹编译为 sb3，支持角色文件、舞台、宏、嵌套目录、资产与自定义扩展
 - **两种 Python -> Scratch 模式**: DSL 模式保证高保真往返；通用模式可转换普通 Python 脚本（实验性）
 - **语义说明**: 空输入、缺失参数与类型转换的完整规则见 [docs/scratch-semantics.md](docs/scratch-semantics.md)
 - **图形特效**: 颜色、亮度、透明度、鱼眼、旋涡、像素化、马赛克（与 scratch-render 的变换公式一致）
@@ -38,6 +39,7 @@ Scratch JSON  <--->  中间表示(IR)  <--->  Python 代码
 | `python_parser.py` | Python DSL -> IR 解析器（高保真） |
 | `general_python.py` | 通用 Python -> IR 解析器（实验性） |
 | `scratch_vm/` | 纯 IR 解释器：直接执行 sb3，支持断点、单步、trace、变量查看与可视化调试 |
+| `scpython/` | `.scpy` 语言编译器：工程目录 -> sb3，支持宏、嵌套角色、资产与自定义扩展 |
 | `convert_log.py` | 转换日志（阶段、中间状态、异常定位） |
 | `converter.py` | 主转换器入口 |
 
@@ -229,6 +231,71 @@ print(result["stats"])       # opcode / 角色执行统计
 - 递归深度受 Python 栈限制；
 - SVG 使用内置简化渲染器，复杂矢量图可能失真；
 - 与官方 JS VM 的字符串长度（UTF-16 vs 码点）、超大整数精度存在差异。
+
+## ScPython（.scpy）
+
+ScPython 是一门 **Python 风格、Scratch 语义** 的文本语言。一个工程文件夹直接编译为 `.sb3`：
+
+```text
+my_project/
+├── stage.scpy        # 舞台
+├── Cat.scpy          # 角色（文件名即角色名）
+├── macros.scpy       # 所有角色可复用的宏
+├── extensions.json   # 自定义扩展声明
+└── assets/
+    ├── cat.svg
+    └── meow.wav
+```
+
+```python
+# Cat.scpy
+init:
+    costumes = ["cat.svg"]
+    var score = 0
+    list history = []
+
+when green_flag:
+    greet("ScPython")
+    for i in range(5):
+        score += i
+        history.append(i)
+    say(join("score=", score))
+
+def add_score(amount, *, types="n", warp=True):
+    score += amount
+```
+
+```bash
+cd src
+
+# 语法检查
+python -m scpython check ..\example\scpy_demo
+
+# 导出 sb3
+python -m scpython export ..\example\scpy_demo -o ..\example\scpy_demo.sb3
+
+# 主转换器别名
+python converter.py scpy2scratch ..\example\scpy_demo ..\example\scpy_demo.sb3
+```
+
+特性：
+
+- `==` / `!=` 使用 Scratch 比较规则；`+` 是 Scratch 数字加法，字符串用 `join`；
+- 列表索引从 1 开始，只支持原版 Scratch 列表操作；
+- 每个文件一个角色，`units/Bat.scpy` 导出为角色 `units//Bat`；
+- `macros.scpy` 中的函数在角色调用时按需复制到角色内（含传递依赖）；
+- 支持 pen/music 内置封装与 `extensions.json` 自定义扩展；
+- `assets/` 自动计算 MD5、造型尺寸与旋转中心，资源自动去重；
+- 导出前校验 SB3 元数据与目标结构（`meta.vm`、`targets`、造型/声音字段），避免 TurboWarp 拒绝打开；
+- 事件用 `when ...:`，自制积木用 `def` + `*` 元信息（`types`/`warp`/`label`）；
+- 拒绝 class、装饰器、字典/集合、推导式、f-string、字符串方法、列表切片等高级语法。
+
+文档：
+
+- [ScPython 编写教程](docs/scpython-tutorial.md)（Scratch 机制 + 从零教程 + 常用配方 + AI 工作流）
+- [ScPython 语言指南](docs/scpython.md)
+- [ScPython AI 速查表](docs/scpython-ai-cheatsheet.md)
+- [ScPython 与 Scratch 行为参考](docs/scpython-scratch-behavior.md)
 
 ## 两种 Python -> Scratch 模式
 
