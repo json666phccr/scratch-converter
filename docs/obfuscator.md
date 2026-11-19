@@ -1,0 +1,288 @@
+# SB3 -> 混淆 Python 单向转换
+
+本工具把 Scratch 项目（`.sb3`）转换为**单文件、可执行、经过强混淆的 Python**。
+它是**单向**的：输出不包含任何可反向还原 SB3 的源码信息。
+
+v2 强化版在 v1（常量折叠 + 字符串加密 + 载荷加密）之上新增：
+
+- **属性派发表**：所有属性/方法访问改写为 `getattr(obj, 加密表引用)`，
+  `co_names` 中不再出现 `move/say/broadcast` 等 Scratch 方法名；
+- **类方法重命名**（黑名单保护 threading/os/pygame 同名方法）；
+- **链式加密字符串表**：条目间哈希链关联，一次性展开解码；
+- **函数簇懒加载**：顶层函数拆分为独立加密的簇，trampoline 首次调用才解密，
+  hook 一次 `exec` 只能拿到单个簇；
+- **密钥分裂**：主密钥 = SHA256(8 个散布的 64 位片段)，文件中不存在完整密钥；
+- **分段 HMAC-SHA256**：每段独立 salt + 完整性标签，篡改任意字节即解密失败；
+- **Silent Corrupt**：篡改/调试器/版本不符不报清晰错误，而是翻转密钥继续
+  解密，让垃圾数据在远离检测点的地方自然崩溃；
+- **反调试探针**：启动检测 `sys.gettrace`/`sys.monitoring`/调试器模块，
+  运行中每 17 秒复查，命中后腐蚀字符串表；
+- **虚拟资产文件系统**：内嵌资产不落盘，包装 `open`/`os.path.exists`/
+  `pygame.image.load`/`pygame.mixer.Sound` 按需解密，资产重命名为匿名文件。
+
+> 重要：任何纯 Python 本地混淆都不是不可破解的加密。本工具的目标是显著提高
+> 阅读、搜索、直接复用源码的成本，同时保证项目正常运行。确定要逆向的人仍然
+> 可以通过调试器、hook `exec`、dump code object 等方式恢复部分逻辑。
+> 完整威胁模型与后续路线见 [obfuscator-hardening.md](obfuscator-hardening.md)。
+
+---
+
+## 1. 快速开始
+
+```bash
+cd src
+
+# 默认内嵌资产，输出单文件
+python -m obfuscator ..\example\scpy_demo.sb3 ..\example\scpy_demo_obf.py
+
+# 使用主转换器
+python converter.py sb3obf ..\example\scpy_demo.sb3 ..\example\scpy_demo_obf.py
+
+# 资产放外部目录
+python -m obfuscator input.sb3 output.py --no-embed-assets
+
+# 关闭常量折叠
+python -m obfuscator input.sb3 output.py --no-fold
+
+# 固定 AST 混淆随机种子（便于复现构建）
+python -m obfuscator input.sb3 output.py --seed 123
+```
+
+运行：
+
+```bash
+python output.py --headless --frames 60 --no-audio
+python output.py            # 窗口模式
+```
+
+---
+
+## 2. 参数
+
+| 参数 | 说明 |
+|------|------|
+| `input` | 输入 `.sb3` / `.json` |
+| `output` | 输出 `.py`；默认 `<输入名>_obf.py` |
+| `--no-embed-assets` | 资产不写入载荷，导出到 `<输出名>_assets/` |
+| `--no-fold` | 关闭常量折叠与恒定条件简化 |
+| `--seed N` | AST 混淆随机种子 |
+
+Python API：
+
+```python
+from obfuscator import obfuscate_sb3
+
+result = obfuscate_sb3(
+    "game.sb3",
+    "game_obf.py",
+    embed_assets=True,
+    fold=True,
+    seed=123,
+)
+print(result.output, result.size, result.asset_count)
+```
+
+---
+
+## 3. 转换流程
+
+```text
+SB3
+ ├─ 解析为 IR
+ ├─ 常量折叠 / 恒定条件简化
+ ├─ 生成普通 Python
+ ├─ AST 混淆
+ │   ├─ 删除 docstring 与注释
+ │   ├─ 重命名模块级函数/类
+ │   ├─ 重命名类方法（黑名单跳过 threading/os/pygame 同名）
+ │   ├─ 属性访问 -> getattr/setattr/delattr + 加密字符串表
+ │   ├─ 字符串常量 -> 链式加密表
+ │   ├─ 注入垃圾函数与死分支
+ │   ├─ 顶层 def -> 函数簇懒加载 trampoline
+ │   └─ 抹平行号
+ ├─ 编译为 stage1 code object + N 个簇 code object
+ ├─ marshal -> zlib -> HMAC-SHA256 标签 -> SHA-256 密钥流异或 -> base85
+ └─ 写入极小加载器（密钥分裂 + 反调试 + Silent Corrupt）
+```
+
+运行时：
+
+```text
+加载器 -> 反调试探针 -> 密钥分裂重建 K_root
+      -> 逐段 HMAC 校验（失败则静默翻钥）-> 解密字符串表
+      -> 注入模块绑定与懒加载辅助 -> exec(stage1)
+      -> 虚拟资产文件系统包装 -> 启动周期探针
+      -> 调用混淆后的 main()（函数簇按需解密）
+```
+
+---
+
+## 4. 常量折叠
+
+折叠发生在 IR 层，使用运行时 `_sc_*` 函数，保证与 Scratch 语义一致。
+
+示例：
+
+| 原始表达式 | 折叠结果 |
+|------------|----------|
+| `1 + 2` | `3` |
+| `join("a", 5)` | `"a5"` |
+| `"ABC" == "abc"` | `true` |
+| `length("hello")` | `5` |
+| `round(2.5)` | `3` |
+| `if 1 == 1:` | 只保留分支体 |
+| `if 1 == 2:` | 删除整个分支 |
+| `repeat 0` | 删除循环 |
+| `wait until true` | 删除等待 |
+| `repeat until true` | 删除循环 |
+
+以下**不会**折叠：
+
+- 涉及变量、列表、角色属性、计时器、随机数、扩展调用的表达式；
+- 结果为 `NaN` / `Infinity` 的运算（保留运行时语义）；
+- 超大字符串（避免生成巨型字面量）。
+
+关闭折叠：
+
+```bash
+python -m obfuscator input.sb3 output.py --no-fold
+```
+
+---
+
+## 5. 混淆内容
+
+### 5.1 源码信息清除
+
+- 删除所有注释与 docstring；
+- 不保留原始项目名、转换器信息、调试报告；
+- 不生成 SB3 元数据；
+- 运行时窗口标题/日志中的 “Scratch 3.0” 标识替换为通用文本；
+- 移除 `--trace` 选项，避免运行时打印原始脚本与自制积木名；
+- code object 使用随机文件名，所有 AST 行号被抹平。
+
+### 5.2 标识符重命名
+
+模块级函数与类（包括运行时类、角色类、`main`、`_sc_*` 辅助函数）会改名为
+随机标识符。局部变量名保留（避免破坏复杂作用域），但代码以 marshal 形式存在，
+普通阅读者看不到。
+
+### 5.3 字符串加密
+
+所有字符串常量（用户文本、积木参数、资源名、提示语等）被移入字符串表：
+
+- 每条字符串用随机 16 字节密钥 XOR；
+- 运行时惰性解码并缓存；
+- 源码中不再出现原始文本，`grep` 搜索不到台词、变量名、opcode 等。
+
+### 5.4 垃圾代码
+
+注入若干永不执行的随机函数与死分支，增加阅读与反编译噪音。
+这些代码没有副作用，不会影响项目运行。
+
+### 5.5 载荷加密
+
+- 每个段独立 `salt` + 段密钥（`HMAC(K_root, sid)`）+ HMAC-SHA256 完整性标签；
+- `K_root = SHA256(8 个散布的 64 位片段)`，文件中不存在完整密钥；
+- 校验失败 / 检测到调试器 / 解释器版本不符时**不报错**，而是翻转密钥字节，
+  让垃圾数据在离检测点很远的 marshal/zlib 阶段自然崩溃（Silent Corrupt）；
+- 每段密文独立 base85 分块嵌入，不再有单一巨型密文块。
+
+### 5.6 函数簇懒加载
+
+- 顶层 `def`（`_sc_*` 辅助函数、扩展处理器、`main` 等）按每簇最多 6 个拆分；
+- 原位置替换为 trampoline：首次调用时经加载器解密该簇并在模块命名空间
+  重新绑定真实函数；
+- 效果：hook 一次 `exec`/`marshal.loads` 只能拿到当前簇，必须逐簇触发才能
+  拼出全貌。
+
+### 5.7 资产
+
+默认 `embed_assets=True`：
+
+- 资产重命名为 `a_<随机>.<扩展名>`，抹除 md5 身份；
+- 每个资产独立加密段，**首次使用时才解密**；
+- 运行时通过虚拟文件系统包装 `open`/`os.path.exists`/
+  `pygame.image.load`/`pygame.mixer.Sound`，**全程不落盘**；
+- 输出目录只保留一个 `.py`。
+
+`--no-embed-assets`：
+
+- 资产写入 `<输出名>_assets/`（保留原始 md5 名称，便于管理）；
+- 加载器把 `ASSETS_DIR` 指向该目录，不做运行时包装。
+
+---
+
+## 6. 兼容性
+
+| 项 | 说明 |
+|----|------|
+| Python 版本 | **必须与生成时相同的 `major.minor`**（marshal code object 与版本相关） |
+| 依赖 | pygame（与普通生成脚本相同） |
+| 平台 | 跨平台，只要 Python 版本与 pygame 满足 |
+| 资源 | 内嵌模式运行时会写临时目录；外部模式输出 `_assets` |
+| 调试 | 混淆版移除了 `--trace`；保留 `--headless/--frames/--seconds/--no-audio` 等 |
+| 反向转换 | 不支持；这是一次性单向输出 |
+
+加载器会检查解释器版本；版本不匹配时走 Silent Corrupt 路径（无明文提示）。
+
+---
+
+## 7. 性能
+
+- 常量折叠会减少运行时表达式数量；
+- 字符串表在启动时一次性解码，之后为 O(1) 查表；
+- 属性访问经 `getattr` + 查表，热点路径略慢于直接属性（实测整体可玩性不受影响）；
+- 函数簇懒加载只在每个簇首次调用时付一次解密开销；
+- 内嵌资产按需解密，无整包启动开销、无落盘；
+- 混淆不引入逐语句解释器，不会显著拖慢游戏循环。
+
+---
+
+## 8. 安全边界
+
+v2 主要防御：
+
+- 直接打开 `.py` 阅读源码（加载器逻辑十六进制化 + 密钥分裂）；
+- 文本搜索变量名、台词、opcode、函数名（全部进加密表）；
+- `hook 一次 exec/marshal -> dump -> pycdc 反编译` 的最低成本路径
+  （函数簇懒加载 + 属性派发表让 dump 出的代码不可读）；
+- 篡改文件后直接运行（分段 HMAC + Silent Corrupt）；
+- 挂调试器/trace 跟踪（启动 + 周期探针，命中即静默腐蚀）；
+- 直接复制资产（虚拟 FS + 匿名重命名 + 按需解密）。
+
+它仍然不能防御：
+
+- 理解方案后逐簇 dump 并重建的耐心攻击者；
+- 用 C 级调试器读取运行中进程的内存；
+- 从运行中的进程提取已解码字符串表与已加载资产。
+
+对抗这三类攻击者请使用 Tier 2：Cython/Nuitka 原生编译 + 机器绑定许可证
+（见 [obfuscator-hardening.md](obfuscator-hardening.md)）。
+
+---
+
+## 9. 验证
+
+项目测试包含：
+
+```bash
+python tests/test_all.py
+```
+
+混淆器测试覆盖：
+
+- 常量折叠与恒定条件简化；
+- 内嵌资产导出并可运行（源码无 import pygame/marshal/zlib 明文）；
+- **字节码名字扫描**：dump 全部 code object 的 `co_names`/`co_varnames`，
+  断言无积木 opcode、无原始类名/函数名；
+- **防篡改**：翻转密文一个字符 → 非零退出且无明文校验提示；
+- **反调试**：挂 `sys.settrace` → Silent Corrupt；不挂时正常；
+- 外部资产导出并可运行。
+
+手工验证：
+
+```bash
+python -m obfuscator ..\example\scpy_demo.sb3 ..\example\scpy_demo_obf.py --seed 1
+python ..\example\scpy_demo_obf.py --headless --frames 60 --no-audio
+```

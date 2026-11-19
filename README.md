@@ -1,6 +1,6 @@
 # Scratch 3.0 <-> Python 双向转换器
 
-> 版本 **0.11.0** · [MIT License](LICENSE)
+> 版本 **0.13.0** · [MIT License](LICENSE)
 
 一个强大的 Scratch 3.0 与 Python 之间的双向转换工具，支持**一比一对应**的转换，同时支持高级 Python 语法。
 
@@ -16,6 +16,7 @@
 - **自制积木**: Scratch自制积木 -> Python类方法
 - **Scratch VM**: 内置纯 IR 解释器，可直接读取 sb3 并执行，无需先生成 Python；支持命令行调试器与窗口内可视化调试面板
 - **ScPython**: 新语言 `.scpy`，Python 风格语法 + Scratch 语义；一个工程文件夹编译为 sb3，支持角色文件、舞台、宏、嵌套目录、资产与自定义扩展
+- **混淆导出**: SB3 -> 单文件 Python，支持常量折叠、AST 混淆、字符串加密、code object 加密载荷与资产内嵌
 - **两种 Python -> Scratch 模式**: DSL 模式保证高保真往返；通用模式可转换普通 Python 脚本（实验性）
 - **语义说明**: 空输入、缺失参数与类型转换的完整规则见 [docs/scratch-semantics.md](docs/scratch-semantics.md)
 - **图形特效**: 颜色、亮度、透明度、鱼眼、旋涡、像素化、马赛克（与 scratch-render 的变换公式一致）
@@ -40,6 +41,7 @@ Scratch JSON  <--->  中间表示(IR)  <--->  Python 代码
 | `general_python.py` | 通用 Python -> IR 解析器（实验性） |
 | `scratch_vm/` | 纯 IR 解释器：直接执行 sb3，支持断点、单步、trace、变量查看与可视化调试 |
 | `scpython/` | `.scpy` 语言编译器：工程目录 -> sb3，支持宏、嵌套角色、资产与自定义扩展 |
+| `obfuscator/` | SB3 -> 混淆 Python：常量折叠、AST 混淆、加密载荷、内嵌资产 |
 | `convert_log.py` | 转换日志（阶段、中间状态、异常定位） |
 | `converter.py` | 主转换器入口 |
 
@@ -296,6 +298,45 @@ python converter.py scpy2scratch ..\example\scpy_demo ..\example\scpy_demo.sb3
 - [ScPython 语言指南](docs/scpython.md)
 - [ScPython AI 速查表](docs/scpython-ai-cheatsheet.md)
 - [ScPython 与 Scratch 行为参考](docs/scpython-scratch-behavior.md)
+
+## SB3 -> 混淆 Python（单向）
+
+把 `.sb3` 转换为**单文件、可执行的混淆 Python**，适合分发但不希望直接暴露源码的场景。
+
+```bash
+cd src
+
+# 默认内嵌资产，输出单文件
+python -m obfuscator ..\example\scpy_demo.sb3 ..\example\scpy_demo_obf.py
+
+# 主转换器别名
+python converter.py sb3obf ..\example\scpy_demo.sb3 ..\example\scpy_demo_obf.py
+
+# 外部资产 / 关闭常量折叠 / 固定随机种子
+python -m obfuscator input.sb3 output.py --no-embed-assets
+python -m obfuscator input.sb3 output.py --no-fold
+python -m obfuscator input.sb3 output.py --seed 123
+```
+
+处理内容：
+
+- **常量折叠**：`1 + 2` -> `3`，`join("a", 5)` -> `"a5"`，恒定 `if`/`repeat 0`/`wait until true` 直接简化；
+- **源码信息清除**：删除注释/docstring、运行时 “Scratch 3.0” 标识、`--trace` 调试输出；
+- **AST 混淆**：顶层函数/类与类方法重命名、属性访问派发表（字节码无 Scratch 方法名）、链式加密字符串表、垃圾函数与死分支、行号抹平；
+- **函数簇懒加载**：顶层函数拆分为独立加密的簇，首次调用才解密——hook 一次 `exec` 只能拿到单个簇；
+- **载荷加密**：密钥分裂（文件中无完整密钥）+ 每段独立 salt + HMAC-SHA256 完整性标签 + SHA-256 密钥流异或 + base85；
+- **Silent Corrupt**：篡改/调试器/版本不符不报错，静默翻钥让垃圾数据远处崩溃；启动 + 周期反调试探针；
+- **资产内嵌**：匿名重命名 + 按需解密 + 虚拟文件系统，全程不落盘。
+
+运行：
+
+```bash
+python output.py --headless --frames 60 --no-audio
+```
+
+注意：marshal code object 与 Python `major.minor` 绑定，输出脚本需用与生成时相同的 Python 版本运行。纯 Python 混淆无法做到绝对不可破解，详见文档。
+
+文档：[SB3 -> 混淆 Python](docs/obfuscator.md)
 
 ## 两种 Python -> Scratch 模式
 

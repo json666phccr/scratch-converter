@@ -30,7 +30,7 @@ from python_parser import (parse_python_code, parse_python_file,
 from general_python import parse_general_project
 from convert_log import LOG
 
-__version__ = "0.11.0"
+__version__ = "0.13.0"
 
 
 def _count_statements(project: ProjectIR) -> int:
@@ -476,6 +476,7 @@ def _dispatch(converter, args):
         print("  python converter.py scratch2py <input.sb3> [output.py] [--split] [--no-bundle]")
         print("  python converter.py py2scratch <input.py> [output.sb3] [--mode dsl|general|auto]")
         print("  python converter.py scpy2scratch <工程目录> [output.sb3]")
+        print("  python converter.py sb3obf <input.sb3> [output.py] [--no-embed-assets] [--no-fold] [--seed N]")
         print("  python converter.py roundtrip-sb3 <input.sb3> [output.sb3]")
         print("  python converter.py roundtrip-py <input.py> [output.py]")
         print("  python converter.py demo")
@@ -530,6 +531,29 @@ def _dispatch(converter, args):
             os.path.abspath(folder.rstrip('\\/')) + '.sb3')
         path = export_project(folder, output_path)
         print(f"  ScPython 工程已导出: {path}")
+
+    elif command == 'sb3obf':
+        args = args[1:]
+        embed_assets = '--no-embed-assets' not in args
+        fold = '--no-fold' not in args
+        seed = None
+        if '--seed' in args:
+            index = args.index('--seed')
+            if index + 1 < len(args):
+                seed = int(args[index + 1])
+                del args[index:index + 2]
+        args = [item for item in args if item not in (
+            '--no-embed-assets', '--no-fold')]
+        if not args:
+            print("用法: python converter.py sb3obf <input.sb3> [output.py] "
+                  "[--no-embed-assets] [--no-fold] [--seed N]")
+            sys.exit(1)
+        from obfuscator import obfuscate_sb3
+        result = obfuscate_sb3(
+            args[0], args[1] if len(args) > 1 else None,
+            embed_assets=embed_assets, fold=fold, seed=seed)
+        print(f"  混淆 Python 已生成: {result.output}")
+        print(f"  大小: {result.size} 字节；资产 {result.asset_count} 个")
 
     elif command == 'roundtrip-sb3':
         if len(args) < 2:
