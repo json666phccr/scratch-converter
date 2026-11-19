@@ -69,23 +69,46 @@ def build_payload(stage1_code, cluster_sources: List[str],
 
     segments: Dict[str, Tuple[bytes, bytes, bytes]] = {}
 
-    def encrypt(sid: str, plain: bytes) -> None:
+    def encrypt(sid: str, plain: bytes, prev_digest: bytes) -> bytes:
+        """链式段加密：段密钥 = HMAC(prev_digest, sid)。
+
+        返回明文摘要，作为下一段密钥派生的输入——批量解密必须按
+        链条顺序进行，无法乱序/并行静态求解。
+        """
         salt = os.urandom(16)
-        key = hmac.new(kroot, sid.encode(), hashlib.sha256).digest()
+        key = hmac.new(prev_digest, sid.encode(), hashlib.sha256).digest()
         compressed = zlib.compress(plain, 9)
         ciphertext = _xor(compressed, _keystream(key + salt, len(compressed)))
         tag = hmac.new(key, ciphertext, hashlib.sha256).digest()
         segments[sid] = (salt, tag, ciphertext)
+        return hashlib.sha256(plain).digest()
 
-    encrypt(_SEG_MAIN, marshal.dumps({'c': stage1_code}))
+    # 链条：K_root -> str -> main -> {簇, 资产}
+    digest_str = encrypt(_SEG_STR, marshal.dumps(_encode_chain(
+        str_entries, hmac.new(kroot, _SEG_STR.encode(),
+                              hashlib.sha256).digest())), kroot)
+    digest_main = encrypt(_SEG_MAIN, marshal.dumps({'c': stage1_code}),
+                          digest_str)
 
+    cluster_codes = []
     for index, source in enumerate(cluster_sources):
         code = compile(source, f"<{rng.randrange(16 ** 12):012x}>",
                        'exec', dont_inherit=True)
-        encrypt(f'c{index}', marshal.dumps(code))
+        cluster_codes.append(code)
+        encrypt(f'c{index}', marshal.dumps(code), digest_main)
 
-    # 链式字符串表：条目密钥依赖前一条明文摘要
-    str_key = hmac.new(kroot, _SEG_STR.encode(), hashlib.sha256).digest()
+    for name, data in assets.items():
+        encrypt('a:' + name, data, digest_main)
+
+    return PayloadSpec(
+        fragments=fragments,
+        segments=segments,
+        version=tuple(sys.version_info[:2]),
+    )
+
+
+def _encode_chain(str_entries: List[str], str_key: bytes) -> List[bytes]:
+    """链式字符串表：条目密钥依赖前一条明文摘要。"""
     chain = b''
     entry_cts = []
     for entry in str_entries:
@@ -93,16 +116,7 @@ def build_payload(stage1_code, cluster_sources: List[str],
         ks = _keystream(str_key + chain, len(raw))
         entry_cts.append(_xor(raw, ks))
         chain = hashlib.sha256(raw).digest()
-    encrypt(_SEG_STR, marshal.dumps(entry_cts))
-
-    for name, data in assets.items():
-        encrypt('a:' + name, data)
-
-    return PayloadSpec(
-        fragments=fragments,
-        segments=segments,
-        version=tuple(sys.version_info[:2]),
-    )
+    return entry_cts
 
 
 def _chunks(data: bytes, size: int = 2048) -> List[str]:
@@ -167,6 +181,10 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     n_snd0 = name('s')
     n_sndw = name('s')
     n_mainc = name('m')
+    n_pd2 = name('p')
+    n_md = name('m')
+    n_sp = name('s')
+    n_mp = name('m')
     n_pg = name('p')
     frag_names = [name('f') for _ in spec.fragments]
 
@@ -242,26 +260,31 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
         "key + c.to_bytes(4, 'big')).digest())")
     add("        c += 1")
     add("    return bytes(out[:n])")
-    add(f"def {n_dec}(sidhex):")
+    add(f"def {n_dec}(sidhex, prev):")
+    add(f"    fr = {n_sys}._getframe(1)")
+    add("    if fr is None or " +
+        f"{n_os}.path.abspath(__file__) != fr.f_code.co_filename:")
+    add(f"        {n_cr}()")
     add(f"    salt, tag, parts = {n_segs}[sidhex]")
     add(f"    ct = {n_b85}.b85decode(''.join(parts))")
-    add(f"    k2 = bytearray({n_hmac}.new(bytes({n_k}), "
+    add(f"    k2 = bytearray({n_hmac}.new(bytes(prev), "
         f"{n_hex}(sidhex), {n_hash}.sha256).digest())")
     add("    if not " + f"{n_hmac}.compare_digest(")
     add(f"            {n_hmac}.new(bytes(k2), ct, "
         f"{n_hash}.sha256).digest(), tag):")
     add("        k2[9] ^= 0x37")
     add(f"    ks = {n_ksf}(bytes(k2) + salt, len(ct))")
-    add(f"    return {n_zlib}.decompress(")
-    add("        bytes(a ^ b for a, b in zip(ct, ks)))")
+    add("    plain = bytes(a ^ b for a, b in zip(ct, ks))")
+    add(f"    return {n_zlib}.decompress(plain)")
     add()
 
     # ---- 字符串表（链式解码，一次性展开）----
     add(f"{n_L} = []")
     add(f"{n_sk} = {n_hmac}.new(bytes({n_k}), {H(_SEG_STR)}.encode(), "
         f"{n_hash}.sha256).digest()")
+    add(f"{n_sp} = {n_dec}({_sid_hex(_SEG_STR)!r}, bytes({n_k}))")
     add("prev = b''")
-    add(f"for ect in {n_mar}.loads({n_dec}({_sid_hex(_SEG_STR)!r})):")
+    add(f"for ect in {n_mar}.loads({n_sp}):")
     add("    raw = bytes(a ^ b for a, b in zip(")
     add(f"        ect, {n_ksf}({n_sk} + prev, len(ect))))")
     add("    try:")
@@ -270,6 +293,7 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     add(f"        {n_cr}()")
     add(f"        {n_L}.append('')")
     add(f"    prev = {n_hash}.sha256(raw).digest()")
+    add(f"{n_pd2} = {n_hash}.sha256({n_sp}).digest()")
     add()
 
     # ---- 命名空间与模块注入 ----
@@ -287,13 +311,15 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
 
     # ---- 函数簇懒加载 ----
     add(f"def {n_clh}(cid, g):")
-    add(f"    {n_ex}({n_mar}.loads({n_dec}('63' + str(cid).encode().hex())), g)")
+    add("    " + f"{n_ex}({n_mar}.loads({n_dec}("
+        f"'63' + str(cid).encode().hex(), {n_md})), g)")
     add(f"{n_ns}[{H(cluster_helper)}] = {n_clh}")
     add()
 
     # ---- 主程序 ----
-    add(f"{n_mainc} = {n_mar}.loads({n_dec}({_sid_hex(_SEG_MAIN)!r}))"
-        f"[{H('c')}]")
+    add(f"{n_mp} = {n_dec}({_sid_hex(_SEG_MAIN)!r}, {n_pd2})")
+    add(f"{n_mainc} = {n_mar}.loads({n_mp})[{H('c')}]")
+    add(f"{n_md} = {n_hash}.sha256({n_mp}).digest()")
     add(f"{n_ex}({n_mainc}, {n_ns})")
     add()
 
@@ -313,7 +339,7 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
         add(f"def {n_alh}(bn):")
         add(f"    d = {n_acache}.get(bn)")
         add("    if d is None:")
-        add(f"        d = {n_dec}({n_amap}[bn])")
+        add(f"        d = {n_dec}({n_amap}[bn], {n_md})")
         add(f"        {n_acache}[bn] = d")
         add("    return d")
         add(f"{n_ns}[{H(asset_helper)}] = {n_alh}")

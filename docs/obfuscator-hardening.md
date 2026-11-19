@@ -247,3 +247,43 @@ license {
 - **篡改验证**：byte 级翻转 payload / patch 加载器常量 → 断言 Silent Corrupt；
 - **反调试验证**：子进程挂 `sys.settrace` 运行 → 断言行为异常且无明文报错；
 - **性能**：混淆产物帧率与明文版差异 < 5%（Lazy 解密只在首调生效）。
+
+---
+
+## 8. 已验证攻击与 v2.1 对策（实测记录）
+
+用仓库测试辅助构造最小项目（SecretSprite + SVG + 绿旗脚本）实际执行脱壳，
+验证 v2.0 的真实防护边界：
+
+### 8.1 实测结论
+
+| 攻击目标 | 结果 |
+|---|---|
+| 分段解密 | **15/15** 全部解开，HMAC 校验全部通过（密钥在文件里的根本极限） |
+| stage1 code object | 成功提取，可 `dis` |
+| 函数簇 | **12/12** 全部提取成 `.marshal` |
+| 字符串表 | 1086 条，链式解码与运行时一致；'move'/'say'/'green_flag' 均可搜到 |
+| 内嵌资产 | 与原始 SVG **字节级一致** |
+| `co_names` | 全部随机名，AST 混淆生效 |
+| py2scratch 识别 | 失败——DSL 标记被改名，无法当普通 Python 脚本解析 |
+
+**结论**：批量脱壳没有理论障碍（这是纯 Python 本地混淆的极限，见第 2 节诚实边界）；
+真正的瓶颈在 code object → 可读代码（Python 3.11 无成熟反编译器，需专用反编译器）。
+因此 v2.1 的目标不是"阻止脱壳"，而是**提高脱壳后的成品率门槛**。
+
+### 8.2 v2.1 对策（已实施）
+
+| 对策 | 实现位置 | 效果 |
+|---|---|---|
+| **段密钥链式派生** | `payload.py::encrypt(sid, plain, prev_digest)`：`key_i = HMAC(prev_plain_digest, sid)`，链条 K_root → str → main → {簇, 资产} | 乱序/并行静态解密失效；解 str 段必须先算 K_root，解簇必须先解 main |
+| **类与 main 入末簇** | `ast_obf.py::_split_clusters`：所有 ClassDef + main 移入同一末簇，模块体 stage1 只剩 trampoline 与常量 | hook 一次 exec 拿不到类骨架；main 首次调用时末簇整体解密 |
+| **`_dec` 调用栈指纹** | `payload.py`：`sys._getframe(1).f_code.co_filename == abspath(__file__)`，不符则翻钥 | hook `marshal.loads` 等注入式调用会命中指纹 → Silent Corrupt |
+| **资产内容重构** | `__init__.py::_mangle_assets`：SVG 规范化重序列化 / PNG 插 tEXt / WAV 追加 LIST/INFO / MP3 追加 ID3v1 | 破坏"资产与原始字节一致"，阻止按原文件比对识别 |
+
+### 8.3 残余风险与 Tier 2 边界
+
+- 逐段跟跑（运行到哪解到哪）依然可行——密钥全在文件里，这是纯 Python 的根本极限；
+- code object 反编译无现成工具，攻击者需手写专用反编译器（成本高但非零）；
+- 质变只能靠 Tier 2（P6/P7）：Cython 编译加载层 + 许可证密钥参与派生，
+  使"没有有效许可证的机器上根本解不出正确密钥"。
+

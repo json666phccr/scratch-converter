@@ -18,7 +18,15 @@ v2 强化版在 v1（常量折叠 + 字符串加密 + 载荷加密）之上新�
 - **反调试探针**：启动检测 `sys.gettrace`/`sys.monitoring`/调试器模块，
   运行中每 17 秒复查，命中后腐蚀字符串表；
 - **虚拟资产文件系统**：内嵌资产不落盘，包装 `open`/`os.path.exists`/
-  `pygame.image.load`/`pygame.mixer.Sound` 按需解密，资产重命名为匿名文件。
+  `pygame.image.load`/`pygame.mixer.Sound` 按需解密，资产重命名为匿名文件；
+- **段密钥链式派生（v2.1）**：各段密钥由前一段明文摘要派生
+  （K_root → 字符串表 → main → {簇, 资产}），乱序/并行静态解密失效；
+- **类与 main 入末簇（v2.1）**：模块体 stage1 只剩 trampoline 与常量，
+  hook 一次 `exec` 拿不到类骨架；
+- **`_dec` 调用栈指纹（v2.1）**：解密入口校验调用方源文件，hook 注入式
+  调用（如替换 `marshal.loads`）命中指纹后 Silent Corrupt；
+- **资产内容重构（v2.1）**：SVG 规范化重序列化、PNG 插 tEXt、WAV 追加
+  LIST/INFO、MP3 追加 ID3v1——语义等价但字节与原始文件不一致。
 
 > 重要：任何纯 Python 本地混淆都不是不可破解的加密。本工具的目标是显著提高
 > 阅读、搜索、直接复用源码的成本，同时保证项目正常运行。确定要逆向的人仍然
@@ -182,15 +190,21 @@ python -m obfuscator input.sb3 output.py --no-fold
 
 ### 5.5 载荷加密
 
-- 每个段独立 `salt` + 段密钥（`HMAC(K_root, sid)`）+ HMAC-SHA256 完整性标签；
+- 每个段独立 `salt` + 段密钥 + HMAC-SHA256 完整性标签；
+- **段密钥链式派生**：`key = HMAC(前一段明文摘要, sid)`，链条为
+  K_root → 字符串表 → main → {函数簇, 资产}——不按顺序解开前驱就无法
+  得到后继密钥，无法乱序或并行静态解密；
 - `K_root = SHA256(8 个散布的 64 位片段)`，文件中不存在完整密钥；
-- 校验失败 / 检测到调试器 / 解释器版本不符时**不报错**，而是翻转密钥字节，
-  让垃圾数据在离检测点很远的 marshal/zlib 阶段自然崩溃（Silent Corrupt）；
+- 校验失败 / 检测到调试器 / 解释器版本不符 / 解密入口调用栈指纹不符时
+  **不报错**，而是翻转密钥字节，让垃圾数据在离检测点很远的 marshal/zlib
+  阶段自然崩溃（Silent Corrupt）；
 - 每段密文独立 base85 分块嵌入，不再有单一巨型密文块。
 
 ### 5.6 函数簇懒加载
 
 - 顶层 `def`（`_sc_*` 辅助函数、扩展处理器、`main` 等）按每簇最多 6 个拆分；
+- **所有 ClassDef 与 main 移入同一末簇**：stage1 模块体只剩 trampoline 与
+  常量，一次 `exec` 拿不到类骨架；
 - 原位置替换为 trampoline：首次调用时经加载器解密该簇并在模块命名空间
   重新绑定真实函数；
 - 效果：hook 一次 `exec`/`marshal.loads` 只能拿到当前簇，必须逐簇触发才能
@@ -201,6 +215,9 @@ python -m obfuscator input.sb3 output.py --no-fold
 默认 `embed_assets=True`：
 
 - 资产重命名为 `a_<随机>.<扩展名>`，抹除 md5 身份；
+- **内容重构**：SVG 经 XML 规范化重序列化、PNG 插入随机 tEXt 块、WAV
+  追加 LIST/INFO 块、MP3 追加 ID3v1 标签——渲染结果不变但字节与原始文件
+  不一致，无法用原文件比对识别；
 - 每个资产独立加密段，**首次使用时才解密**；
 - 运行时通过虚拟文件系统包装 `open`/`os.path.exists`/
   `pygame.image.load`/`pygame.mixer.Sound`，**全程不落盘**；
@@ -249,7 +266,8 @@ v2 主要防御：
   （函数簇懒加载 + 属性派发表让 dump 出的代码不可读）；
 - 篡改文件后直接运行（分段 HMAC + Silent Corrupt）；
 - 挂调试器/trace 跟踪（启动 + 周期探针，命中即静默腐蚀）；
-- 直接复制资产（虚拟 FS + 匿名重命名 + 按需解密）。
+- hook 注入式调用解密入口（调用栈指纹校验，命中即静默翻钥）；
+- 直接复制资产（虚拟 FS + 匿名重命名 + 内容重构 + 按需解密）。
 
 它仍然不能防御：
 

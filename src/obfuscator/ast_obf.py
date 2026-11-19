@@ -495,33 +495,61 @@ def _inject_junk(tree: ast.Module, rng: random.Random, used: Set[str]) -> None:
 # ===================== 函数簇拆分 =====================
 
 def _split_clusters(tree: ast.Module, rng: random.Random,
-                    helper: str, max_size: int = 6
+                    helper: str, main_name: str, max_size: int = 6
                     ) -> List[str]:
-    """把顶层 def 替换为懒加载 trampoline，返回各簇源码（index=cid）"""
+    """把顶层 def 替换为懒加载 trampoline，返回各簇源码（index=cid）。
+
+    所有 ClassDef 与 main 移入同一个末簇：模块体 stage1 只剩
+    trampoline 与常量，hook 一次 exec 拿不到类骨架。main 首次被调用时
+    末簇整体解密执行（类定义先于 main 体绑定）。
+    """
     clusters: List[str] = []
     body = tree.body
+
+    # 收集类与 main，移到末尾形成连续段
+    tail = [node for node in body
+            if isinstance(node, ast.ClassDef)
+            or (isinstance(node, ast.FunctionDef)
+                and node.name == main_name and not node.decorator_list)]
+    for node in tail:
+        body.remove(node)
+    body.extend(tail)
+
     i = 0
     cid = 0
     while i < len(body):
         node = body[i]
-        if not isinstance(node, ast.FunctionDef) or node.decorator_list:
+        if isinstance(node, ast.ClassDef):
+            # 末簇：吞掉从这里到结尾的全部类与 main
+            group = []
+            j = i
+            while j < len(body) and isinstance(
+                    body[j], (ast.ClassDef, ast.FunctionDef)):
+                group.append(body[j])
+                j += 1
+        elif (isinstance(node, ast.FunctionDef) and not node.decorator_list
+              and node.name != main_name):
+            group = [node]
+            j = i + 1
+            while (j < len(body) and len(group) < max_size
+                   and isinstance(body[j], ast.FunctionDef)
+                   and not body[j].decorator_list
+                   and body[j].name != main_name):
+                group.append(body[j])
+                j += 1
+        else:
             i += 1
             continue
-        group = [node]
-        j = i + 1
-        while (j < len(body) and len(group) < max_size
-               and isinstance(body[j], ast.FunctionDef)
-               and not body[j].decorator_list):
-            group.append(body[j])
-            j += 1
 
-        sources = [ast.unparse(func) for func in group]
+        sources = [ast.unparse(item) for item in group]
         for func in group:
+            if not isinstance(func, ast.FunctionDef) or \
+                    func.name != main_name:
+                continue
             tramp = ast.parse(
                 f"def {func.name}(*_a, **_k):\n"
                 f"    {helper}({cid}, globals())\n"
                 f"    return {func.name}(*_a, **_k)\n").body[0]
-            tramp.decorator_list = copy.deepcopy(func.decorator_list)
             ast.copy_location(tramp, func)
             body[body.index(func)] = tramp
         clusters.append("\n\n".join(sources))
@@ -570,7 +598,8 @@ def obfuscate_module(tree: ast.Module,
     table = _StringTable()
     _encode_strings(tree, table, strtable_name)
 
-    clusters = _split_clusters(tree, rng, cluster_helper)
+    clusters = _split_clusters(
+        tree, rng, cluster_helper, mapping.get('main', 'main'))
 
     _flatten_locations(tree)
     tree = ast.fix_missing_locations(tree)

@@ -78,6 +78,70 @@ def _read_assets(assets_dir: str, names: Set[str]) -> Dict[str, bytes]:
     return assets
 
 
+def _mangle_assets(assets: Dict[str, bytes], seed) -> Dict[str, bytes]:
+    """资产内容重构：语义等价但字节与原始文件不一致。
+
+    - SVG: XML 规范化重序列化（属性排序、文本规范化）；
+    - PNG: 在 IHDR 后插入随机内容的 tEXt 块；
+    - WAV: 在末尾追加随机 LIST/INFO 块；
+    - MP3: 追加 ID3v1 标签。
+
+    解析失败的格式回退为原始字节，保证运行不受影响。
+    """
+    rng = random.Random(seed)
+
+    def png(data: bytes) -> bytes:
+        import struct
+        import zlib
+        if not data.startswith(b'\x89PNG\r\n\x1a\n'):
+            return data
+        # IHDR 固定长度 13，data 块总长 4+4+13+4
+        ihdr_end = 8 + 25
+        if len(data) < ihdr_end or data[12:16] != b'IHDR':
+            return data
+        text = f"generator:{rng.randrange(16 ** 16):016x}".encode('ascii')
+        chunk = (struct.pack('>I', len(text)) + b'tEXt' + text
+                 + struct.pack('>I', zlib.crc32(b'tEXt' + text) & 0xFFFFFFFF))
+        return data[:ihdr_end] + chunk + data[ihdr_end:]
+
+    def svg(data: bytes) -> bytes:
+        import xml.etree.ElementTree as ET
+        try:
+            return ET.canonicalize(
+                data.decode('utf-8'), strip_text=True).encode('utf-8')
+        except Exception:
+            return data
+
+    def wav(data: bytes) -> bytes:
+        if len(data) < 44 or data[:4] != b'RIFF' or data[8:12] != b'WAVE':
+            return data
+        info = (f"INFOICMT\x1a\x00\x00\x00converter{rng.randrange(16 ** 16):016x}"
+                .encode('ascii'))
+        return data + b'LIST' + len(info).to_bytes(4, 'little') + info
+
+    def mp3(data: bytes) -> bytes:
+        if len(data) < 128:
+            return data
+        tag = bytearray(128)
+        tag[:3] = b'TAG'
+        title = f"c{rng.randrange(16 ** 12):012x}".encode('ascii')[:30]
+        tag[3:3 + len(title)] = title
+        return data + bytes(tag)
+
+    handlers = {'png': png, 'svg': svg, 'wav': wav, 'mp3': mp3}
+    result: Dict[str, bytes] = {}
+    for name, data in assets.items():
+        handler = handlers.get(name.rsplit('.', 1)[-1].lower())
+        if handler:
+            try:
+                result[name] = handler(data)
+            except Exception:
+                result[name] = data
+        else:
+            result[name] = data
+    return result
+
+
 def _rename_assets(project: ProjectIR, assets: Dict[str, bytes],
                    seed) -> Dict[str, bytes]:
     """把 md5ext 资产名替换为 a_<hex>.<ext>，抹除资产身份"""
@@ -165,7 +229,8 @@ def obfuscate_sb3(input_path: str,
         names = _asset_names(project)
         raw_assets = _read_assets(loaded.assets_dir, names)
         if embed_assets:
-            payload_assets = _rename_assets(project, raw_assets, seed)
+            payload_assets = _rename_assets(
+                project, _mangle_assets(raw_assets, seed), seed)
         else:
             payload_assets = {}
 
