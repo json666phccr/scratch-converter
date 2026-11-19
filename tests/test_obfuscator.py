@@ -200,18 +200,21 @@ def test_obfuscator_end_to_end():
 
 
 def _dump_code_names(obf_path: str, names_path: str) -> None:
-    """在子进程里运行混淆产物，dump 所有 code object 的名字集合"""
+    """在子进程里运行混淆产物，dump 所有 code object 的名字集合。
+
+    通过包装 zlib/bz2/lzma 的 decompress 拦截解密结果（不触碰
+    builtins/marshal，避免触发 builtins 完整性探针）。
+    """
     wrapper = os.path.join(os.path.dirname(obf_path), "_dump_wrapper.py")
     with open(wrapper, "w", encoding="utf-8") as handle:
         handle.write(
-            "import marshal, sys, runpy\n"
-            "real = marshal.loads\n"
+            "import marshal, sys, runpy, zlib, bz2, lzma\n"
             "path = sys.argv[1]\n"
             "out = sys.argv[2]\n"
             "# 让混淆产物以正确的 argv 运行（main 才会触发簇懒加载）\n"
             "sys.argv = [path] + sys.argv[3:]\n"
-            "saved = []\n"
             "names = set()\n"
+            "seen = set()\n"
             "def walk(code):\n"
             "    if id(code) in seen: return\n"
             "    seen.add(id(code))\n"
@@ -220,23 +223,29 @@ def _dump_code_names(obf_path: str, names_path: str) -> None:
             "    for c in code.co_consts:\n"
             "        if hasattr(c, 'co_code'):\n"
             "            walk(c)\n"
-            "seen = set()\n"
-            "def patched(data):\n"
-            "    obj = real(data)\n"
-            "    # 只扫描混淆器编译的 code object（co_filename 为 <hex>），\n"
-            "    # 避免捕获标准库 .pyc 加载（inspect/zipfile 等含 'main'）\n"
-            "    def ok(c):\n"
-            "        return (hasattr(c, 'co_code')\n"
-            "                and c.co_filename.startswith('<'))\n"
+            "def inspect_plain(plain):\n"
+            "    try:\n"
+            "        obj = marshal.loads(plain)\n"
+            "    except Exception:\n"
+            "        return\n"
             "    if hasattr(obj, 'co_code'):\n"
-            "        if ok(obj):\n"
+            "        if obj.co_filename.startswith('<'):\n"
             "            walk(obj)\n"
             "    elif hasattr(obj, 'get'):\n"
             "        c = obj.get('c')\n"
-            "        if ok(c):\n"
+            "        if c is not None and hasattr(c, 'co_code')\\\n"
+            "                and c.co_filename.startswith('<'):\n"
             "            walk(c)\n"
-            "    return obj\n"
-            "marshal.loads = patched\n"
+            "def wrap(mod):\n"
+            "    real = mod.decompress\n"
+            "    def d(data, *a, **k):\n"
+            "        r = real(data, *a, **k)\n"
+            "        inspect_plain(r)\n"
+            "        return r\n"
+            "    mod.decompress = d\n"
+            "wrap(zlib)\n"
+            "wrap(bz2)\n"
+            "wrap(lzma)\n"
             "try:\n"
             "    runpy.run_path(path, run_name='__main__')\n"
             "except SystemExit:\n"
@@ -250,6 +259,8 @@ def _dump_code_names(obf_path: str, names_path: str) -> None:
         capture_output=True, text=True, timeout=90,
         stdin=subprocess.DEVNULL)
     assert os.path.exists(names_path), result.stderr
+    # 至少要扫到一些 code object 名字，否则 wrapper 没有生效
+    assert open(names_path, encoding="utf-8").read().strip(), result.stderr
 
 
 def test_obfuscator_no_source_leak_in_bytecode():
@@ -410,6 +421,91 @@ def test_obfuscator_external_assets():
     return True
 
 
+def test_obfuscator_no_static_anchors():
+    """OBF-2e 通用静态解包依赖的结构特征不复存在：
+    无固定 sid 锚点、含算术派生片段、含 builtins 完整性探针"""
+    print("[测试105e] 静态结构锚点清除")
+
+    with tempfile.TemporaryDirectory() as folder:
+        project_json = make_project({
+            "hat": block("event_whenflagclicked", None, None, top_level=True),
+        }, name="AnchorSprite")
+        project_json["targets"].insert(0, _stage_target())
+        sb3 = _write_sb3(folder, project_json)
+        output = os.path.join(folder, "protected.py")
+        obfuscate_sb3(sb3, output, embed_assets=True, seed=13)
+
+        source = open(output, encoding="utf-8").read()
+        # 固定段标识锚点（'str'/'main' 的 hex）必须不存在
+        assert "'737472'" not in source, "存在 'str' 锚点"
+        assert "'6d61696e'" not in source, "存在 'main' 锚点"
+        # 至少一个片段由算术派生（非常量），通用解包器的常量假设失效
+        assert "& 0xFFFFFFFFFFFFFFFF" in source, "缺少算术派生片段"
+        # builtins 完整性探针存在（堵 exec/marshal.loads hook）
+        assert "is not type(" in source, "缺少 builtins 完整性探针"
+
+    print("  [PASS] 静态结构锚点清除通过")
+    return True
+
+
+def test_obfuscator_resists_exec_hook():
+    """OBF-2f 纯 Python 替换 builtins.exec 截获 code object 的手法
+    应被 builtins 完整性探针识别并 Silent Corrupt"""
+    print("[测试105f] exec hook 抵抗")
+
+    with tempfile.TemporaryDirectory() as folder:
+        project_json = make_project({
+            "hat": block("event_whenflagclicked", "set", None,
+                         top_level=True),
+            "set": block("looks_say", None, "hat",
+                         {"MESSAGE": [1, [10, "hook bait"]]}),
+        }, name="HookSprite")
+        project_json["targets"].insert(0, _stage_target())
+        sb3 = _write_sb3(folder, project_json)
+        output = os.path.join(folder, "protected.py")
+        obfuscate_sb3(sb3, output, embed_assets=True, seed=17)
+
+        wrapper = os.path.join(folder, "_exec_hook.py")
+        with open(wrapper, "w", encoding="utf-8") as handle:
+            handle.write(
+                "import builtins, runpy, sys, types\n"
+                "captured = []\n"
+                "orig = builtins.exec\n"
+                "def hook(obj, gl=None, loc=None):\n"
+                "    if (isinstance(obj, types.CodeType)\n"
+                "            and obj.co_filename.startswith('<')):\n"
+                "        captured.append(1)\n"
+                "        raise SystemExit(0x51B3)\n"
+                "    return orig(obj, gl, loc)\n"
+                "builtins.exec = hook\n"
+                "try:\n"
+                "    runpy.run_path(sys.argv[1], run_name='__main__')\n"
+                "except SystemExit as e:\n"
+                "    if e.code == 0x51B3:\n"
+                "        sys.stderr.write('SENTINEL-CAPTURED\\n')\n"
+                "finally:\n"
+                "    builtins.exec = orig\n"
+            )
+        proc = subprocess.run(
+            [sys.executable, wrapper, output],
+            capture_output=True, text=True, timeout=90,
+            stdin=subprocess.DEVNULL)
+        assert "SENTINEL-CAPTURED" not in proc.stderr, \
+            "exec hook 成功截获 code object（探针未生效）"
+        assert proc.returncode != 0, "hook 环境下应 Silent Corrupt 非零退出"
+
+        # 对照：不挂 hook 时正常
+        proc = subprocess.run(
+            [sys.executable, output, "--headless", "--frames", "10",
+             "--no-audio"],
+            capture_output=True, text=True, timeout=90,
+            stdin=subprocess.DEVNULL)
+        assert proc.returncode == 0, proc.stderr
+
+    print("  [PASS] exec hook 抵抗通过")
+    return True
+
+
 TESTS = [
     test_obfuscator_constant_folding,
     test_obfuscator_end_to_end,
@@ -417,4 +513,6 @@ TESTS = [
     test_obfuscator_tamper_detected,
     test_obfuscator_antidebug_detected,
     test_obfuscator_external_assets,
+    test_obfuscator_no_static_anchors,
+    test_obfuscator_resists_exec_hook,
 ]

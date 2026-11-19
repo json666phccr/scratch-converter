@@ -287,3 +287,30 @@ license {
 - 质变只能靠 Tier 2（P6/P7）：Cython 编译加载层 + 许可证密钥参与派生，
   使"没有有效许可证的机器上根本解不出正确密钥"。
 
+### 8.4 v2.2 多态壳（针对"一份脚本通吃"的实测反击）
+
+对方把解包器升级为版本自适应（以 `str` 段为锚点自动识别 flat/chained，
+两个版本同一份脚本通吃，全量还原 256 ms）。v2.1 的三项对策被逐条评估为
+"+0 成本"。对此 v2.2 不再纠缠密码学细节，而是**消灭"通用"本身**：
+
+| 破解脚本依赖的结构特征 | v2.2 对策 | 实测效果 |
+|---|---|---|
+| 8 个整型片段常量（`find_fragment_names` 要求全部是 Constant） | 片段算术混合：1~3 个片段由其他片段 `(f_p*M+C) & 2^64-1` 派生 | 解包器第一步即死："片段不是常量" |
+| `{sid: (salt, tag, [b85块])}` 模块级字典表 | 表形态随机（字典 / 行列表两种，行列表躲过 `literal_eval` 结构识别） | 表定位失效 |
+| 固定 sid 锚点 `'str'`/`'main'`（hex 常量） | 段标识每次导出随机化 | 锚点查表 KeyError |
+| zlib + b85 + sha256 + HMAC(prev, sid) 固定算法 | 压缩 zlib/bz2/lzma、编码 b85/b64、哈希族 6 种、KDF 形式 4 种、密钥流布局/计数器编码逐次随机 | 解密公式必须逐产物逆向 |
+| 链 B：纯 Python 替换 `builtins.exec` 截获 code object | builtins 完整性探针：`type(exec/compile/__import__/marshal.loads) is not type(len)` → Silent Corrupt | **实测截获失败**：探针识别 hook，翻钥后垃圾在 lzma 阶段自然崩溃 |
+| 链 B：globals 中 `list[str] >50` 捕获字符串表 | 字符串表以 `tuple` 存入命名空间 | 按结构特征捕获失效 |
+
+**交叉验证结果**（用对方自己的脚本打 v2.2 产物）：
+
+- `unpack_scratch_obf.py`：第一步"片段不是常量"退出，0 段解密；
+- `dump_via_exec_hook.py`：未截获任何 code object，产物在解密阶段
+  以 `LZMAError` 崩溃（Silent Corrupt，无指向性报错）；
+- 正常路径：8 个不同 seed（覆盖 3 压缩 × 2 编码 × 4 KDF × 多哈希族 ×
+  2 表形态组合）全部生成并 headless 运行成功。
+
+**诚实边界不变**：这轮提高的是"逐产物逆向成本"——攻击者无法再维护一份
+通用脚本，每次导出都要分析当次的配方与结构；但密钥仍随文件走，
+保密性上限仍为 0，量级变化仍需 Tier 2。
+
