@@ -12,6 +12,9 @@ import zipfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _support import *  # noqa: F401,F403
 
+_SRC_DIR = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), '..', 'src'))
+
 from ir import BlockType, ExprType
 from obfuscator import obfuscate_sb3
 from obfuscator.folding import fold_expression, fold_project
@@ -506,6 +509,163 @@ def test_obfuscator_resists_exec_hook():
     return True
 
 
+def test_license_binding():
+    """OBF-T2a Ed25519 许可证参与密钥派生：
+    本机签发的许可证可运行；错误机器指纹的许可证 Silent Corrupt"""
+    print("[测试T2a] 许可证绑定")
+
+    import shutil
+    has_license_cli = shutil.which(sys.executable) is not None
+    assert has_license_cli
+
+    with tempfile.TemporaryDirectory() as folder:
+        project_json = make_project({
+            "hat": block("event_whenflagclicked", "set", None,
+                         top_level=True),
+            "set": block("looks_say", None, "hat",
+                         {"MESSAGE": [1, [10, "licensed"]]}),
+        }, name="LicSprite")
+        project_json["targets"].insert(0, _stage_target())
+        sb3 = _write_sb3(folder, project_json)
+
+        env = {**os.environ, "PYTHONPATH": _SRC_DIR}
+        pub_path = os.path.join(folder, "public.key")
+        priv_path = os.path.join(folder, "private.key")
+        proc = subprocess.run(
+            [sys.executable, "-m", "obfuscator.license", "keygen",
+             "--out-dir", folder],
+            capture_output=True, text=True, timeout=120, env=env,
+            stdin=subprocess.DEVNULL)
+        assert proc.returncode == 0, proc.stderr
+        pub = open(pub_path, encoding="ascii").read().strip()
+
+        lic_path = os.path.join(folder, "license.dat")
+        proc = subprocess.run(
+            [sys.executable, "-m", "obfuscator.license", "issue",
+             "--priv", priv_path, "--product", "test-game",
+             "--days", "30", "--out", lic_path],
+            capture_output=True, text=True, timeout=120, env=env,
+            stdin=subprocess.DEVNULL)
+        assert proc.returncode == 0, proc.stderr
+
+        lic_bad_path = os.path.join(folder, "license_bad.dat")
+        proc = subprocess.run(
+            [sys.executable, "-m", "obfuscator.license", "issue",
+             "--priv", priv_path, "--product", "test-game",
+             "--fp", "ab" * 32, "--out", lic_bad_path],
+            capture_output=True, text=True, timeout=120, env=env,
+            stdin=subprocess.DEVNULL)
+        assert proc.returncode == 0, proc.stderr
+
+        # 本机许可证 → 可运行
+        output = os.path.join(folder, "protected_lic.py")
+        proc = subprocess.run(
+            [sys.executable, "-m", "obfuscator", sb3, output,
+             "--license-pubkey", pub, "--license-file", lic_path,
+             "--seed", "19"],
+            capture_output=True, text=True, timeout=300, env=env,
+            stdin=subprocess.DEVNULL)
+        assert proc.returncode == 0, proc.stderr
+        proc = subprocess.run(
+            [sys.executable, output, "--headless", "--frames", "15",
+             "--no-audio"],
+            capture_output=True, text=True, timeout=90,
+            stdin=subprocess.DEVNULL)
+        assert proc.returncode == 0, proc.stderr
+
+        # 错误机器指纹的许可证 → Silent Corrupt（非零退出且无明文提示）
+        output_bad = os.path.join(folder, "protected_bad.py")
+        proc = subprocess.run(
+            [sys.executable, "-m", "obfuscator", sb3, output_bad,
+             "--license-pubkey", pub, "--license-file", lic_bad_path,
+             "--seed", "19"],
+            capture_output=True, text=True, timeout=300, env=env,
+            stdin=subprocess.DEVNULL)
+        assert proc.returncode == 0, proc.stderr
+        proc = subprocess.run(
+            [sys.executable, output_bad, "--headless", "--frames", "15",
+             "--no-audio"],
+            capture_output=True, text=True, timeout=90,
+            stdin=subprocess.DEVNULL)
+        assert proc.returncode != 0, "错误机器许可证应 Silent Corrupt"
+        combined = (proc.stdout or '') + (proc.stderr or '')
+        assert 'license' not in combined.lower()
+
+        # 篡改许可证签名 → 生成端清晰报错
+        bad_sig = open(lic_path, encoding="ascii").read().rstrip()
+        tampered = lic_path + ".tampered"
+        with open(tampered, "w", encoding="ascii") as handle:
+            handle.write(bad_sig[:-4] + "AAAA\n")
+        proc = subprocess.run(
+            [sys.executable, "-m", "obfuscator", sb3, output,
+             "--license-pubkey", pub, "--license-file", tampered],
+            capture_output=True, text=True, timeout=120, env=env,
+            stdin=subprocess.DEVNULL)
+        assert proc.returncode != 0
+        assert "许可证无效" in (proc.stderr or '')
+
+    print("  [PASS] 许可证绑定通过")
+    return True
+
+
+def _has_native_compiler() -> bool:
+    import shutil
+    return shutil.which('gcc') is not None or shutil.which('cl') is not None
+
+
+def test_native_build():
+    """OBF-T2b Tier 2 原生编译：loader 编译为 .pyd，产物可运行且
+    目录中不含解密器 Python 源码（无编译器时跳过）"""
+    print("[测试T2b] native 原生编译")
+
+    if not _has_native_compiler():
+        print("  [SKIP] 未找到 C 编译器（gcc/cl），跳过 native 测试")
+        return True
+
+    try:
+        import Cython  # noqa: F401
+    except ImportError:
+        print("  [SKIP] 未安装 Cython，跳过 native 测试")
+        return True
+
+    with tempfile.TemporaryDirectory() as folder:
+        project_json = make_project({
+            "hat": block("event_whenflagclicked", "set", None,
+                         top_level=True),
+            "set": block("looks_say", None, "hat",
+                         {"MESSAGE": [1, [10, "native"]]}),
+        }, name="NatSprite")
+        project_json["targets"].insert(0, _stage_target())
+        sb3 = _write_sb3(folder, project_json)
+
+        env = {**os.environ, "PYTHONPATH": _SRC_DIR}
+        out_dir = os.path.join(folder, "protected_native")
+        proc = subprocess.run(
+            [sys.executable, "-m", "obfuscator", sb3, out_dir,
+             "--native", "--seed", "23"],
+            capture_output=True, text=True, timeout=600, env=env,
+            stdin=subprocess.DEVNULL)
+        assert proc.returncode == 0, proc.stderr
+        entries = os.listdir(out_dir)
+        assert any(e.startswith('core.') and e.endswith(
+            ('.pyd', '.so')) for e in entries), entries
+        assert 'main.py' in entries
+        # 解密器必须是原生扩展：目录里没有含分段表的 Python 源码
+        loader_like = [e for e in entries if e.endswith('.py')
+                       and e != 'main.py']
+        assert not loader_like, loader_like
+
+        proc = subprocess.run(
+            [sys.executable, os.path.join(out_dir, 'main.py'),
+             "--headless", "--frames", "15", "--no-audio"],
+            capture_output=True, text=True, timeout=120,
+            stdin=subprocess.DEVNULL)
+        assert proc.returncode == 0, proc.stderr
+
+    print("  [PASS] native 原生编译通过")
+    return True
+
+
 TESTS = [
     test_obfuscator_constant_folding,
     test_obfuscator_end_to_end,
@@ -515,4 +675,6 @@ TESTS = [
     test_obfuscator_external_assets,
     test_obfuscator_no_static_anchors,
     test_obfuscator_resists_exec_hook,
+    test_license_binding,
+    test_native_build,
 ]

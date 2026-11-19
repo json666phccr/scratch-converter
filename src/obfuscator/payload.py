@@ -39,7 +39,7 @@ import random
 import sys
 import zlib
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 _DEBUG_MODULES = ('pdb', 'pydevd', 'ptvsd', 'debugpy', 'frida')
 _INJECTED_MODULES = (
@@ -89,6 +89,11 @@ class Recipe:
     main_sid: str
     cluster_sids: List[str] = field(default_factory=list)
     asset_sids: Dict[str, str] = field(default_factory=dict)
+    # 许可证绑定（Tier 2）：payload/sig 以 b64 嵌入 loader，
+    # 运行端 machine_fp 参与主密钥派生——fp 不对即解密失败
+    license_payload_b64: Optional[str] = None
+    license_sig_b64: Optional[str] = None
+    license_expires: Optional[int] = None
 
     # ---- 生成端密码学 ----
     def kroot(self) -> bytes:
@@ -197,10 +202,30 @@ class PayloadSpec:
 
 def build_payload(stage1_code, cluster_sources: List[str],
                   str_entries: List[str], assets: Dict[str, bytes],
-                  seed=None) -> PayloadSpec:
+                  seed=None,
+                  license: Optional[Tuple[bytes, bytes, bytes]] = None
+                  ) -> PayloadSpec:
     rng = random.Random(seed)
     recipe = make_recipe(rng, len(cluster_sources), sorted(assets))
     kroot = recipe.kroot()
+
+    if license is not None:
+        # Tier 2 许可证绑定：binding = H(payload || sig || machine_fp)
+        # machine_fp 为签发机器指纹；运行端 fp 不符 -> binding 错 -> 垃圾。
+        # payload/sig 嵌入 loader 供运行端重算 binding。
+        payload_bytes, sig_bytes, fp_bytes = license
+        binding = recipe.prev_digest(
+            payload_bytes + sig_bytes + fp_bytes)
+        kroot = _hash_fn(recipe.hash_name)(kroot + binding).digest()
+        recipe.license_payload_b64 = base64.b64encode(
+            payload_bytes).decode('ascii')
+        recipe.license_sig_b64 = base64.b64encode(sig_bytes).decode('ascii')
+        try:
+            import json
+            data = json.loads(payload_bytes.decode('utf-8'))
+            recipe.license_expires = data.get('expires_at')
+        except (ValueError, UnicodeDecodeError):
+            recipe.license_expires = None
 
     segments: Dict[str, Tuple[bytes, bytes, bytes]] = {}
 
@@ -268,7 +293,8 @@ def _sid_hex(sid: str) -> str:
 def loader_source(spec: PayloadSpec, *, main_name: str,
                   strtable_name: str, cluster_helper: str,
                   asset_helper: str, embed_assets: bool,
-                  asset_dir: str = 'assets', seed=None) -> str:
+                  asset_dir: str = 'assets', seed=None,
+                  frame_check: bool = True) -> str:
     rng = random.Random(seed)
     rec = spec.recipe
     used: set = set()
@@ -328,6 +354,10 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     n_mp = name('m')
     n_pg = name('p')
     n_rows = name('r')
+    n_lpb = name('l')
+    n_lsb = name('l')
+    n_fpv = name('f')
+    n_fpf = name('f')
     frag_names = [name('f') for _ in rec.fragments]
 
     str_sid_hex = _sid_hex(rec.str_sid)
@@ -369,6 +399,49 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     add("    t.to_bytes(8, 'big') for t in ("
         + ", ".join(frag_names) + "))).digest())")
     add()
+
+    # ---- 许可证绑定（Tier 2）：fp 参与主密钥派生 ----
+    if rec.license_payload_b64 is not None:
+        reg_path = 'SOFTWARE\\Microsoft\\Cryptography'
+        add(f"{n_lpb} = {n_b85}.b64decode({rec.license_payload_b64!r})")
+        add(f"{n_lsb} = {n_b85}.b64decode({rec.license_sig_b64!r})")
+        add(f"def {n_fpf}():")
+        add("    parts = []")
+        add("    try:")
+        add(f"        if {n_sys}.platform == {H('win32')}:")
+        add(f"            rg = {n_imp}({H('winreg')})")
+        add(f"            t = rg.OpenKey(rg.HKEY_LOCAL_MACHINE, "
+            f"{H(reg_path)})")
+        add(f"            v, _ = rg.QueryValueEx(t, {H('MachineGuid')})")
+        add("            parts.append(v.encode('utf-8'))")
+        add("        else:")
+        add("            for t in (" + ", ".join(
+            H(p) for p in ('/etc/machine-id',
+                           '/var/lib/dbus/machine-id')) + "):")
+        add("                try:")
+        add(f"                    with open(t, {H('r')}, "
+            f"encoding={H('utf-8')}) as f:")
+        add("                        parts.append("
+            "f.read().strip().encode('utf-8'))")
+        add("                    break")
+        add("                except Exception:")
+        add("                    pass")
+        add("    except Exception:")
+        add("        pass")
+        add("    if not parts:")
+        add("        parts.append(str("
+            f"{n_imp}({H('uuid')}).getnode()).encode('utf-8'))")
+        add("    parts.append("
+            f"{n_imp}({H('platform')}).machine().encode('utf-8'))")
+        add(f"    return {n_hf}(b'|'.join(parts)).digest()")
+        add(f"{n_fpv} = {n_fpf}()")
+        add(f"{n_k} = bytearray({n_hf}(bytes({n_k}) + "
+            f"{n_hf}({n_lpb} + {n_lsb} + {n_fpv}).digest()).digest())")
+        if rec.license_expires is not None:
+            add(f"if {n_imp}({H('time')}).time() > "
+                f"{rec.license_expires}:")
+            add(f"    {n_cr}()")
+        add()
 
     # ---- 反调试探针（含 builtins 完整性检查）----
     add(f"def {n_pd}():")
@@ -454,10 +527,11 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
                 f"bytes({prev})).digest())")
 
     add(f"def {n_dec}(sidhex, prev):")
-    add(f"    fr = {n_sys}._getframe(1)")
-    add("    if fr is None or " +
-        f"{n_os}.path.abspath(__file__) != fr.f_code.co_filename:")
-    add(f"        {n_cr}()")
+    if frame_check:
+        add(f"    fr = {n_sys}._getframe(1)")
+        add("    if fr is None or " +
+            f"{n_os}.path.abspath(__file__) != fr.f_code.co_filename:")
+        add(f"        {n_cr}()")
     add(f"    salt, tag, parts = {n_segs}[sidhex]")
     add(f"    ct = {n_b85}.{dec_attr}(''.join(parts))")
     add(f"    k2 = {kdf_expr('prev', 'sidhex')}")

@@ -36,7 +36,13 @@ v2 强化版在 v1（常量折叠 + 字符串加密 + 载荷加密）之上新�
 - **builtins 完整性探针（v2.2）**：`type(exec/compile/__import__/
   marshal.loads)` 与原生内建类型不符（如 Python 层 hook）即 Silent Corrupt；
 - **字符串表 tuple 化（v2.2）**：命名空间中不出现大体积 `list[str]`
-  结构特征。
+  结构特征；
+- **Ed25519 许可证绑定（Tier 2，可选）**：许可证内容与机器指纹参与主
+  密钥派生 `K' = H(K_root || H(payload‖sig‖fp))`——机器不对即解密失败，
+  无可 patch 的校验分支；
+- **原生编译（Tier 2，可选）**：`--native` 把 loader 编译为 Cython 扩展
+  （`main.py + core*.pyd`），字节码级工具（marshal dump / pycdc /
+  exec hook）完全失效。
 
 > 重要：任何纯 Python 本地混淆都不是不可破解的加密。本工具的目标是显著提高
 > 阅读、搜索、直接复用源码的成本，同时保证项目正常运行。确定要逆向的人仍然
@@ -243,6 +249,54 @@ python -m obfuscator input.sb3 output.py --no-fold
 
 - 资产写入 `<输出名>_assets/`（保留原始 md5 名称，便于管理）；
 - 加载器把 `ASSETS_DIR` 指向该目录，不做运行时包装。
+
+---
+
+## Tier 2：许可证绑定与原生编译（可选）
+
+Tier 1 是纯 Python，密钥必然随文件走。Tier 2 提供两个量级提升
+（可单独或组合使用）：
+
+### Ed25519 许可证绑定
+
+产物只能在**签发机器**上运行；许可证内容与机器指纹参与主密钥派生，
+伪造/盗用/篡改许可证都导致解密失败（Silent Corrupt，无校验分支可 patch）。
+
+```bash
+cd src
+
+# 1. 生成签发密钥对（私钥自留，切勿提交仓库）
+python -m obfuscator.license keygen --out-dir license_keys/
+
+# 2. 为目标机器签发许可证（默认绑定当前机器，--days 有效期）
+python -m obfuscator.license issue --priv license_keys/private.key \
+    --product mygame --days 365 --out license.dat
+
+# 3. 构建绑定的产物
+python -m obfuscator game.sb3 game_obf.py \
+    --license-pubkey "$(cat license_keys/public.key)" \
+    --license-file license.dat
+```
+
+- 错误机器 / 篡改许可证 → 产物 Silent Corrupt；
+- 许可证与产物绑定后，换证/换机器需重新导出。
+
+### 原生编译
+
+```bash
+# 需要 Cython 与 C 编译器（Windows: gcc/MSVC；Linux/mac: 默认编译器）
+pip install cython
+python -m obfuscator game.sb3 game_native/ --native
+
+# 可与许可证叠加
+python -m obfuscator game.sb3 game_native/ --native \
+    --license-pubkey "$(cat license_keys/public.key)" \
+    --license-file license.dat
+```
+
+产物为 `main.py`（壳）+ `core.cpXXX-xxx.pyd`（原生扩展）：解密、许可证
+绑定、探针、exec 全在原生代码内，marshal dump / pycdc / exec hook 等
+字节码级工具完全失效，逆向需 IDA/Ghidra 级工具。
 
 ---
 

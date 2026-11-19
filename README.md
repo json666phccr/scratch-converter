@@ -1,6 +1,6 @@
 # Scratch 3.0 <-> Python 双向转换器
 
-> 版本 **0.13.2** · [MIT License](LICENSE)
+> 版本 **0.13.3** · [MIT License](LICENSE)
 
 一个强大的 Scratch 3.0 与 Python 之间的双向转换工具，支持**一比一对应**的转换，同时支持高级 Python 语法。
 
@@ -17,6 +17,7 @@
 - **Scratch VM**: 内置纯 IR 解释器，可直接读取 sb3 并执行，无需先生成 Python；支持命令行调试器与窗口内可视化调试面板
 - **ScPython**: 新语言 `.scpy`，Python 风格语法 + Scratch 语义；一个工程文件夹编译为 sb3，支持角色文件、舞台、宏、嵌套目录、资产与自定义扩展
 - **混淆导出**: SB3 -> 单文件 Python，多态加密配方、常量折叠、AST 混淆、字符串加密、code object 加密载荷、builtins 完整性探针与资产内嵌内容重构
+- **Tier 2 商业分发**（可选）: Ed25519 许可证绑定机器（参与密钥派生，无可 patch 的校验分支）+ `--native` Cython 原生编译（字节码级工具失效）
 - **两种 Python -> Scratch 模式**: DSL 模式保证高保真往返；通用模式可转换普通 Python 脚本（实验性）
 - **语义说明**: 空输入、缺失参数与类型转换的完整规则见 [docs/scratch-semantics.md](docs/scratch-semantics.md)
 - **图形特效**: 颜色、亮度、透明度、鱼眼、旋涡、像素化、马赛克（与 scratch-render 的变换公式一致）

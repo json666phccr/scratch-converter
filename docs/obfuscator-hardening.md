@@ -204,6 +204,10 @@ license {
 - 签名验证用纯 Python Ed25519（~400 行，无第三方依赖）或可选 `cryptography`；
 - 离线验证，无网络依赖。
 
+> **已实施（0.13.3）**：见第 9 节。机器指纹直接参与密钥派生
+> `binding = H(payload || sig || fp)`——把 fp 比对分支 patch 掉也没用，
+> 因为 fp 错 → binding 错 → 密钥错。
+
 ### 4.4 防差分（消除 W13）
 
 - 默认禁用固定 seed（`--seed` 仅内部测试保留）；
@@ -313,4 +317,55 @@ license {
 **诚实边界不变**：这轮提高的是"逐产物逆向成本"——攻击者无法再维护一份
 通用脚本，每次导出都要分析当次的配方与结构；但密钥仍随文件走，
 保密性上限仍为 0，量级变化仍需 Tier 2。
+
+---
+
+## 9. Tier 2 已实施：原生编译 + 许可证绑定（0.13.3，P6）
+
+v2.2 收官时明确了残余边界："密钥仍随文件走、解密结果仍必须进同一进程"。
+Tier 2 直接打破这两条：
+
+### 9.1 Ed25519 许可证参与密钥派生（`src/obfuscator/license.py`）
+
+- 纯 Python Ed25519（RFC 8032 参考实现，sign+verify，已用官方测试向量验证，
+  无第三方依赖）；
+- 许可证 = 规范化 JSON（product_id / machine_fp / expires_at / features /
+  nonce）+ Ed25519 签名，文件格式 `b64(payload).b64(sig)`；
+- 机器指纹：Windows MachineGuid / Linux machine-id / 兜底 MAC+平台；
+- **密钥派生**：`K' = H(K_root || H(payload || sig || machine_fp))`
+  ——机器不对 → binding 错 → 密钥错 → Silent Corrupt。
+  **没有可 patch 的"许可证校验分支"**：fp 比对即密钥派生本身；
+- 生成端（开发者操作）清晰报错；运行端（攻击现场）静默腐蚀；
+- CLI：`python -m obfuscator.license keygen / issue / show`。
+
+### 9.2 Cython 原生编译层（`src/obfuscator/native.py`）
+
+- `--native` 把多态壳 loader 编译为平台扩展，分发形态
+  `main.py + core.cpXXX-win_amd64.pyd`；
+- 解密、许可证绑定、builtins 探针、exec 全部在原生代码内——
+  marshal dump / pycdc / exec hook 等**字节码级工具完全失效**，
+  逆向成本抬升到 IDA/Ghidra 级别；
+- 构建矩阵：Windows（MinGW gcc / MSVC）、Linux/macOS（默认编译器）；
+  Cython 或编译器缺失时清晰报错，可回退 Tier 1 纯 Python；
+- 实测：Cython 3.3.1 + MinGW gcc 构建通过，产物 headless 运行正常。
+
+### 9.3 实测结果
+
+| 场景 | 结果 |
+|---|---|
+| 本机签发许可证 → 产物运行 | exit 0 |
+| 错误机器指纹的合法签名许可证 | Silent Corrupt（非零退出，无明文提示） |
+| 篡改许可证签名 | 生成端清晰报错"许可证无效" |
+| native 产物本机运行 | exit 0 |
+| native + 错误机器许可证 | Silent Corrupt |
+| 纯 Python Ed25519 vs RFC 8032 向量 | TEST1/TEST2/TEST3 全部一致 |
+
+### 9.4 边界
+
+- 许可证与密钥派生绑定后，"换证/换机器"必须重新导出产物（binding 已参与
+  加密）——按机器分发为默认形态；
+- native 产物仍可被 C 级逆向（IDA/Ghidra）分析，但成本从"读 Python"
+  抬升了一个数量级；
+- 过期许可证在运行端以 time 检查触发 Silent Corrupt（可通过改系统时间
+  绕过，如需强过期校验请配合联网激活，见 Tier 3）。
 

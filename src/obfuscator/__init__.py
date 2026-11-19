@@ -35,7 +35,7 @@ from .folding import fold_project
 from .foreign_names import collect_foreign_method_names
 from .payload import build_payload, compile_module, loader_source
 
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 
 
 class ObfuscationError(Exception):
@@ -193,32 +193,77 @@ def _scrub_runtime_labels(code: str) -> str:
     return code
 
 
+def _load_license_binding(license_file: str,
+                          license_pubkey: str) -> Tuple[bytes, bytes, bytes]:
+    """读取并验签许可证文件，返回 (payload, sig, machine_fp) 绑定三元组。
+
+    生成端用清晰报错（这是开发者操作，不是攻击现场）。
+    """
+    from .license import LicenseError, verify_license, check_expiry
+    with open(license_file, encoding='ascii') as handle:
+        text = handle.read()
+    pubkey_bytes = bytes.fromhex(license_pubkey)
+    try:
+        data, payload, sig = verify_license(pubkey_bytes, text)
+    except LicenseError as exc:
+        raise ObfuscationError(f"许可证无效: {exc}") from exc
+    try:
+        check_expiry(data)
+    except LicenseError as exc:
+        raise ObfuscationError(f"许可证无效: {exc}") from exc
+    try:
+        fp_bytes = bytes.fromhex(data['machine_fp'])
+        if len(fp_bytes) != 32:
+            raise ValueError
+    except (KeyError, ValueError) as exc:
+        raise ObfuscationError("许可证缺少有效的 machine_fp") from exc
+    return payload, sig, fp_bytes
+
+
 def obfuscate_sb3(input_path: str,
                   output_path: Optional[str] = None,
                   embed_assets: bool = True,
                   fold: bool = True,
-                  seed: Optional[int] = None) -> ObfuscationResult:
+                  seed: Optional[int] = None,
+                  license_file: Optional[str] = None,
+                  license_pubkey: Optional[str] = None,
+                  native: bool = False) -> ObfuscationResult:
     """把 .sb3 转换为混淆后的单文件 Python。
 
     Args:
         input_path: .sb3/.json 输入
-        output_path: 输出 .py；默认 <输入名>_obf.py
+        output_path: 输出 .py；默认 <输入名>_obf.py（native 模式为目录）
         embed_assets: True 时资产写入加密载荷，运行时通过虚拟文件系统
             按需解密（不落盘）；False 时导出到 <输出名>_assets/
         fold: 是否进行常量折叠与恒定条件简化
         seed: 混淆随机种子（None 表示每次不同）
+        license_file: Tier 2 许可证文件路径（b64(payload).b64(sig)）；
+            提供 license_file 时必须同时提供 license_pubkey
+        license_pubkey: Ed25519 公钥 hex；许可证内容与机器指纹参与主密钥
+            派生，机器/许可证不对则产物无法运行
+        native: Tier 2 原生编译模式——loader 用 Cython 编译为 .pyd，
+            输出 <输出名>_native/ 目录（main.py 壳 + core 扩展）
 
     Returns:
-        ObfuscationResult
+        ObfuscationResult（native 模式 output 为目录）
     """
     input_path = os.path.abspath(input_path)
     if not os.path.exists(input_path):
         raise ObfuscationError(f"输入文件不存在: {input_path}")
+    if (license_file is None) != (license_pubkey is None):
+        raise ObfuscationError(
+            "license_file 与 license_pubkey 必须同时提供")
     if output_path is None:
         stem = os.path.splitext(os.path.basename(input_path))[0]
+        suffix = '_obf_native' if native else '_obf'
         output_path = os.path.join(os.path.dirname(input_path),
-                                   stem + '_obf.py')
+                                   stem + suffix)
     output_path = os.path.abspath(output_path)
+
+    license_binding = None
+    if license_file is not None:
+        license_binding = _load_license_binding(
+            os.path.abspath(license_file), license_pubkey)
 
     loaded = load_project(input_path)
     try:
@@ -247,7 +292,7 @@ def obfuscate_sb3(input_path: str,
 
         spec = build_payload(
             stage1_code, result.clusters, result.str_entries,
-            payload_assets, seed)
+            payload_assets, seed, license=license_binding)
         asset_dir_name = (
             os.path.splitext(os.path.basename(output_path))[0] + '_assets')
         source = loader_source(
@@ -258,7 +303,23 @@ def obfuscate_sb3(input_path: str,
             asset_helper='__al__',
             embed_assets=embed_assets,
             asset_dir=asset_dir_name,
-            seed=seed)
+            seed=seed,
+            frame_check=not native)
+
+        if native:
+            from .native import build_native
+            build_dir = build_native(source, output_path, seed)
+            return ObfuscationResult(
+                output=build_dir,
+                asset_count=len(names),
+                embedded_assets=embed_assets and bool(raw_assets),
+                size=sum(os.path.getsize(os.path.join(root, f))
+                         for root, _, files in os.walk(build_dir)
+                         for f in files),
+                folded=fold,
+                clusters=len(result.clusters),
+                strings=len(result.str_entries),
+            )
 
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         with open(output_path, 'w', encoding='utf-8', newline='\n') as handle:
