@@ -88,6 +88,8 @@ _METHOD_BLACKLIST = {
     'aaline', 'aalines', 'arc', 'circle', 'ellipse', 'line', 'lines',
     'polygon', 'rect_draw',
     'tick', 'get_fps', 'get_rawtime', 'tick_busy_loop',
+    'pause', 'unpause', 'music', 'Sound', 'init', 'quit', 'pre_init',
+    'set_pos', 'get_pos', 'get_count', 'get_sdl_device_index',
 }
 
 
@@ -240,8 +242,11 @@ def _collect_foreign_attr_names(tree: ast.Module) -> Set[str]:
 
 
 def _rename_methods(tree: ast.Module, rng: random.Random,
-                    used: Set[str]) -> Dict[str, str]:
+                    used: Set[str], foreign_names: Optional[Set[str]] = None
+                    ) -> Dict[str, str]:
     blacklist = set(_METHOD_BLACKLIST) | _collect_foreign_attr_names(tree)
+    if foreign_names:
+        blacklist |= set(foreign_names)
     mapping: Dict[str, str] = {}
     for node in ast.walk(tree):
         if not isinstance(node, ast.ClassDef):
@@ -542,7 +547,8 @@ def _flatten_locations(tree: ast.Module) -> None:
 # ===================== 入口 =====================
 
 def obfuscate_module(tree: ast.Module,
-                     seed: Optional[int] = None) -> ObfResult:
+                     seed: Optional[int] = None,
+                     foreign_names: Optional[Set[str]] = None) -> ObfResult:
     rng = random.Random(seed)
     tree = ast.fix_missing_locations(tree)
     _remove_docstrings(tree)
@@ -550,7 +556,7 @@ def obfuscate_module(tree: ast.Module,
 
     mapping = _rename_top_level(tree, rng)
     used = set(mapping.values())
-    _rename_methods(tree, rng, used)
+    _rename_methods(tree, rng, used, foreign_names)
     _inject_junk(tree, rng, used)
 
     strtable_name = _random_name(rng, used)

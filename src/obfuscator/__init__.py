@@ -32,6 +32,7 @@ from scratch_vm import load_project
 
 from .ast_obf import obfuscate_module
 from .folding import fold_project
+from .foreign_names import collect_foreign_method_names
 from .payload import build_payload, compile_module, loader_source
 
 __version__ = "2.0.0"
@@ -175,7 +176,8 @@ def obfuscate_sb3(input_path: str,
         except SyntaxError as error:
             raise ObfuscationError(f"生成代码语法错误: {error}") from error
 
-        result = obfuscate_module(tree, seed)
+        result = obfuscate_module(tree, seed,
+                                  foreign_names=collect_foreign_method_names())
         stage1_code = compile_module(result.tree, seed)
 
         spec = build_payload(
