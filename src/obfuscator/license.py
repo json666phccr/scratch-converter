@@ -3,23 +3,29 @@
 
 无第三方依赖：Ed25519 按 RFC 8032 参考实现（sign + verify，扩展坐标）。
 
-许可证模型：
+许可证模型（0.13.4 起：**指纹不进入许可证**）：
 
 - 开发者 `keygen` 生成私钥（自留）与公钥（嵌入产物）；
-- `issue` 为目标机器签发许可证：
-  ``{"product_id", "machine_fp", "expires_at", "features", "nonce"}``
+- `fingerprint` 在目标机器上打印指纹 hex（32 字节，勿随产物分发）；
+- `issue` 签发许可证：``{"product_id", "expires_at", "features", "nonce"}``
   规范化 JSON + Ed25519 签名，文件格式 ``b64(payload).b64(sig)``；
-- 产物构建时传入 ``--license-pubkey`` 与 ``--license-file``，许可证
-  **内容（payload+sig）与签发机器指纹一起参与主密钥派生**：
-  ``K' = H(K_root || H(payload || sig || fp))``
-  ——机器不对 / 许可证被换 / payload 被改，密钥全错 → Silent Corrupt，
-  **没有独立的"校验分支"可 patch**（fp 校验即密钥派生本身）。
+  **许可证文件与产物均可公开分发——它们不含指纹**；
+- 构建时传入 ``--license-pubkey``、``--license-file`` 与
+  ``--license-fp <目标机指纹>``，绑定公式::
+
+      K' = H(K_root || H(payload || sig || fp))
+
+  **fp 只存在于开发者手里**：产物/许可证里都没有它，离线攻击者
+  复算 K' 在信息论上不可行；机器不对 → 运行端 fp 计算不同 →
+  binding 错 → 解密垃圾（Silent Corrupt，无可 patch 的校验分支——
+  fp 校验即密钥派生本身）。
 
 CLI::
 
     python -m obfuscator.license keygen --out-dir keys/
+    python -m obfuscator.license fingerprint          # 目标机上执行
     python -m obfuscator.license issue --priv keys/private.key \
-        --product mygame [--days 365] [--features a,b] [--fp <hex>] \
+        --product mygame [--days 365] [--features a,b] \
         --out license.dat
     python -m obfuscator.license show license.dat
 """
@@ -197,13 +203,15 @@ def machine_fingerprint() -> bytes:
 
 # ===================== 许可证 =====================
 
-def license_payload(product_id: str, machine_fp: bytes,
-                    expires_at: Optional[int], features: Tuple[str, ...],
-                    nonce: str) -> bytes:
-    """规范化 JSON payload（排序键 + 紧凑分隔符），签名的对象"""
+def license_payload(product_id: str, expires_at: Optional[int],
+                    features: Tuple[str, ...], nonce: str) -> bytes:
+    """规范化 JSON payload（排序键 + 紧凑分隔符），签名的对象。
+
+    注意：**不含机器指纹**——指纹只由开发者构建时传入参与密钥派生，
+    不出现在许可证文件与产物中（否则离线复算 K' 成为可能）。
+    """
     data = {
         'product_id': product_id,
-        'machine_fp': machine_fp.hex(),
         'features': sorted(features),
         'nonce': nonce,
     }
@@ -214,13 +222,10 @@ def license_payload(product_id: str, machine_fp: bytes,
 
 
 def issue_license(private_key: bytes, product_id: str,
-                  machine_fp: Optional[bytes] = None,
                   expires_at: Optional[int] = None,
                   features: Tuple[str, ...] = ()) -> Tuple[bytes, bytes]:
-    """返回 (payload_bytes, sig_bytes)。machine_fp 缺省取本机。"""
-    if machine_fp is None:
-        machine_fp = machine_fingerprint()
-    payload = license_payload(product_id, machine_fp, expires_at,
+    """返回 (payload_bytes, sig_bytes)。"""
+    payload = license_payload(product_id, expires_at,
                               features, secrets.token_hex(8))
     return payload, sign(private_key, payload)
 
@@ -242,15 +247,15 @@ def verify_license(public_key: bytes, license_text: str
     """验签并解析。返回 (payload_dict, payload_bytes, sig_bytes)。
 
     签名无效 / payload 非法 -> LicenseError。
-    注意：过期与机器不匹配不在本函数检查——它们由密钥派生兜底
-    （错误的 fp / 过期不改变派生正确性，运行时另行处理过期）。
+    注意：过期与机器不匹配不在本函数检查——过期由运行端 Silent
+    Corrupt 兜底；机器绑定由密钥派生兜底（fp 不在文件里）。
     """
     payload, sig = decode_license(license_text)
     if not verify(public_key, payload, sig):
         raise LicenseError('许可证签名无效（pubkey 不匹配或内容被改）')
     try:
         data = json.loads(payload.decode('utf-8'))
-        if not isinstance(data, dict) or 'machine_fp' not in data:
+        if not isinstance(data, dict) or 'product_id' not in data:
             raise ValueError
     except (ValueError, UnicodeDecodeError) as exc:
         raise LicenseError(f'许可证 payload 非法: {exc}') from exc
@@ -284,14 +289,17 @@ def _cli_keygen(args) -> None:
     print(f'公钥 hex: {pub.hex()}')
 
 
+def _cli_fingerprint(_args) -> None:
+    print(machine_fingerprint().hex())
+
+
 def _cli_issue(args) -> None:
     with open(args.priv, encoding='ascii') as handle:
         priv = bytes.fromhex(handle.read().strip())
-    fp = bytes.fromhex(args.fp) if args.fp else machine_fingerprint()
     expires_at = int(time.time() + args.days * 86400) if args.days else None
     features = tuple(f.strip() for f in args.features.split(',')
                      if f.strip()) if args.features else ()
-    payload, sig = issue_license(priv, args.product, fp, expires_at,
+    payload, sig = issue_license(priv, args.product, expires_at,
                                  features)
     data = json.loads(payload.decode('utf-8'))
     text = encode_license(payload, sig)
@@ -302,9 +310,10 @@ def _cli_issue(args) -> None:
     else:
         print(text)
     print(f"  product_id : {data['product_id']}")
-    print(f"  machine_fp : {data['machine_fp'][:16]}...")
     print(f"  expires_at : {data.get('expires_at', '永不过期')}")
     print(f"  features   : {data['features']}")
+    print('  （机器指纹不在许可证中；构建时用 --license-fp 传入，'
+          '用 fingerprint 子命令在目标机上获取）')
 
 
 def _cli_show(args) -> None:
@@ -332,15 +341,17 @@ def main(argv=None) -> int:
     p.add_argument('--out-dir', default='license_keys')
     p.set_defaults(func=_cli_keygen)
 
-    p = sub.add_parser('issue', help='为机器签发许可证')
+    p = sub.add_parser('fingerprint', help='打印本机指纹 hex'
+                                             '（构建时 --license-fp 用）')
+    p.set_defaults(func=_cli_fingerprint)
+
+    p = sub.add_parser('issue', help='签发许可证')
     p.add_argument('--priv', required=True, help='private.key 路径')
     p.add_argument('--product', required=True, help='产品标识')
     p.add_argument('--days', type=int, default=0,
                    help='有效天数（0 = 永不过期）')
     p.add_argument('--features', default='',
                    help='逗号分隔的功能列表')
-    p.add_argument('--fp', default=None,
-                   help='目标机器指纹 hex（缺省为本机）')
     p.add_argument('--out', default=None, help='license.dat 输出路径')
     p.set_defaults(func=_cli_issue)
 

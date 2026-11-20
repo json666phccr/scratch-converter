@@ -510,13 +510,10 @@ def test_obfuscator_resists_exec_hook():
 
 
 def test_license_binding():
-    """OBF-T2a Ed25519 许可证参与密钥派生：
-    本机签发的许可证可运行；错误机器指纹的许可证 Silent Corrupt"""
+    """OBF-T2a Ed25519 许可证参与密钥派生（指纹不进入分发物）：
+    本机指纹构建可运行；错误指纹 Silent Corrupt；指纹哈希两端一致
+    （多 seed 回归，覆盖随机配方与 sha256 指纹的组合）"""
     print("[测试T2a] 许可证绑定")
-
-    import shutil
-    has_license_cli = shutil.which(sys.executable) is not None
-    assert has_license_cli
 
     with tempfile.TemporaryDirectory() as folder:
         project_json = make_project({
@@ -548,37 +545,44 @@ def test_license_binding():
             stdin=subprocess.DEVNULL)
         assert proc.returncode == 0, proc.stderr
 
-        lic_bad_path = os.path.join(folder, "license_bad.dat")
         proc = subprocess.run(
-            [sys.executable, "-m", "obfuscator.license", "issue",
-             "--priv", priv_path, "--product", "test-game",
-             "--fp", "ab" * 32, "--out", lic_bad_path],
+            [sys.executable, "-m", "obfuscator.license", "fingerprint"],
             capture_output=True, text=True, timeout=120, env=env,
             stdin=subprocess.DEVNULL)
         assert proc.returncode == 0, proc.stderr
+        real_fp = proc.stdout.strip().splitlines()[-1].strip()
 
-        # 本机许可证 → 可运行
-        output = os.path.join(folder, "protected_lic.py")
-        proc = subprocess.run(
-            [sys.executable, "-m", "obfuscator", sb3, output,
-             "--license-pubkey", pub, "--license-file", lic_path,
-             "--seed", "19"],
-            capture_output=True, text=True, timeout=300, env=env,
-            stdin=subprocess.DEVNULL)
-        assert proc.returncode == 0, proc.stderr
-        proc = subprocess.run(
-            [sys.executable, output, "--headless", "--frames", "15",
-             "--no-audio"],
-            capture_output=True, text=True, timeout=90,
-            stdin=subprocess.DEVNULL)
-        assert proc.returncode == 0, proc.stderr
+        # 许可证文件与产物均不含指纹（离线复算 K' 不可行的前提）
+        lic_text = open(lic_path, encoding="ascii").read()
+        assert real_fp not in lic_text and 'machine_fp' not in lic_text
 
-        # 错误机器指纹的许可证 → Silent Corrupt（非零退出且无明文提示）
+        # F1 回归：6 个随机 seed（不同配方）+ 本机指纹 -> 全部可运行
+        # （0.13.3 曾因指纹哈希两端不一致 5/6 概率自砖）
+        for seed in (2, 3, 5, 8, 13, 21):
+            output = os.path.join(folder, f"protected_s{seed}.py")
+            proc = subprocess.run(
+                [sys.executable, "-m", "obfuscator", sb3, output,
+                 "--license-pubkey", pub, "--license-file", lic_path,
+                 "--license-fp", real_fp, "--seed", str(seed)],
+                capture_output=True, text=True, timeout=300, env=env,
+                stdin=subprocess.DEVNULL)
+            assert proc.returncode == 0, proc.stderr
+            proc = subprocess.run(
+                [sys.executable, output, "--headless", "--frames", "15",
+                 "--no-audio"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL)
+            assert proc.returncode == 0, \
+                f"seed={seed} 许可证产物应可运行: {proc.stderr[-400:]}"
+            src = open(output, encoding="utf-8").read()
+            assert real_fp not in src
+
+        # 错误指纹 -> Silent Corrupt（非零退出且无明文提示）
         output_bad = os.path.join(folder, "protected_bad.py")
         proc = subprocess.run(
             [sys.executable, "-m", "obfuscator", sb3, output_bad,
-             "--license-pubkey", pub, "--license-file", lic_bad_path,
-             "--seed", "19"],
+             "--license-pubkey", pub, "--license-file", lic_path,
+             "--license-fp", "ab" * 32, "--seed", "19"],
             capture_output=True, text=True, timeout=300, env=env,
             stdin=subprocess.DEVNULL)
         assert proc.returncode == 0, proc.stderr
@@ -587,18 +591,28 @@ def test_license_binding():
              "--no-audio"],
             capture_output=True, text=True, timeout=90,
             stdin=subprocess.DEVNULL)
-        assert proc.returncode != 0, "错误机器许可证应 Silent Corrupt"
+        assert proc.returncode != 0, "错误指纹应 Silent Corrupt"
         combined = (proc.stdout or '') + (proc.stderr or '')
         assert 'license' not in combined.lower()
 
-        # 篡改许可证签名 → 生成端清晰报错
+        # SCRATCH_OBF_DEBUG=1 时输出诊断（区分工具故障与静默腐蚀）
+        proc = subprocess.run(
+            [sys.executable, output_bad, "--headless", "--frames", "15",
+             "--no-audio"],
+            capture_output=True, text=True, timeout=90,
+            stdin=subprocess.DEVNULL,
+            env={**env, "SCRATCH_OBF_DEBUG": "1"})
+        assert 'integrity' in (proc.stderr or '')
+
+        # 篡改许可证签名 -> 生成端清晰报错
         bad_sig = open(lic_path, encoding="ascii").read().rstrip()
         tampered = lic_path + ".tampered"
         with open(tampered, "w", encoding="ascii") as handle:
             handle.write(bad_sig[:-4] + "AAAA\n")
         proc = subprocess.run(
             [sys.executable, "-m", "obfuscator", sb3, output,
-             "--license-pubkey", pub, "--license-file", tampered],
+             "--license-pubkey", pub, "--license-file", tampered,
+             "--license-fp", real_fp],
             capture_output=True, text=True, timeout=120, env=env,
             stdin=subprocess.DEVNULL)
         assert proc.returncode != 0

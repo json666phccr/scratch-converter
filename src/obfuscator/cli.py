@@ -29,10 +29,13 @@ def build_parser() -> argparse.ArgumentParser:
                              "需要 Cython 与 C 编译器）")
     parser.add_argument("--license-pubkey", default=None,
                         help="Tier 2：Ed25519 公钥 hex（配合 "
-                             "--license-file，许可证参与密钥派生）")
+                             "--license-file 与 --license-fp）")
     parser.add_argument("--license-file", default=None,
                         help="Tier 2：许可证文件路径（由 obfuscator.license "
-                             "issue 签发，绑定目标机器）")
+                             "issue 签发）")
+    parser.add_argument("--license-fp", default=None,
+                        help="Tier 2：目标机器指纹 hex（obfuscator.license "
+                             "fingerprint 输出；不随产物分发）")
     return parser
 
 
@@ -47,6 +50,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             seed=args.seed,
             license_file=args.license_file,
             license_pubkey=args.license_pubkey,
+            license_fp=args.license_fp,
             native=args.native,
         )
     except ObfuscationError as error:
@@ -58,9 +62,11 @@ def main(argv: Optional[List[str]] = None) -> int:
           + ("（已内嵌）" if result.embedded_assets else "（外部）"))
     print(f"常量折叠: {'开启' if result.folded else '关闭'}")
     if args.native:
-        print("分发内容: main.py + 原生扩展（字节码级工具无效）")
+        print("分发内容: main.py + 原生扩展（已剥离调试信息，"
+              "字节码级工具无效）")
     if args.license_file:
-        print("许可证绑定: 已启用（产物只能在签发机器上运行）")
+        print("许可证绑定: 已启用（指纹不在分发物中，离线复算密钥不可行；"
+              "产物只能在 --license-fp 对应的机器上运行）")
     return 0
 
 

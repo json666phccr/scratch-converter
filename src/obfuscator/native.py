@@ -39,6 +39,7 @@ import core
 _SETUP_STUB = '''\
 # -*- coding: utf-8 -*-
 import os
+import shutil
 import sys
 
 from setuptools import Extension, setup
@@ -49,8 +50,11 @@ if sys.maxsize > 2 ** 32:
     macros.append(('MS_WIN64', None))
     macros.append(('SIZEOF_VOID_P', '8'))
 
+# F2/D2：不生成调试信息，避免 DWARF 泄露加载器变量词汇表
+extra = ['-g0'] if shutil.which('gcc') else []
+
 ext = Extension('core', ['core.pyx'], define_macros=macros,
-                language='c')
+                language='c', extra_compile_args=extra)
 setup(ext_modules=cythonize(ext, language_level=3))
 '''
 
@@ -103,8 +107,16 @@ def build_native(loader_source_text: str, output_dir: str,
         copied = []
         for name in os.listdir(workdir):
             if name.startswith('core.') and name.endswith(('.pyd', '.so')):
-                shutil.copy2(os.path.join(workdir, name),
-                             os.path.join(output_dir, name))
+                src_file = os.path.join(workdir, name)
+                # F2/D2：strip 兜底（-g0 已禁止生成调试段）
+                strip = shutil.which('strip')
+                if strip:
+                    try:
+                        subprocess.run([strip, '--strip-debug', src_file],
+                                       capture_output=True, timeout=60)
+                    except (OSError, subprocess.TimeoutExpired):
+                        pass
+                shutil.copy2(src_file, os.path.join(output_dir, name))
                 copied.append(name)
         if not copied:
             raise ObfuscationError("编译完成但未找到 core 扩展产物")
