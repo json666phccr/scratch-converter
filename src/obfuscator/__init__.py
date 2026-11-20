@@ -35,7 +35,7 @@ from .folding import fold_project
 from .foreign_names import collect_foreign_method_names
 from .payload import build_payload, compile_module, loader_source
 
-__version__ = "2.4.0"
+__version__ = "2.5.0"
 
 
 class ObfuscationError(Exception):
@@ -297,13 +297,21 @@ def obfuscate_sb3(input_path: str,
         except SyntaxError as error:
             raise ObfuscationError(f"生成代码语法错误: {error}") from error
 
+        # 第一层：源码级预混淆——抹装饰器、恒定折叠/内联、局部变量名
+        # 混淆（含运行时模板）、注入假结构。进入后续管线的已经不是
+        # 原始生成的 Python。
+        from .first_pass import pre_obfuscate, make_decoy_cluster_sources
+        pre_obfuscate(tree, seed)
+
         result = obfuscate_module(tree, seed,
                                   foreign_names=collect_foreign_method_names())
         stage1_code = compile_module(result.tree, seed)
 
         spec = build_payload(
             stage1_code, result.clusters, result.str_entries,
-            payload_assets, seed, license=license_binding)
+            payload_assets, seed, license=license_binding,
+            decoy_sources=make_decoy_cluster_sources(
+                random.Random(seed), rng_decoys=2))
         asset_dir_name = (
             os.path.splitext(os.path.basename(output_path))[0] + '_assets')
         source = loader_source(

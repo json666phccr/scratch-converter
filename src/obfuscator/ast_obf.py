@@ -92,6 +92,20 @@ _METHOD_BLACKLIST = {
     'set_pos', 'get_pos', 'get_count', 'get_sdl_device_index',
 }
 
+# 字符串表语义诱饵词表：与真实 Scratch 词汇同形的假条目
+_DECOY_OPS = ('motion_movesteps', 'looks_say', 'sound_play', 'sound_stopall',
+              'data_setvariableto', 'data_listcontents', 'event_broadcast',
+              'event_whenbroadcastreceived', 'control_forever',
+              'control_ifelse', 'control_wait', 'sensing_timer',
+              'sensing_touchingobject', 'operator_random',
+              'operator_mathop', 'motion_turnright', 'motion_glideto',
+              'looks_nextcostume', 'looks_switchbackdrop',
+              'event_whenflagclicked', 'event_whenkeypressed',
+              'procedures_definition', 'pen_penDown', 'music_playDrum')
+_DECOY_VARS = ('score', 'lives', 'speed', 'timer', 'answer', 'level',
+               'player_x', 'player_y', 'gravity', 'health', 'ammo',
+               'inventory', 'checkpoint', 'highscore', 'difficulty')
+
 
 @dataclass
 class ObfResult:
@@ -603,11 +617,26 @@ def obfuscate_module(tree: ast.Module,
 
     _flatten_locations(tree)
     tree = ast.fix_missing_locations(tree)
+
+    # 字符串表语义诱饵：尾部追加与 Scratch 词汇同形的假条目
+    # （假 opcode / 假变量名 / 假方法名 / 假台词）——追加在尾部不影响
+    # 真实下标，静态搜索命中"情报"实为诱饵
+    decoys: List[str] = []
+    for _ in range(rng.randrange(25, 51)):
+        kind = rng.randrange(4)
+        if kind == 0:
+            decoys.append(rng.choice(_DECOY_OPS))
+        elif kind == 1:
+            decoys.append(rng.choice(_DECOY_VARS))
+        elif kind == 2:
+            decoys.append(f"{rng.choice(_DECOY_VARS)}_{rng.randrange(99)}")
+        else:
+            decoys.append(_random_name(rng, set()))
     return ObfResult(
         tree=tree,
         main_name=mapping.get('main', 'main'),
         strtable_name=strtable_name,
-        str_entries=table.entries,
+        str_entries=table.entries + decoys,
         cluster_helper=cluster_helper,
         clusters=clusters,
     )

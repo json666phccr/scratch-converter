@@ -232,7 +232,8 @@ class PayloadSpec:
 def build_payload(stage1_code, cluster_sources: List[str],
                   str_entries: List[str], assets: Dict[str, bytes],
                   seed=None,
-                  license: Optional[Tuple[bytes, bytes, bytes]] = None
+                  license: Optional[Tuple[bytes, bytes, bytes]] = None,
+                  decoy_sources: Optional[List[str]] = None
                   ) -> PayloadSpec:
     rng = random.Random(seed)
     recipe = make_recipe(rng, len(cluster_sources), sorted(assets))
@@ -285,6 +286,18 @@ def build_payload(stage1_code, cluster_sources: List[str],
         code = compile(source, f"<{rng.randrange(16 ** 12):012x}>",
                        'exec', dont_inherit=True)
         encrypt(recipe.cluster_sids[index], marshal.dumps(code), digest_main)
+
+    # 诱饵簇：与真簇同规格加密入表，但加载器永不调用——静态解包者
+    # 解出后真假难辨，必须逐个执行/反编译才能辨识（提高成品率门槛）
+    for decoy_source in (decoy_sources or ()):
+        code = compile(decoy_source, f"<{rng.randrange(16 ** 12):012x}>",
+                       'exec', dont_inherit=True)
+        sid = ''.join(rng.choice(_SID_ALPHABET) for _ in
+                      range(rng.randrange(10, 17)))
+        while not sid[0].isalpha():
+            sid = ''.join(rng.choice(_SID_ALPHABET)
+                          for _ in range(rng.randrange(10, 17)))
+        encrypt(sid, marshal.dumps(code), digest_main)
 
     for name, data in assets.items():
         encrypt(recipe.asset_sids[name], data, digest_main)
