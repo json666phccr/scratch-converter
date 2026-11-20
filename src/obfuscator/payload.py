@@ -288,7 +288,9 @@ def build_payload(stage1_code, cluster_sources: List[str],
         encrypt(recipe.cluster_sids[index], marshal.dumps(code), digest_main)
 
     # 诱饵簇：与真簇同规格加密入表，但加载器永不调用——静态解包者
-    # 解出后真假难辨，必须逐个执行/反编译才能辨识（提高成品率门槛）
+    # 解出后真假难辨，必须逐个执行/反编译才能辨识（提高成品率门槛）。
+    # sid 追加进 cluster_sids：诱饵 trampoline（stage1 引用 csid 下标）
+    # 使 sid 可达性与真簇一致，引用计数判据失效
     for decoy_source in (decoy_sources or ()):
         code = compile(decoy_source, f"<{rng.randrange(16 ** 12):012x}>",
                        'exec', dont_inherit=True)
@@ -297,6 +299,7 @@ def build_payload(stage1_code, cluster_sources: List[str],
         while not sid[0].isalpha():
             sid = ''.join(rng.choice(_SID_ALPHABET)
                           for _ in range(rng.randrange(10, 17)))
+        recipe.cluster_sids.append(sid)
         encrypt(sid, marshal.dumps(code), digest_main)
 
     for name, data in assets.items():
@@ -412,6 +415,7 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     n_cf = name('c')
     n_ph = name('h')
     n_tx = name('t')
+    n_schk = name('k')
     n_dbg = name('g')
     frag_names = [name('f') for _ in rec.fragments]
 
@@ -423,9 +427,15 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     # ---- 生成期辅助：字符串常量一律运行时由 chr 码构造 ----
     # （不再出现 bytes.fromhex('...') 形态：依赖该形状的静态解析器
     #   无法提取模块名/哈希族名，同时避免原生编译时常量折叠落盘）
+    # 掩码 n_vm 是运行时值（&0 恒为 0 但无法被编译器常量折叠），
+    # 阻断 Cython 把 chr 构造折叠回明文字符串（W4）
+    n_vm = name('m')
+
     def H(value: str) -> str:
-        codes = ", ".join(str(byte) for byte in value.encode('utf-8'))
-        return f"''.join(map(chr, ({codes},)))"
+        codes = ", ".join(str(byte ^ 0x5A)
+                          for byte in value.encode('utf-8'))
+        return (f"''.join(map(chr, tuple(x ^ 0x5A ^ {n_vm} "
+                f"for x in ({codes},))))")
 
     L: List[str] = []
 
@@ -435,6 +445,7 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     # ---- imports（字符串常量运行时构造）----
     add(f"{n_imp} = __import__")
     add(f"{n_hex} = bytes.fromhex")
+    add(f"{n_vm} = len(__name__) & 0")
     for mod, binding in mod_names.items():
         add(f"{binding} = {n_imp}({H(mod)})")
     add(f"{n_bi} = {n_imp}({H('builtins')})")
@@ -443,6 +454,8 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     add(f"{n_kh} = getattr({n_hash}, {H(rec.ks_hash_name)})")
     add(f"{n_h256} = getattr({n_hash}, {H('sha256')})")
     add(f"{n_cf} = False")
+    if self_hash:
+        ph_index = len(L)
     add()
 
     # ---- 密钥分裂片段（算术派生 + 异或混合，两种形态随机）----
@@ -570,27 +583,27 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     add(f"    {n_cr}()")
     add()
 
-    # ---- 源码前缀自校验：本行之前的全部加载器源码参与哈希 ----
-    # 探针/密钥派生/许可证绑定任何一行被 patch -> 哈希不符 -> Silent Corrupt
+    # ---- 源码完整性自校验（覆盖到 EOF）----
+    # ph 行（含 #obf-ichk 标记）之外的全部加载器源码——包括分段表、dec、
+    # 调用点、周期探针与入口——参与哈希。启动与周期探针双重校验：
+    # 追加/删行/改行任一变化 -> Silent Corrupt（重算哈希可绕，Tier 1 边界，
+    # 但每次 patch 都需要理解机制并重算）
     if self_hash:
-        marker = '#obf-selfchk'
-        prefix_text = "\n".join(L) + "\n"
-        ph = _hash_fn(rec.hash_name)(
-            prefix_text.encode('utf-8')).digest()
-        add(marker)
-        add(f"{n_ph} = {ph!r}")
-        add("try:")
-        add(f"    {n_tx} = open(__file__, {H('rb')}).read()"
+        add(f"def {n_schk}():")
+        add("    try:")
+        add(f"        {n_tx} = open(__file__, {H('rb')}).read()"
             f".decode({H('utf-8')})")
-        add(r"    " + f"{n_tx} = {n_tx}.replace('\\r\\n', '\\n')"
+        add(r"        " + f"{n_tx} = {n_tx}.replace('\\r\\n', '\\n')"
             f".replace('\\r', '\\n')")
-        add(f"    {n_tx} = {n_tx}[: {n_tx}.index({H(marker)})]")
-        add(f"    if {n_hf}({n_tx}.encode({H('utf-8')})).digest() "
+        add(f"        {n_tx} = '\\n'.join(x for x in {n_tx}.split('\\n') "
+            f"if {H('#obf-ichk')} not in x)")
+        add(f"        if {n_hf}({n_tx}.encode({H('utf-8')})).digest() "
             f"!= {n_ph}:")
+        add(f"            {n_cr}()")
+        add("    except Exception:")
         add(f"        {n_cr}()")
-        add("except Exception:")
-        add(f"    {n_cr}()")
-        add()
+        add(f"{n_schk}()")
+    add()
 
     # ---- 分段表 ----
     if rec.table_form == 0:
@@ -682,10 +695,13 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     add(f"def {n_dec}({p_sid}, {p_prev}):")
     add(f"    global {n_cf}")
     if frame_check:
+        # 调用方校验双重：源文件 + 函数名白名单（模块帧/clh/alh）——
+        # 同文件追加的钩子代码 co_name 不在白名单内，直接腐蚀
         add(f"    {v_fr} = {n_sys}._getframe(1)")
         add(f"    if {v_fr} is None or " +
             f"{n_os}.path.abspath(__file__) != "
-            f"{v_fr}.f_code.co_filename:")
+            f"{v_fr}.f_code.co_filename or {v_fr}.f_code.co_name "
+            f"not in ({H('<module>')}, {H(n_clh)}, {H(n_alh)}):")
         add(f"        {n_cr}()")
     add(f"    {v_sa}, {v_tg}, {v_pt} = {n_segs}[{p_sid}]")
     add(f"    {v_ct} = getattr({n_b85}, {H(dec_attr)})"
@@ -855,6 +871,8 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     v_i = name('v')
     v_t2 = name('v')
     add(f"def {n_pt}():")
+    if self_hash:
+        add(f"    {n_schk}()")
     add(f"    if {n_pd}():")
     add(f"        for {v_i} in range(len({n_L})):")
     add("            " + f"{n_L}[{v_i}] = chr(0xE000 + ({v_i} * 31 % 400))")
@@ -875,6 +893,17 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     add(f"    if {n_cf}:")
     add(f"        {n_dbg}()")
     add("    raise")
+
+    # ---- ph 行插入：全部源码（除本行）参与 n_schk 哈希 ----
+    # 生成端与运行端以相同规则过滤 #obf-ichk 行后求哈希
+    if self_hash:
+        ph_line = f"{n_ph} = None  #obf-ichk"
+        lines = L[:ph_index] + [ph_line] + L[ph_index:]
+        filtered = '\n'.join(
+            x for x in lines if '#obf-ichk' not in x) + '\n'
+        ph = _hash_fn(rec.hash_name)(filtered.encode('utf-8')).digest()
+        L[:] = (L[:ph_index]
+                + [f"{n_ph} = {ph!r}  #obf-ichk"] + L[ph_index:])
     return "\n".join(L) + "\n"
 
 

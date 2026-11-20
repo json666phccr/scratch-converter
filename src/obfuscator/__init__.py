@@ -35,7 +35,7 @@ from .folding import fold_project
 from .foreign_names import collect_foreign_method_names
 from .payload import build_payload, compile_module, loader_source
 
-__version__ = "2.5.0"
+__version__ = "2.6.0"
 
 
 class ObfuscationError(Exception):
@@ -51,6 +51,7 @@ class ObfuscationResult:
     folded: bool
     clusters: int
     strings: int
+    decoy_clusters: int = 0
 
 
 def _asset_names(project: ProjectIR) -> Set[str]:
@@ -300,7 +301,7 @@ def obfuscate_sb3(input_path: str,
         # 第一层：源码级预混淆——抹装饰器、恒定折叠/内联、局部变量名
         # 混淆（含运行时模板）、注入假结构。进入后续管线的已经不是
         # 原始生成的 Python。
-        from .first_pass import pre_obfuscate, make_decoy_cluster_sources
+        from .first_pass import pre_obfuscate
         pre_obfuscate(tree, seed)
 
         result = obfuscate_module(tree, seed,
@@ -310,8 +311,7 @@ def obfuscate_sb3(input_path: str,
         spec = build_payload(
             stage1_code, result.clusters, result.str_entries,
             payload_assets, seed, license=license_binding,
-            decoy_sources=make_decoy_cluster_sources(
-                random.Random(seed), rng_decoys=2))
+            decoy_sources=result.decoy_clusters)
         asset_dir_name = (
             os.path.splitext(os.path.basename(output_path))[0] + '_assets')
         source = loader_source(
@@ -361,6 +361,7 @@ def obfuscate_sb3(input_path: str,
             folded=fold,
             clusters=len(result.clusters),
             strings=len(result.str_entries),
+            decoy_clusters=len(result.decoy_clusters),
         )
     finally:
         loaded.close()

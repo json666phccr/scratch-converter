@@ -680,6 +680,63 @@ def test_native_build():
     return True
 
 
+def test_obfuscator_tail_patch_resisted():
+    """OBF-2g 源码完整性覆盖 EOF：尾部追加 / 删行 / 改行均应 Silent
+    Corrupt（v2.5 曾只覆盖前缀，追加 164 字节静默通过）"""
+    print("[测试105g] 尾部 patch 抵抗")
+
+    with tempfile.TemporaryDirectory() as folder:
+        project_json = make_project({
+            "hat": block("event_whenflagclicked", None, None, top_level=True),
+        }, name="PatchSprite")
+        project_json["targets"].insert(0, _stage_target())
+        sb3 = _write_sb3(folder, project_json)
+        output = os.path.join(folder, "protected.py")
+        obfuscate_sb3(sb3, output, embed_assets=True, seed=29)
+
+        # 对照：不 patch 正常
+        proc = subprocess.run(
+            [sys.executable, output, "--headless", "--frames", "10",
+             "--no-audio"],
+            capture_output=True, text=True, timeout=90,
+            stdin=subprocess.DEVNULL)
+        assert proc.returncode == 0, proc.stderr
+
+        source = open(output, encoding="utf-8").read()
+        lines = source.splitlines()
+
+        variants = {
+            "tail-append": source + "\nprint('INJECTED-OK')\n",
+            "tail-delete": "\n".join(lines[:-1]) + "\n",
+            "probe-nop": source.replace(
+                "    return False", "    return False\ndef _zz(): pass", 1),
+        }
+        for name, mutated in variants.items():
+            path = os.path.join(folder, f"p_{name}.py")
+            with open(path, "w", encoding="utf-8", newline='\n') as handle:
+                handle.write(mutated)
+            proc = subprocess.run(
+                [sys.executable, path, "--headless", "--frames", "10",
+                 "--no-audio"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL)
+            assert proc.returncode != 0, f"{name} 应 Silent Corrupt"
+            combined = (proc.stdout or '') + (proc.stderr or '')
+            assert 'INJECTED-OK' not in combined, name
+
+            # DEBUG 诊断可见
+            proc = subprocess.run(
+                [sys.executable, path, "--headless", "--frames", "10",
+                 "--no-audio"],
+                capture_output=True, text=True, timeout=90,
+                stdin=subprocess.DEVNULL,
+                env={**os.environ, "SCRATCH_OBF_DEBUG": "1"})
+            assert 'integrity' in (proc.stderr or ''), name
+
+    print("  [PASS] 尾部 patch 抵抗通过")
+    return True
+
+
 TESTS = [
     test_obfuscator_constant_folding,
     test_obfuscator_end_to_end,
@@ -691,4 +748,5 @@ TESTS = [
     test_obfuscator_resists_exec_hook,
     test_license_binding,
     test_native_build,
+    test_obfuscator_tail_patch_resisted,
 ]

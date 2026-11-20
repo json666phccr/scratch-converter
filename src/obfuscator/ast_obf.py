@@ -116,6 +116,7 @@ class ObfResult:
     str_entries: List[str] = field(default_factory=list)
     cluster_helper: str = ''
     clusters: List[str] = field(default_factory=list)  # index = cluster id
+    decoy_clusters: List[str] = field(default_factory=list)
 
 
 def _random_name(rng: random.Random, used: Set[str]) -> str:
@@ -508,6 +509,97 @@ def _inject_junk(tree: ast.Module, rng: random.Random, used: Set[str]) -> None:
 
 # ===================== 函数簇拆分 =====================
 
+def _make_decoy_clusters(clusters: List[str], rng: random.Random,
+                         used: Set[str]) -> List[str]:
+    """从真实簇中克隆函数生成诱饵簇（真实形态/真实常量/随机标识符）。
+
+    克隆体内全部标识符统一换新随机名（诱饵永不执行，仅静态形态存在），
+    消除"固定 _dc 前缀 / 硬编码 opcode 常量 / 固定 code object 数"判据。
+    """
+    import copy as _copy
+
+    real_defs: List[ast.stmt] = []
+    for source in clusters:
+        try:
+            real_defs.extend(ast.parse(source).body)
+        except SyntaxError:
+            continue
+    funcs = [d for d in real_defs
+             if isinstance(d, (ast.FunctionDef, ast.AsyncFunctionDef,
+                               ast.ClassDef))]
+    if not funcs:
+        return []
+
+    decoys = []
+    for _ in range(rng.randrange(1, 3)):
+        template = rng.choice(funcs)
+        clone = _copy.deepcopy(template)
+
+        ids: Set[str] = set()
+        for n in ast.walk(clone):
+            if isinstance(n, ast.Name):
+                ids.add(n.id)
+            elif isinstance(n, ast.arg):
+                ids.add(n.arg)
+            elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                ast.ClassDef)):
+                ids.add(n.name)
+        mapping = {name: _random_name(rng, used) for name in ids}
+
+        for n in ast.walk(clone):
+            if isinstance(n, ast.Name) and n.id in mapping:
+                n.id = mapping[n.id]
+            elif isinstance(n, ast.arg) and n.arg in mapping:
+                n.arg = mapping[n.arg]
+            elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                ast.ClassDef)) and n.name in mapping:
+                n.name = mapping[n.name]
+        decoys.append("\n\n".join(
+            ast.unparse(item) for item in
+            (clone.body if isinstance(clone, ast.ClassDef) else [clone])))
+    return decoys
+
+
+def _shuffle_string_table(tree: ast.Module, table: _StringTable,
+                          strtable_name: str, rng: random.Random
+                          ) -> None:
+    """语义诱饵均匀混入 + 全表随机置换，重写代码中的引用下标。"""
+    real = list(table.entries)
+    existing = set(real)
+    decoys: List[str] = []
+    for _ in range(rng.randrange(25, 51)):
+        kind = rng.randrange(4)
+        if kind == 0:
+            cand = rng.choice(_DECOY_OPS)
+        elif kind == 1:
+            cand = rng.choice(_DECOY_VARS)
+        elif kind == 2:
+            cand = f"{rng.choice(_DECOY_VARS)}_{rng.randrange(99)}"
+        else:
+            cand = _random_name(rng, set())
+        if cand not in existing:
+            existing.add(cand)
+            decoys.append(cand)
+
+    final = real + decoys
+    rng.shuffle(final)
+    mapping = {}
+    for index, value in enumerate(real):
+        mapping[index] = final.index(value)
+
+    # 与引用收集完全相同的 ast.walk 遍历重写（避免 NodeTransformer
+    # 与 walk 的访问差异导致漏改）
+    for n in ast.walk(tree):
+        if (isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name)
+                and n.value.id == strtable_name
+                and isinstance(n.slice, ast.Constant)
+                and isinstance(n.slice.value, int)
+                and n.slice.value in mapping):
+            n.slice.value = mapping[n.slice.value]
+    table.entries = final
+    ast.fix_missing_locations(tree)
+
+
 def _split_clusters(tree: ast.Module, rng: random.Random,
                     helper: str, main_name: str, max_size: int = 6
                     ) -> List[str]:
@@ -612,31 +704,33 @@ def obfuscate_module(tree: ast.Module,
     table = _StringTable()
     _encode_strings(tree, table, strtable_name)
 
+    # 字符串表定稿：语义诱饵均匀混入 + 全表随机置换（引用下标重写，
+    # "诱饵全部连续位于尾部"的边界判据失效）
+    _shuffle_string_table(tree, table, strtable_name, rng)
+
     clusters = _split_clusters(
         tree, rng, cluster_helper, mapping.get('main', 'main'))
 
+    # 诱饵簇：克隆真实簇函数（真实形态/常量/随机名）+ 诱饵 trampoline
+    # 注入 stage1（helper(csid 下标) 引用使诱饵 sid 与真簇同样可达）
+    decoy_clusters = _make_decoy_clusters(clusters, rng, used)
+    base = len(clusters)
+    for offset in range(len(decoy_clusters)):
+        tname = _random_name(rng, used)
+        tramp = ast.parse(
+            f"def {tname}(*_a, **_k):\n"
+            f"    {cluster_helper}({base + offset}, globals())\n"
+            f"    return {tname}(*_a, **_k)\n").body[0]
+        tree.body.append(tramp)
+
     _flatten_locations(tree)
     tree = ast.fix_missing_locations(tree)
-
-    # 字符串表语义诱饵：尾部追加与 Scratch 词汇同形的假条目
-    # （假 opcode / 假变量名 / 假方法名 / 假台词）——追加在尾部不影响
-    # 真实下标，静态搜索命中"情报"实为诱饵
-    decoys: List[str] = []
-    for _ in range(rng.randrange(25, 51)):
-        kind = rng.randrange(4)
-        if kind == 0:
-            decoys.append(rng.choice(_DECOY_OPS))
-        elif kind == 1:
-            decoys.append(rng.choice(_DECOY_VARS))
-        elif kind == 2:
-            decoys.append(f"{rng.choice(_DECOY_VARS)}_{rng.randrange(99)}")
-        else:
-            decoys.append(_random_name(rng, set()))
     return ObfResult(
         tree=tree,
         main_name=mapping.get('main', 'main'),
         strtable_name=strtable_name,
-        str_entries=table.entries + decoys,
+        str_entries=table.entries,
         cluster_helper=cluster_helper,
         clusters=clusters,
+        decoy_clusters=decoy_clusters,
     )

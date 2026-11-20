@@ -542,58 +542,6 @@ class {cls_name}:
 
 # ---------------------------------------------------------------- 入口
 
-def make_decoy_cluster_sources(rng: random.Random, rng_decoys: int = 2
-                               ) -> List[str]:
-    """生成诱饵簇源码：与真簇同形（顶层函数 + 垃圾运算 + 假类），
-    加密进载荷但加载器永不调用——静态解包者解出后真假难辨。"""
-    sources = []
-    for _ in range(rng_decoys):
-        names = [f"_dc{rng.randrange(16 ** 8):08x}" for _ in range(3)]
-        cls_name = f"_Dc{rng.randrange(16 ** 8):08x}"
-        a, b = rng.randrange(1 << 16), rng.randrange(1 << 16)
-        sources.append(f"""
-def {names[0]}(x, y):
-    if x == {rng.randrange(0x10000, 0xFFFFF)}:
-        return (y * {rng.randrange(3, 99)}) ^ x
-    acc = x
-    for _ in range({rng.randrange(2, 6)}):
-        acc = (acc * {a} + {b}) & 0xFFFFFFFF
-    return acc ^ y
-
-
-def {names[1]}(flag):
-    table = {{
-        'motion_movesteps': {names[0]},
-        'looks_say': {names[2]},
-        'data_setvariableto': {names[0]},
-    }}
-    if flag:
-        return table
-    return {{k: v for k, v in table.items() if k}}
-
-
-def {names[2]}(runtime, target, value):
-    if runtime is None:
-        return {rng.randrange(1 << 20)}
-    return target if target else value
-
-
-class {cls_name}:
-    def __init__(self, state):
-        self._state = state
-        self._cache = {{}}
-
-    def _apply(self, key, amount):
-        if key not in self._cache:
-            self._cache[key] = {names[0]}(amount, {a})
-        return self._cache[key]
-
-    def step(self, delta):
-        return self._apply('motion_movesteps', delta)
-""")
-    return sources
-
-
 def pre_obfuscate(tree: ast.Module, seed=None) -> None:
     """第一层源码预混淆入口（先于 obfuscate_module）。"""
     rng = random.Random(seed)
