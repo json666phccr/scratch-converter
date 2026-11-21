@@ -29,12 +29,17 @@ from .compiler import (
     validate_sb3_json,
 )
 from .errors import ScPythonError, ScPythonSyntaxError
+from .importer import import_sb3
+from .lint import LintIssue, lint_project
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "export_project",
     "check_project",
+    "import_sb3",
+    "lint_project",
+    "LintIssue",
     "ProjectCompiler",
     "validate_sb3_json",
     "ModuleAnalyzer",
@@ -65,3 +70,9 @@ def check_project(folder: str, verbose: bool = False) -> ProjectIR:
     """只编译不导出，用于语法检查"""
     compiler = ProjectCompiler(folder, verbose=verbose)
     return compiler.compile()
+
+
+def sb3_to_scpython(input_path: str, output_folder: str,
+                    split_macros: bool = True) -> str:
+    """把 .sb3 / project.json 转成 ScPython 工程目录。"""
+    return import_sb3(input_path, output_folder, split_macros=split_macros)

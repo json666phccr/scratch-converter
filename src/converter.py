@@ -30,7 +30,7 @@ from python_parser import (parse_python_code, parse_python_file,
 from general_python import parse_general_project
 from convert_log import LOG
 
-__version__ = "0.14.2"
+__version__ = "0.15.0"
 
 
 def _count_statements(project: ProjectIR) -> int:
@@ -476,6 +476,7 @@ def _dispatch(converter, args):
         print("  python converter.py scratch2py <input.sb3> [output.py] [--split] [--no-bundle]")
         print("  python converter.py py2scratch <input.py> [output.sb3] [--mode dsl|general|auto]")
         print("  python converter.py scpy2scratch <工程目录> [output.sb3]")
+        print("  python converter.py sb32scpy <input.sb3> <工程目录> [--no-macros]")
         print("  python converter.py sb3obf <input.sb3> [output.py] [--no-embed-assets] [--no-fold] [--seed N]")
         print("  python converter.py roundtrip-sb3 <input.sb3> [output.sb3]")
         print("  python converter.py roundtrip-py <input.py> [output.py]")
@@ -531,6 +532,19 @@ def _dispatch(converter, args):
             os.path.abspath(folder.rstrip('\\/')) + '.sb3')
         path = export_project(folder, output_path)
         print(f"  ScPython 工程已导出: {path}")
+
+    elif command == 'sb32scpy':
+        args = args[1:]
+        split_macros = '--no-macros' not in args
+        args = [item for item in args if item != '--no-macros']
+        if len(args) < 2:
+            print("用法: python converter.py sb32scpy <input.sb3> <工程目录> "
+                  "[--no-macros]")
+            sys.exit(1)
+        from scpython import sb3_to_scpython
+        path = sb3_to_scpython(args[0], args[1],
+                               split_macros=split_macros)
+        print(f"  ScPython 工程已生成: {path}")
 
     elif command == 'sb3obf':
         args = args[1:]

@@ -1,6 +1,6 @@
 # Scratch 3.0 <-> Python 双向转换器
 
-> 版本 **0.14.2** · [MIT License](LICENSE)
+> 版本 **0.15.0** · [MIT License](LICENSE)
 
 一个强大的 Scratch 3.0 与 Python 之间的双向转换工具，支持**一比一对应**的转换，同时支持高级 Python 语法。
 
@@ -277,8 +277,16 @@ python -m scpython check ..\example\scpy_demo
 # 导出 sb3
 python -m scpython export ..\example\scpy_demo -o ..\example\scpy_demo.sb3
 
+# 把现有 sb3 转成 ScPython 工程（相同自制积木自动抽到 macros.scpy）
+python -m scpython import ..\example\scpy_demo.sb3 -o ..\example\scpy_imported
+
+# 调试：静态检查 + 无头运行
+python -m scpython lint ..\example\scpy_demo
+python -m scpython run ..\example\scpy_demo --seconds 3 --trace 20 --stats
+
 # 主转换器别名
 python converter.py scpy2scratch ..\example\scpy_demo ..\example\scpy_demo.sb3
+python converter.py sb32scpy ..\example\scpy_demo.sb3 ..\example\scpy_imported
 ```
 
 特性：
@@ -287,6 +295,10 @@ python converter.py scpy2scratch ..\example\scpy_demo ..\example\scpy_demo.sb3
 - 列表索引从 1 开始，只支持原版 Scratch 列表操作；
 - 每个文件一个角色，`units/Bat.scpy` 导出为角色 `units//Bat`；
 - `macros.scpy` 中的函数在角色调用时按需复制到角色内（含传递依赖）；
+- **sb3 → ScPython**：转换事件/变量/列表/自制积木/注释；默认分析各角色中**完全相同**的自制积木并抽到 `macros.scpy`（`--no-macros` 可关闭）；全局变量只在舞台声明；
+- **列表默认值**：`list xs = txt("data.txt")` 或 `debug.import_list(xs, "data.txt")` 直接读文本文件（每行一项）；
+- **调试方法**：`debug.set_default` / `debug.set_list_default` 改变量/列表默认值，`debug.set_var` / `debug.reset` 运行期改值或恢复默认值，`debug.print/trace/watch/assert` 作为编译期提示输出；
+- **调试工具**：`scpython lint` 检查未使用的变量/列表/自制积木/宏；`scpython run` 在本机无头 VM 中运行并输出变量、watch 表达式、统计与最近执行轨迹；编译错误附带源码行与列指示；
 - 支持 pen/music 内置封装与 `extensions.json` 自定义扩展；
 - `assets/` 自动计算 MD5、造型尺寸与旋转中心，资源自动去重；
 - 导出前校验 SB3 元数据与目标结构（`meta.vm`、`targets`、造型/声音字段），避免 TurboWarp 拒绝打开；

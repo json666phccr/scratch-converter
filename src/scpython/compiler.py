@@ -294,9 +294,16 @@ class ModuleAnalyzer:
                     and isinstance(stmt.value, ast.Constant) \
                     and isinstance(stmt.value.value, str):
                 continue
+            elif isinstance(stmt, ast.Expr) \
+                    and isinstance(stmt.value, ast.Call) \
+                    and isinstance(stmt.value.func, ast.Attribute) \
+                    and isinstance(stmt.value.func.value, ast.Name) \
+                    and stmt.value.func.value.id == 'debug':
+                self._parse_debug_init(module, stmt.value.func.attr,
+                                       stmt.value, stmt.lineno)
             else:
                 raise ScPythonError(
-                    "init 块只能包含初始化赋值",
+                    "init 块只能包含初始化赋值/调试指令",
                     path=self.path, line=getattr(stmt, 'lineno', None))
 
     def _parse_init_assignment(self, module: ModuleInfo,
@@ -327,6 +334,22 @@ class ModuleAnalyzer:
             return
         if name in _PROPERTY_KEYS:
             module.meta[name] = _constant(value, self.path, name)
+            return
+
+        # list xs = txt("data.txt") / list xs = __list__(txt("..."))
+        if isinstance(value, ast.Call) and isinstance(
+                value.func, ast.Name) and value.func.id == '__list__' \
+                and len(value.args) == 1 \
+                and isinstance(value.args[0], ast.Call) \
+                and isinstance(value.args[0].func, ast.Name) \
+                and value.args[0].func.id in ('txt', '__txt__'):
+            items = self._read_text_lines(value.args[0], name, node.lineno)
+            self._declare_list(module, name, items, node.lineno)
+            return
+        if isinstance(value, ast.Call) and isinstance(
+                value.func, ast.Name) and value.func.id in ('txt', '__txt__'):
+            items = self._read_text_lines(value, name, node.lineno)
+            self._declare_list(module, name, items, node.lineno)
             return
 
         # var x = ... / list xs = [...]
@@ -364,6 +387,77 @@ class ModuleAnalyzer:
                 f"变量 {name} 的初始值类型不受支持",
                 path=self.path, line=node.lineno)
         self._declare_var(module, name, initial, node.lineno)
+
+    def _read_text_lines(self, call: ast.Call, name: str,
+                         lineno: int) -> List[str]:
+        if not call.args or not isinstance(call.args[0], ast.Constant) \
+                or not isinstance(call.args[0].value, str):
+            raise ScPythonError(
+                f"{name} 的 txt/文件路径必须是字符串字面量",
+                path=self.path, line=lineno)
+        relative = call.args[0].value
+        base = os.path.dirname(os.path.abspath(self.path))
+        full = os.path.abspath(os.path.join(base, relative))
+        if not os.path.isfile(full):
+            raise ScPythonError(
+                f"找不到数据文件 {relative!r}（相对于 {base}）",
+                path=self.path, line=lineno)
+        with open(full, 'r', encoding='utf-8-sig') as handle:
+            return handle.read().splitlines()
+
+    def _parse_debug_init(self, module: ModuleInfo, action: str,
+                          call: ast.Call, lineno: int) -> None:
+        args = call.args
+        if action == 'import_list':
+            if len(args) != 2:
+                raise ScPythonError(
+                    "debug.import_list(list, path) 需要两个参数",
+                    path=self.path, line=lineno)
+            name = _target_name(args[0])
+            if name is None:
+                raise ScPythonError(
+                    "debug.import_list 的第一个参数必须是列表名",
+                    path=self.path, line=lineno)
+            items = self._read_text_lines(
+                ast.Call(func=ast.Name(id='txt', ctx=ast.Load()),
+                         args=[args[1]], keywords=[]),
+                name, lineno)
+            self._declare_list(module, name, items, lineno)
+            return
+        if action == 'set_default':
+            if len(args) != 2:
+                raise ScPythonError(
+                    "debug.set_default(var, value) 需要两个参数",
+                    path=self.path, line=lineno)
+            name = _target_name(args[0])
+            if name is None:
+                raise ScPythonError(
+                    "debug.set_default 的第一个参数必须是变量名",
+                    path=self.path, line=lineno)
+            self._declare_var(module, name,
+                              _constant(args[1], self.path, name), lineno)
+            return
+        if action == 'set_list_default':
+            if len(args) != 2:
+                raise ScPythonError(
+                    "debug.set_list_default(list, values) 需要两个参数",
+                    path=self.path, line=lineno)
+            name = _target_name(args[0])
+            values = _constant(args[1], self.path, str(name))
+            if name is None or not isinstance(values, list):
+                raise ScPythonError(
+                    "debug.set_list_default 需要 (列表名, 列表字面量)",
+                    path=self.path, line=lineno)
+            self._declare_list(module, name, values, lineno)
+            return
+        if action in ('watch', 'print', 'trace', 'assert'):
+            # 编译期调试指令：不生成 Scratch 块，记录到工程警告中
+            module.meta.setdefault('debug_notes', []).append(
+                f"{action}: {ast.unparse(call)}")
+            return
+        raise ScPythonError(
+            f"未知 debug 初始化指令: {action}",
+            path=self.path, line=lineno)
 
     def _declare_var(self, module: ModuleInfo, name: str,
                      value: Any, lineno: int) -> None:
@@ -545,6 +639,24 @@ def _string_list(node: ast.AST, path: str, what: str) -> List[str]:
     return list(value)
 
 
+def _literal_expr(value: Any) -> Expr:
+    """把 Python 常量转成 IR 字面量表达式（用于 debug.reset 的默认值）"""
+    if isinstance(value, bool):
+        return make_boolean(value)
+    if isinstance(value, (int, float)):
+        return make_number(value)
+    return make_string('' if value is None else str(value))
+
+
+def _target_name(node: ast.AST) -> Optional[str]:
+    """接受 "名字" 字符串字面量或裸变量名两种写法"""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name):
+        return node.id
+    return None
+
+
 def _parse_function(node: ast.FunctionDef, path: str) -> FunctionInfo:
     if node.decorator_list:
         raise ScPythonError(
@@ -644,6 +756,8 @@ class RoleBuilder:
         self.id_counter = 0
         self.current_function: Optional[FunctionInfo] = None
         self.used_macros: set = set()
+        # debug.reset() 一次可能要重置多个变量/列表，这里暂存多条语句
+        self.pending_debug: List[Statement] = []
 
     # ---------- 入口 ----------
 
@@ -658,6 +772,8 @@ class RoleBuilder:
                 self.sprite.statements.append(self._compile_hat(obj))
 
         self._finish_symbols()
+        for note in self.module.meta.get('debug_notes', []):
+            self.compiler.warnings.append(f"[{self.module.name}] {note}")
         if self.module.is_stage:
             # 舞台脚本里自动创建的变量也属于全局，必须在本角色编译完成后
             # 再同步给后续角色使用
@@ -974,7 +1090,14 @@ class RoleBuilder:
                     isinstance(node.value.value, str):
                 return []
             if isinstance(node.value, ast.Call):
-                return [self._compile_call_statement(node.value)]
+                stmt = self._compile_call_statement(node.value)
+                produced: List[Statement] = []
+                if stmt is not None:
+                    produced.append(stmt)
+                if self.pending_debug:
+                    produced.extend(self.pending_debug)
+                    self.pending_debug = []
+                return produced
             raise ScPythonError(
                 "表达式语句只能是函数调用",
                 path=self.module.path, line=node.lineno)
@@ -1362,7 +1485,12 @@ class RoleBuilder:
 
     # ---------- 调用语句 ----------
 
-    def _compile_call_statement(self, call: ast.Call) -> Statement:
+    def _compile_call_statement(self, call: ast.Call
+                                ) -> Optional[Statement]:
+        if isinstance(call.func, ast.Attribute) \
+                and isinstance(call.func.value, ast.Name) \
+                and call.func.value.id == 'debug':
+            return self._compile_debug_statement(call.func.attr, call)
         if isinstance(call.func, ast.Name):
             name = call.func.id
             if name == 'ext':
@@ -1393,6 +1521,99 @@ class RoleBuilder:
                 path=self.module.path, line=call.lineno)
         raise ScPythonError("不支持的调用形式",
                             path=self.module.path, line=call.lineno)
+
+    # ---------- 调试指令 ----------
+
+    def _debug_target(self, node: ast.AST, action: str) -> str:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.Name):
+            return node.id
+        raise ScPythonError(
+            f"debug.{action} 的目标必须是变量名或字符串字面量",
+            path=self.module.path, line=getattr(node, 'lineno', None))
+
+    def _debug_default(self, name: str, action: str,
+                       lineno: int) -> Any:
+        """查找变量/列表在 init 中声明的默认值"""
+        if name in self.module.variables:
+            return self.module.variables[name]
+        if name in self.module.lists:
+            return list(self.module.lists[name])
+        if not self.module.is_stage and name in self.compiler.stage_vars:
+            return self.compiler.stage_vars[name]
+        if not self.module.is_stage and name in self.compiler.stage_lists:
+            return list(self.compiler.stage_lists[name])
+        if name in self.local_vars:
+            return self.local_vars[name]
+        if name in self.local_lists:
+            return list(self.local_lists[name])
+        raise ScPythonError(
+            f"debug.{action}: 找不到 {name} 的默认值；"
+            "请先在 init 中用 var/list 声明",
+            path=self.module.path, line=lineno)
+
+    def _reset_statements(self, name: str, lineno: int) -> List[Statement]:
+        if self._is_list_name(name):
+            default = self._debug_default(name, 'reset', lineno)
+            name, list_id = self.ensure_list(name)
+            clear = Statement(BlockType.DELETE_ALL_FROM_LIST)
+            clear.extra.update({'name': name, 'id': list_id})
+            result = [clear]
+            for item in default:
+                add = Statement(BlockType.ADD_TO_LIST)
+                add.extra.update({'name': name, 'id': list_id})
+                add.value = _literal_expr(item)
+                result.append(add)
+            return result
+        default = self._debug_default(name, 'reset', lineno)
+        if isinstance(default, list):
+            raise ScPythonError(
+                f"{name} 是列表，不能按变量重置",
+                path=self.module.path, line=lineno)
+        return [self._set_var(name, _literal_expr(default))]
+
+    def _compile_debug_statement(self, action: str, call: ast.Call
+                                 ) -> Optional[Statement]:
+        if call.keywords:
+            raise ScPythonError(
+                "debug 指令不支持关键字参数",
+                path=self.module.path, line=call.lineno)
+        args = list(call.args)
+        lineno = call.lineno
+
+        if action in ('set_var', 'set_value'):
+            if len(args) != 2:
+                raise ScPythonError(
+                    "debug.set_var(变量, 值) 需要两个参数",
+                    path=self.module.path, line=lineno)
+            name = self._debug_target(args[0], action)
+            if self._is_list_name(name):
+                raise ScPythonError(
+                    f"{name} 是列表；请使用 debug.reset({name!r})",
+                    path=self.module.path, line=lineno)
+            return self._set_var(name, self._expr(args[1]))
+
+        if action == 'reset':
+            names = [self._debug_target(arg, action) for arg in args]
+            if not names:
+                names = sorted(self.module.explicit_vars
+                               | self.module.explicit_lists)
+            for name in names:
+                self.pending_debug.extend(
+                    self._reset_statements(name, lineno))
+            return None
+
+        if action in ('print', 'trace', 'watch', 'log', 'assert'):
+            # 编译期调试指令：不生成 Scratch 块，只在导出时提示
+            self.compiler.warnings.append(
+                f"[{self.module.name}] debug.{action}: {ast.unparse(call)}")
+            return None
+
+        raise ScPythonError(
+            f"未知 debug 指令: {action}；支持 set_var / reset / "
+            "print / trace / watch / assert",
+            path=self.module.path, line=lineno)
 
     def _procedure_call_statement(self, function: FunctionInfo,
                                   call: ast.Call) -> Statement:
@@ -1571,6 +1792,12 @@ class RoleBuilder:
             stmt.value = self._expr(args[0])
             stmt.extra['x'] = self._expr(args[1])
             stmt.extra['y'] = self._expr(args[2])
+        elif name == 'glide_to_target':
+            self._require_args(args, 2, name)
+            stmt = Statement(BlockType.GLIDE_TO)
+            stmt.value = self._expr(args[0])
+            stmt.extra['target'] = str(
+                self._const_node(self._need(args, 1, name)))
         elif name == 'point_in_direction':
             stmt = Statement(BlockType.POINT_IN_DIRECTION)
             stmt.value = self._arg_or(args, 0, make_number(90))
@@ -1890,6 +2117,8 @@ class RoleBuilder:
     def _call_expr(self, call: ast.Call) -> Expr:
         if isinstance(call.func, ast.Name):
             name = call.func.id
+            if name == 'ext':
+                return self._generic_extension_expr(call)
             builtin = self._builtin_expr(name, call)
             if builtin is not None:
                 return builtin
@@ -1898,8 +2127,6 @@ class RoleBuilder:
                 return self._procedure_call_expr(function, call)
             if name in _LIST_EXPR_FUNCTIONS:
                 return self._list_expr_function(name, call)
-            if name == 'ext':
-                return self._generic_extension_expr(call)
             raise ScPythonError(
                 f"未知函数 {name}；宏/自定义积木需要先定义",
                 path=self.module.path, line=call.lineno)

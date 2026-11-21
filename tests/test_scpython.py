@@ -10,7 +10,9 @@ import zipfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _support import *  # noqa: F401,F403
 
-from scpython import ScPythonError, check_project, export_project
+from scpython import (
+    ScPythonError, check_project, export_project, import_sb3,
+)
 from scratch_parser import parse_scratch_project
 from scratch_vm import run_project
 
@@ -516,6 +518,291 @@ def test_scpython_rejects_advanced_syntax():
     return True
 
 
+def _patch_sb3_comments(sb3_path, target_name, text, standalone_text):
+    """给导出的 sb3 注入一条附着注释和一条独立注释"""
+    with zipfile.ZipFile(sb3_path) as archive:
+        entries = {name: archive.read(name) for name in archive.namelist()}
+    data = json.loads(entries['project.json'].decode('utf-8'))
+    target = next(t for t in data['targets'] if t.get('name') == target_name)
+    blocks = target.get('blocks') or {}
+    block_id = next(
+        (bid for bid, block in blocks.items()
+         if isinstance(block, dict) and block.get('opcode') == 'looks_say'),
+        None)
+    assert block_id, "测试工程里应有一个 say 块"
+    comments = target.setdefault('comments', {})
+    comments['c_attached'] = {
+        'blockId': block_id, 'x': 0, 'y': 0, 'width': 200, 'height': 100,
+        'minimized': False, 'text': text,
+    }
+    comments['c_standalone'] = {
+        'blockId': None, 'x': 0, 'y': 0, 'width': 200, 'height': 100,
+        'minimized': False, 'text': standalone_text,
+    }
+    entries['project.json'] = json.dumps(data).encode('utf-8')
+    with zipfile.ZipFile(sb3_path, 'w') as archive:
+        for name, payload in entries.items():
+            archive.writestr(name, payload)
+
+
+def test_scpython_sb3_import_roundtrip():
+    """SC-10 sb3 -> ScPython：注释、全局变量、相同自制积木抽到 macros"""
+    print("[测试104] ScPython sb3 导入往返与宏拆分")
+
+    with tempfile.TemporaryDirectory() as folder:
+        root = os.path.join(folder, 'round')
+        _make_project(root, {
+            'stage.scpy': """\
+init:
+    costumes = ["bg.svg"]
+    var g = 0
+""",
+            'A.scpy': """\
+init:
+    costumes = ["cat.svg"]
+
+def spin(speed, *, types="n", warp=True):
+    set_rotation_style("all around")
+    turn_right(speed)
+
+when green_flag:
+    g += 1
+    spin(15)
+    say("A")
+""",
+            'B.scpy': """\
+init:
+    costumes = ["cat.svg"]
+
+def spin(speed, *, types="n", warp=True):
+    set_rotation_style("all around")
+    turn_right(speed)
+
+when green_flag:
+    g += 2
+    spin(30)
+    say("B")
+""",
+        }, assets={'bg.svg': _BG_SVG, 'cat.svg': _CAT_SVG})
+        sb3 = _export(root)
+        _patch_sb3_comments(sb3, 'A', '旋转一次', '独立说明')
+
+        imported = os.path.join(folder, 'imported')
+        import_sb3(sb3, imported, split_macros=True)
+
+        with open(os.path.join(imported, 'macros.scpy'),
+                  encoding='utf-8') as handle:
+            macros = handle.read()
+        assert 'def spin(speed' in macros, macros
+
+        a_source = open(os.path.join(imported, 'A.scpy'),
+                        encoding='utf-8').read()
+        b_source = open(os.path.join(imported, 'B.scpy'),
+                        encoding='utf-8').read()
+        stage_source = open(os.path.join(imported, 'stage.scpy'),
+                            encoding='utf-8').read()
+        assert 'def spin' not in a_source
+        assert 'def spin' not in b_source
+        assert 'spin(15)' in a_source
+        assert 'spin(30)' in b_source
+        # 注释：附着在 say 前，独立注释在文件头
+        assert '# 旋转一次' in a_source, a_source
+        assert '# 独立说明' in a_source, a_source
+        # 全局变量只在舞台声明
+        assert 'var g' in stage_source
+        assert 'var g' not in a_source
+        assert 'var g' not in b_source
+
+        # 再导出，宏应合并回每个角色
+        sb3_again = os.path.join(folder, 'again.sb3')
+        export_project(imported, sb3_again)
+        with zipfile.ZipFile(sb3_again) as archive:
+            data = json.loads(archive.read('project.json').decode('utf-8'))
+        project = parse_scratch_project(data)
+        by_name = {sprite.name: sprite for sprite in project.sprites}
+        for name in ('A', 'B'):
+            proccodes = [stmt.extra.get('proccode')
+                         for stmt in by_name[name].statements
+                         if stmt.type.name == 'PROCEDURE_DEFINE']
+            assert proccodes == ['spin %n'], (name, proccodes)
+
+        result = _run(sb3_again)
+        assert not result['errors'], result['errors']
+        assert _variable(result, 'Stage', 'g') == 3
+
+    print("  [PASS] sb3 导入往返与宏拆分通过")
+    return True
+
+
+def test_scpython_import_without_macros():
+    """SC-11 --no-macros 时相同自制积木保留在各角色文件中"""
+    print("[测试105] ScPython 导入 --no-macros")
+
+    with tempfile.TemporaryDirectory() as folder:
+        root = os.path.join(folder, 'plain')
+        _make_project(root, {
+            'stage.scpy': _STAGE_MIN,
+            'A.scpy': """\
+def ping(*, warp=True):
+    say("ping")
+
+when green_flag:
+    ping()
+""",
+            'B.scpy': """\
+def ping(*, warp=True):
+    say("ping")
+
+when green_flag:
+    ping()
+""",
+        }, assets={'bg.svg': _BG_SVG})
+        sb3 = _export(root)
+        imported = os.path.join(folder, 'imported')
+        import_sb3(sb3, imported, split_macros=False)
+        assert not os.path.exists(os.path.join(imported, 'macros.scpy'))
+        for name in ('A', 'B'):
+            source = open(os.path.join(imported, name + '.scpy'),
+                          encoding='utf-8').read()
+            assert 'def ping' in source, source
+
+    print("  [PASS] 导入 --no-macros 通过")
+    return True
+
+
+def test_scpython_txt_and_debug():
+    """SC-12 txt 列表默认值、debug.set_default/import_list/set_var/reset"""
+    print("[测试106] ScPython txt 与 debug 调试方法")
+
+    with tempfile.TemporaryDirectory() as folder:
+        root = os.path.join(folder, 'debug')
+        _write(root, 'words.txt', 'alpha\nbeta\ngamma\n')
+        _make_project(root, {
+            'stage.scpy': _STAGE_MIN,
+            'Cat.scpy': """\
+init:
+    costumes = ["cat.svg"]
+    list words = txt("words.txt")
+    debug.import_list(names, "words.txt")
+    debug.set_default(score, 7)
+    debug.set_list_default(nums, [1, 2, 3])
+
+when green_flag:
+    score = 99
+    words.append("extra")
+    for w in words:
+        nums.append(w)
+    debug.set_var(score, 42)
+    debug.print("score before reset")
+    debug.reset(score)
+    debug.reset(words)
+    debug.reset(nums)
+    debug.trace("重置完成")
+""",
+        }, assets={'bg.svg': _BG_SVG, 'cat.svg': _CAT_SVG})
+        sb3 = _export(root)
+        result = _run(sb3)
+        assert not result['errors'], result['errors']
+        assert _list_value(result, 'Cat', 'words') == [
+            'alpha', 'beta', 'gamma']
+        assert _list_value(result, 'Cat', 'names') == [
+            'alpha', 'beta', 'gamma']
+        assert _list_value(result, 'Cat', 'nums') == [1, 2, 3]
+        assert _variable(result, 'Cat', 'score') == 7
+
+    print("  [PASS] txt 与 debug 调试方法通过")
+    return True
+
+
+def test_scpython_lint():
+    """SC-13 lint 报告未使用的变量/列表/自制积木/宏"""
+    print("[测试107] ScPython lint 静态检查")
+
+    from scpython import lint_project
+
+    with tempfile.TemporaryDirectory() as folder:
+        root = os.path.join(folder, 'lint')
+        _make_project(root, {
+            'stage.scpy': """\
+init:
+    costumes = ["bg.svg"]
+    var unused_g = 0
+    var shared = 0
+""",
+            'Cat.scpy': """\
+init:
+    costumes = ["cat.svg"]
+    var used = 0
+    list unused_list = []
+
+def orphan():
+    say("x")
+
+when green_flag:
+    used += 1
+    say(used)
+    say(shared)
+""",
+            'macros.scpy': """\
+def unused_macro():
+    say("m")
+""",
+        }, assets={'bg.svg': _BG_SVG, 'cat.svg': _CAT_SVG})
+        issues = lint_project(root)
+        codes = {issue.code for issue in issues}
+        assert {'W001', 'W002', 'W003', 'W004'} <= codes, [
+            str(issue) for issue in issues]
+        messages = ' '.join(str(issue) for issue in issues)
+        assert 'unused_g' in messages
+        assert 'shared' not in messages  # 舞台全局变量被角色使用
+        assert 'unused_list' in messages
+        assert 'orphan' in messages
+        assert 'unused_macro' in messages
+
+    print("  [PASS] ScPython lint 通过")
+    return True
+
+
+def test_scpython_cli_run():
+    """SC-14 scpython run 无头运行并输出变量"""
+    print("[测试108] ScPython CLI 无头运行")
+
+    import contextlib
+    import io
+
+    from scpython.cli import main as cli_main
+
+    with tempfile.TemporaryDirectory() as folder:
+        root = os.path.join(folder, 'run')
+        _make_project(root, {
+            'stage.scpy': _STAGE_MIN,
+            'Cat.scpy': """\
+init:
+    costumes = ["cat.svg"]
+    var score = 0
+
+when green_flag:
+    score = 42
+""",
+        }, assets={'bg.svg': _BG_SVG, 'cat.svg': _CAT_SVG})
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = cli_main(['run', root, '--seconds', '0.4'])
+        assert code == 0
+        output = buffer.getvalue()
+        assert '变量 score = 42' in output, output
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = cli_main(['run', root, '--seconds', '0.4', '--trace', '3'])
+        assert code == 0
+        assert '[trace]' in buffer.getvalue()
+
+    print("  [PASS] ScPython CLI 无头运行通过")
+    return True
+
+
 TESTS = [
     test_scpython_end_to_end,
     test_scpython_scratch_operators,
@@ -526,4 +813,9 @@ TESTS = [
     test_scpython_custom_extensions,
     test_scpython_hats_and_init,
     test_scpython_rejects_advanced_syntax,
+    test_scpython_sb3_import_roundtrip,
+    test_scpython_import_without_macros,
+    test_scpython_txt_and_debug,
+    test_scpython_lint,
+    test_scpython_cli_run,
 ]

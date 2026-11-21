@@ -525,6 +525,10 @@ when green_flag:
 - 宏名不要与内置函数（`say`、`move` 等）重名；
 - 宏文件里不能写事件头、`init` 或普通语句。
 
+用 `python -m scpython import` 把 sb3 转成 ScPython 时，会对比各角色中的自制积木：
+函数名、参数、类型、warp、label 与函数体完全相同的定义会被抽到 `macros.scpy`，
+角色文件里只保留调用；导出时再自动复制回每个角色。
+
 ---
 
 ## 12. 扩展
@@ -637,26 +641,135 @@ init:
 
 ---
 
-## 14. 命令行与 API
+## 14. 数据文件、调试与 sb3 导入
+
+### 14.1 用 txt 文件做列表默认值
+
+`txt("文件.txt")` 在编译时读取文本文件，每个非空行作为一项，路径相对于当前 `.scpy` 文件：
+
+```python
+init:
+    list words = txt("data/words.txt")
+```
+
+等价写法：
+
+```python
+init:
+    debug.import_list(words, "data/words.txt")
+```
+
+文件使用 UTF-8（自动兼容 BOM），换行符 `\n`/`\r\n` 均可。
+
+### 14.2 修改默认值
+
+`init` 中可以用调试指令声明/覆盖默认值，导出后就是角色的初始变量值：
+
+```python
+init:
+    debug.set_default(score, 100)
+    debug.set_list_default(nums, [1, 2, 3])
+```
+
+### 14.3 运行期调试指令
+
+```python
+when green_flag:
+    debug.set_var(score, 42)   # 立即赋值
+    debug.reset(score)         # 恢复 init 中的默认值
+    debug.reset(words)         # 列表恢复默认值（清空后重新填入）
+    debug.reset()              # 重置当前角色所有显式声明的变量/列表
+    debug.print("debug")       # 编译期提示，不生成积木
+    debug.trace("done")
+    debug.watch(score)
+    debug.assert(score > 0)
+```
+
+说明：
+
+- `set_var` / `reset` 会生成普通的「将变量设为」/ 列表清空与添加积木；
+- `reset`/`set_var` 的目标可以写字符串 `"score"`，也可以直接写变量名 `score`；
+- `print` / `trace` / `watch` / `assert` 只做编译期记录，导出时在命令行打印；
+- `reset` 的默认值来自 `init` 中的 `var`/`list`/`debug.set_default`/`debug.set_list_default`。
+
+### 14.4 sb3 -> ScPython
+
+```bash
+python -m scpython import input.sb3 -o my_project
+python -m scpython import input.sb3 -o my_project --no-macros
+python converter.py sb32scpy input.sb3 my_project
+```
+
+```python
+from scpython import sb3_to_scpython
+
+sb3_to_scpython("input.sb3", "my_project", split_macros=True)
+```
+
+转换内容：
+
+- 事件帽子、运动/外观/声音/控制/侦测块、变量与列表、自制积木与调用；
+- Scratch 注释：附着在块上的注释放在对应语句前，独立注释放在文件头；
+- 全局变量只在 `stage.scpy` 中声明一次，角色文件不再重复声明；
+- 默认把多个角色中**完全相同**的自制积木抽到 `macros.scpy`；
+- 无法表达的块会写成 `# TODO` 并在命令行给出警告，不会静默丢弃。
+
+---
+
+## 15. 命令行与 API
 
 ```bash
 # 检查
 python -m scpython check <工程目录>
 
+# 静态检查（未使用的变量/列表/自制积木/宏）
+python -m scpython lint <工程目录>
+
+# 无头运行并查看变量、统计、最近执行轨迹
+python -m scpython run <工程目录> --seconds 3 --stats
+python -m scpython run <工程目录> --seconds 3 --trace 20
+python -m scpython run <工程目录> --no-vars --json
+
 # 导出
 python -m scpython export <工程目录> -o out.sb3
 
+# sb3 导入
+python -m scpython import <input.sb3> -o <工程目录>
+
 # 主转换器别名
 python converter.py scpy2scratch <工程目录> out.sb3
+python converter.py sb32scpy <input.sb3> <工程目录>
+```
+
+`run` 会先在临时目录编译为 sb3，再调用本机 VM 无头执行：
+
+- `--seconds` / `--frames` 控制运行时长；
+- `--seed` 固定随机数；`--turbo` 立即模式；`--audio` 启用声音；
+- 结束后默认打印每个角色的变量/列表（内部 `__scpy_*` 变量已隐藏）；
+- `--trace N` 打印最近 N 条执行记录，`--stats` 打印帧数/语句数/克隆数；
+- `--watch "var('score')"` / `--watch "lst('history')"` 在结束后求值变量或列表；
+- `--json` 输出完整结果（含运行时错误），便于脚本处理；
+- `--no-vars` 关闭结束时的变量/列表打印；
+- 退出码：0 正常，1 有运行时错误，2 编译/加载失败。
+
+编译错误会附带出错源码行与列指示：
+
+```text
+错误: C:\...\Cat.scpy:12:5: 未知函数 foo
+  12 |     foo(1)
+     |     ^
 ```
 
 ```python
-from scpython import export_project, check_project, ScPythonError
+from scpython import export_project, check_project, lint_project, ScPythonError
 
 try:
     export_project("my_project", "out.sb3")
 except ScPythonError as error:
     print(error)   # 文件:行:列: 错误信息
+
+for issue in lint_project("my_project"):
+    print(issue)
 ```
 
 导出前会自动校验 SB3 的关键结构：
@@ -671,7 +784,7 @@ except ScPythonError as error:
 
 ---
 
-## 15. 完整示例
+## 16. 完整示例
 
 ```python
 # Cat.scpy
@@ -721,7 +834,7 @@ def greet(name, *, types="s"):
 
 ---
 
-## 16. 限制一览
+## 17. 限制一览
 
 不支持：
 
@@ -743,7 +856,7 @@ def greet(name, *, types="s"):
 
 ---
 
-## 17. AI 编写检查清单
+## 18. AI 编写检查清单
 
 生成 `.scpy` 时按以下顺序检查：
 

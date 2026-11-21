@@ -21,7 +21,7 @@ from .interpreter import VMInterpreter
 from .loader import LoadedProject, LoadError, load_project
 from .module import RuntimeModule, build_module
 
-__version__ = "0.14.2"
+__version__ = "0.15.0"
 
 __all__ = [
     "run_project",
@@ -42,6 +42,8 @@ def run_project(path: str,
                 max_seconds: Optional[float] = None,
                 debug: bool = False,
                 overlay: bool = False,
+                trace: Optional[int] = None,
+                watch: Optional[list] = None,
                 **options) -> dict:
     """加载并运行项目，返回运行快照。
 
@@ -52,10 +54,13 @@ def run_project(path: str,
         max_seconds: 运行秒数上限
         debug: 是否启用交互调试（断点命中时暂停）
         overlay: 是否启用窗口内调试面板（headless 下自动关闭）
+        trace: 返回最近 N 条执行记录
+        watch: 运行结束后求值的表达式列表（如 ``["score"]``）
         **options: 透传给 ``ScratchRuntime`` 的选项
 
     Returns:
         ``{"frames", "elapsed", "stats", "variables", "errors"}``
+        （指定 ``trace`` / ``watch`` 时额外包含 ``"trace"`` / ``"watches"``）
     """
     with load_project(path) as loaded:
         module = build_module(loaded.project, loaded.assets_dir)
@@ -67,6 +72,8 @@ def run_project(path: str,
             interpreter, runtime, loaded.project, trace_size=2000)
         controller.interactive = bool(debug)
         interpreter.debug = controller
+        for expression in (watch or []):
+            controller.add_watch(expression)
 
         if overlay and not headless:
             from .overlay import DebugOverlay
@@ -78,10 +85,15 @@ def run_project(path: str,
         finally:
             controller.shutdown()
             runtime.shutdown()
-        return {
+        result = {
             "frames": runtime.frame,
             "elapsed": runtime.elapsed(),
             "stats": controller.stats_report(),
             "variables": controller.dump_variables(),
             "errors": list(controller.errors),
         }
+        if trace:
+            result["trace"] = controller.recent_trace(trace)
+        if watch:
+            result["watches"] = controller.eval_watches()
+        return result
