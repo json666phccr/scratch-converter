@@ -205,8 +205,9 @@ def test_obfuscator_end_to_end():
 def _dump_code_names(obf_path: str, names_path: str) -> None:
     """在子进程里运行混淆产物，dump 所有 code object 的名字集合。
 
-    通过包装 zlib/bz2/lzma 的 decompress 拦截解密结果（不触碰
-    builtins/marshal，避免触发 builtins 完整性探针）。
+    通过包装 marshal.loads 拦截解密结果；v3.1 起载荷不压缩，没有
+    zlib/bz2/lzma 调用点。类型探针不再检查 marshal.loads（宿主可合法
+    包装，F-20）。
     """
     wrapper = os.path.join(os.path.dirname(obf_path), "_dump_wrapper.py")
     with open(wrapper, "w", encoding="utf-8") as handle:
@@ -227,10 +228,13 @@ def _dump_code_names(obf_path: str, names_path: str) -> None:
             "        if hasattr(c, 'co_code'):\n"
             "            walk(c)\n"
             "def inspect_plain(plain):\n"
-            "    try:\n"
-            "        obj = marshal.loads(plain)\n"
-            "    except Exception:\n"
-            "        return\n"
+            "    if hasattr(plain, 'co_code') or hasattr(plain, 'get'):\n"
+            "        obj = plain\n"
+            "    else:\n"
+            "        try:\n"
+            "            obj = real_loads(plain)\n"
+            "        except Exception:\n"
+            "            return\n"
             "    if hasattr(obj, 'co_code'):\n"
             "        if obj.co_filename.startswith('<'):\n"
             "            walk(obj)\n"
@@ -246,9 +250,12 @@ def _dump_code_names(obf_path: str, names_path: str) -> None:
             "        inspect_plain(r)\n"
             "        return r\n"
             "    mod.decompress = d\n"
-            "wrap(zlib)\n"
-            "wrap(bz2)\n"
-            "wrap(lzma)\n"
+            "real_loads = marshal.loads\n"
+            "def inspect_loads(data, *a, **k):\n"
+            "    r = real_loads(data, *a, **k)\n"
+            "    inspect_plain(r)\n"
+            "    return r\n"
+            "marshal.loads = inspect_loads\n"
             "try:\n"
             "    runpy.run_path(path, run_name='__main__')\n"
             "except SystemExit:\n"
@@ -810,7 +817,7 @@ dec = None
 for obj in gc.get_objects():
     code = getattr(obj, '__code__', None)
     if code is not None and '_getframe' in code.co_names \\
-            and 'compare_digest' in code.co_names:
+            and 'from_bytes' in code.co_names:
         dec = obj
         break
 assert dec is not None
@@ -895,8 +902,8 @@ assert not long_strs, '命名空间仍存在明文字符串表'
 
 
 def test_loader_antihook():
-    """OBF-2l A13b 回归：hashlib/sys.exit 被 Python 层包装时，加载器
-    不把片段交给哈希函数，且不会在钩子点产生可 dump 状态"""
+    """OBF-2l F-16 回归：Python 层包装 hmac / zlib / base64 后，
+    产物仍能运行且解密路径不调用这些钩子"""
     print("[测试105l] 加载器反插桩")
 
     with tempfile.TemporaryDirectory() as folder:
@@ -911,18 +918,17 @@ def test_loader_antihook():
         probe = os.path.join(folder, "probe.py")
         hook_flag = os.path.join(folder, "hook.txt")
         with open(probe, "w", encoding="utf-8") as handle:
-            handle.write('''import hashlib, os, sys
+            handle.write('''import base64, hmac, os, sys, zlib
 os.environ['SDL_VIDEODRIVER'] = 'dummy'
 os.environ['SDL_AUDIODRIVER'] = 'dummy'
 sys.argv = ['probe', '--headless', '--frames', '1', '--no-audio']
-_real = hashlib.sha256
-def _wrapped(*a, **k):
-    return _real(*a, **k)
-hashlib.sha256 = _wrapped
-def _hook(*a, **k):
+def _mark():
     open(%r, 'wb').write(b'HOOK')
     raise SystemExit(1)
-sys.exit = _hook
+hmac.new = lambda *a, **k: _mark()
+zlib.decompress = lambda *a, **k: _mark()
+base64.b64decode = lambda *a, **k: _mark()
+base64.b85decode = lambda *a, **k: _mark()
 src = open(%r, encoding='utf-8').read()
 try:
     exec(compile(src, %r, 'exec'),

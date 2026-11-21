@@ -56,8 +56,13 @@ _INJECTED_MODULES = (
 # C 级构造函数，Python 层对 hashlib 的 monkeypatch 钩子拿不到密钥输入。
 # blake2b 不在 _hashlib 中（会回落到可被钩子的 hashlib），故移除。
 _HASHES = ('sha256', 'sha384', 'sha512', 'sha3_256', 'sha3_512')
-_COMPRESSION = ('zlib', 'bz2', 'lzma')
-_ENCODERS = ('b85', 'b64')
+# v3.1（F-16）：解密路径不再调用 zlib/bz2/lzma 的 Python 函数。
+# 这些函数可被 Python 层包装成任意输入输出；体积换掉一个 Critical
+# 钩子面是划算的。载荷因此比压缩版大 1.5~3 倍。
+_COMPRESSION = ('none',)
+# 只用 base64：运行端走 binascii.a2b_base64（C 级），Python 层
+# base64.b64decode/b85decode 的钩子不在解密路径上。
+_ENCODERS = ('b64',)
 _FLIP_XORS = (0x37, 0x5A, 0xA7, 0x91, 0x6C, 0xB3, 0xE2)
 _SID_ALPHABET = 'abcdefghijklmnopqrstuvwxyz0123456789'
 _MASK64 = (1 << 64) - 1
@@ -154,15 +159,10 @@ class Recipe:
         return bytes(output[:length])
 
     def compress(self, data: bytes) -> bytes:
-        if self.comp == 'zlib':
-            return zlib.compress(data, 9)
-        if self.comp == 'bz2':
-            return bz2.compress(data, 9)
-        return lzma.compress(data, preset=6)
+        # 不压缩：避免 zlib/bz2/lzma 成为可替换的解密原语
+        return data
 
     def encode_text(self, data: bytes) -> str:
-        if self.enc == 'b85':
-            return base64.b85encode(data).decode('ascii')
         return base64.b64encode(data).decode('ascii')
 
     def prev_digest(self, plain: bytes) -> bytes:
@@ -383,15 +383,14 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     n_imp = name('i')
     n_hex = name('x')
     mod_names = {mod: name('m') for mod in
-                 ('os', 'sys', 'hashlib', 'hmac', 'marshal', rec.comp,
-                  'base64', 'threading', 'io')}
+                 ('os', 'sys', 'hashlib', 'hmac', 'marshal',
+                  'binascii', 'threading', 'io')}
     n_os = mod_names['os']
     n_sys = mod_names['sys']
     n_hash = mod_names['hashlib']
     n_hmac = mod_names['hmac']
     n_mar = mod_names['marshal']
-    n_comp = mod_names[rec.comp]
-    n_b85 = mod_names['base64']
+    n_bin = mod_names['binascii']
     n_thr = mod_names['threading']
     n_io = mod_names['io']
     n_bi = name('b')
@@ -399,6 +398,8 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     n_k = name('k')
     n_hf = name('h')
     n_kh = name('h')
+    n_hnew = name('h')
+    n_vault = name('V')
     n_segs = name('s')
     n_ksf = name('k')
     n_dec = name('d')
@@ -454,7 +455,9 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     str_sid_hex = _sid_hex(rec.str_sid)
     main_sid_hex = _sid_hex(rec.main_sid)
     cluster_sid_hexes = [_sid_hex(s) for s in rec.cluster_sids]
-    dec_attr = {'b85': 'b85decode', 'b64': 'b64decode'}[rec.enc]
+    # 只用 binascii 的 C 级 base64 解码：Python 层对
+    # base64.b64decode/b85decode 的钩子不再位于解密路径上。
+    dec_attr = 'a2b_base64'
 
     # ---- 生成期辅助：字符串常量一律运行时由 chr 码构造 ----
     # （不再出现 bytes.fromhex('...') 形态：依赖该形状的静态解析器
@@ -488,7 +491,7 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
         rng.shuffle(order)
         for index in order:
             add(f"{names[index]} = {pieces[index]!r}")
-        add(f"{var} = getattr({n_b85}, {H('b85decode')})(''.join((")
+        add(f"{var} = getattr({n_bin}, {H('a2b_base64')})(''.join((")
         for start in range(0, len(names), 8):
             add("    " + ", ".join(names[start:start + 8]) + ",")
         add(")))")
@@ -513,14 +516,23 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
             f"if {n_lib} is not None else None")
         add(f"if {var} is None:")
         add(f"    {var} = getattr({n_hash}, {H(hname)})")
-    # 反插桩：sys.exit / 实际使用的哈希 / marshal.loads 必须是 C 级
-    # builtin（Python 包装函数即视为被 hook）。命中后不把真实片段交给
-    # 任何哈希函数，并在 dec 入口直接返回空，避免密钥经钩子外泄。
-    add(f"{n_bad} = (type({n_sys}.exit) is not type({n_bi}.len) or")
+    # HMAC 直调 _hashlib.hmac_new（C 级）：Python 层对 hmac.new 的
+    # 包装不再位于解密路径上。仅在 OpenSSL 绑定缺失时回落到 hmac 模块。
+    add(f"{n_hnew} = getattr({n_lib}, {H('hmac_new')}, None) "
+        f"if {n_lib} is not None else None")
+    add(f"if {n_hnew} is None:")
+    add(f"    {n_hnew} = {n_hmac}.new")
+    # 反插桩只覆盖**实际解密原语**（F-20：不再检查 sys.exit 这类
+    # 与解密无关的宿主可调用对象，避免 pytest/IPython 误伤）：
+    # 哈希 / HMAC 必须是 C 级 builtin；解压函数用 builtin 类型或
+    # 模块归属校验；marshal.loads 必须是 C 级。SCRATCH_OBF_DEV=1
+    # 可跳过（宿主兼容/测试）。
+    add(f"{n_bad} = (type({n_hnew}) is not type({n_bi}.len) or")
     add(f"    type({n_hf}) is not type({n_bi}.len) or")
     add(f"    type({n_kh}) is not type({n_bi}.len) or")
     add(f"    type({n_h256}) is not type({n_bi}.len) or")
-    add(f"    type({n_mar}.loads) is not type({n_bi}.len))")
+    add(f"    type(getattr({n_bin}, {H('a2b_base64')})) "
+        f"is not type({n_bi}.len))")
     add(f"{n_cf} = False")
     add(f"{n_bind} = b''")
     # 命名空间最小化：这些名字由 _boot 赋值、由 _clh/_alh/_pt 读取，
@@ -537,7 +549,7 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     # base-32 提取均失去锚点）。派生公式只在生成端使用，运行端只看到
     # 一段 base85 文本；解出的 64 字节再按大端切分。
     frag_blob = b''.join(f.to_bytes(8, 'big') for f in rec.fragments)
-    frag_b85 = base64.b85encode(frag_blob).decode('ascii')
+    frag_b85 = base64.b64encode(frag_blob).decode('ascii')
     emit_blob(n_fb, frag_b85, 24)
     add(f"{n_k} = bytearray({n_hf}("
         f"bytes(64) if {n_bad} else {n_fb}).digest())")
@@ -549,8 +561,10 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
         # 许可证绑定整体跳过，后续 dec 也会因 n_bad 直接返回空。
         lic_start = len(L)
         reg_path = 'SOFTWARE\\Microsoft\\Cryptography'
-        add(f"{n_lpb} = {n_b85}.b64decode({rec.license_payload_b64!r})")
-        add(f"{n_lsb} = {n_b85}.b64decode({rec.license_sig_b64!r})")
+        add(f"{n_lpb} = getattr({n_bin}, {H('a2b_base64')})("
+            f"{rec.license_payload_b64!r})")
+        add(f"{n_lsb} = getattr({n_bin}, {H('a2b_base64')})("
+            f"{rec.license_sig_b64!r})")
         v_parts = name('v')
         v_rg = name('v')
         v_tk = name('v')
@@ -630,16 +644,15 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     add(f"    for {v_t} in ({', '.join(H(mod) for mod in _DEBUG_MODULES)},):")
     add(f"        if {v_t} in {v_ms}:")
     add("            return True")
-    # builtins 完整性：Python 层替换 exec/compile/__import__/marshal.loads
-    # 的 hook（类型为 'function'）与原生内建类型不符
+    # builtins 完整性：Python 层替换 exec/compile/__import__ 的 hook
+    # （类型为 'function'）与原生内建类型不符。v3.1 起不再检查
+    # marshal.loads（F-20：pytest/调试宿主会合法包装它；且字符串表已
+    # 不在 marshal 结果中以明文容器存在）。
     add(f"    for {v_t} in (" + ", ".join(
         H(nm) for nm in ('exec', 'compile', '__import__')) + "):")
     add(f"        if type(getattr({n_bi}, {v_t})) is not "
         f"type(getattr({n_bi}, {H('len')})):")
     add("            return True")
-    add(f"    if type({n_mar}.loads) is not "
-        f"type(getattr({n_bi}, {H('len')})):")
-    add("        return True")
     add("    return False")
     dbg_msg = 'obfuscator: integrity/license binding failure'
     add(f"def {n_dbg}():")
@@ -651,7 +664,10 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     add(f"def {n_cr}():")
     add(f"    nonlocal {n_cf}")
     add(f"    {n_cf} = True")
-    add(f"    {n_k}[{rec.corrupt_idx}] ^= 0x{rec.corrupt_xor:X}")
+    add("    try:")
+    add(f"        {n_k}[{rec.corrupt_idx}] ^= 0x{rec.corrupt_xor:X}")
+    add("    except Exception:")
+    add("        pass")
     add(f"    {n_dbg}()")
     add(f"if {n_bad} or {n_pd}():")
     add(f"    {n_cr}()")
@@ -688,7 +704,7 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     #   [4B ctlen][ct-ascii]
     # 运行端按 sid 线性查找；61 段量级，dec 仅懒加载调用，成本可忽略。
     tbl_blob = _pack_rows(spec.segments, rec.encode_text)
-    tbl_b85 = base64.b85encode(tbl_blob).decode('ascii')
+    tbl_b85 = base64.b64encode(tbl_blob).decode('ascii')
     emit_blob(n_tbl, tbl_b85, 4096)
     acc_variant = rng.randrange(2)
     p_s = name('p')
@@ -721,11 +737,11 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     # ---- 段解密（KDF 10 形态按配方生成）----
     def kdf_expr(prev: str, sid: str) -> str:
         if rec.kdf == 0:
-            return (f"bytearray({n_hmac}.new(bytes({prev}), "
-                    f"{n_hex}({sid}), {n_hf}).digest())")
+            return (f"bytearray({n_hnew}(bytes({prev}), "
+                    f"{n_hex}({sid}), {H(rec.hash_name)}).digest())")
         if rec.kdf == 1:
-            return (f"bytearray({n_hmac}.new({n_hex}({sid}), "
-                    f"bytes({prev}), {n_hf}).digest())")
+            return (f"bytearray({n_hnew}({n_hex}({sid}), "
+                    f"bytes({prev}), {H(rec.hash_name)}).digest())")
         if rec.kdf == 2:
             return (f"bytearray({n_hf}(bytes({prev}) + "
                     f"{n_hex}({sid})).digest())")
@@ -739,12 +755,13 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
             return (f"bytearray({n_hf}(bytes({prev}) + "
                     f"{n_hf}({n_hex}({sid})).digest()).digest())")
         if rec.kdf == 6:
-            return (f"bytearray({n_hmac}.new(bytes({prev}), "
-                    f"{n_hf}({n_hex}({sid})).digest(), {n_hf}).digest())")
+            return (f"bytearray({n_hnew}(bytes({prev}), "
+                    f"{n_hf}({n_hex}({sid})).digest(), "
+                    f"{H(rec.hash_name)}).digest())")
         if rec.kdf == 7:
-            return (f"bytearray({n_hmac}.new("
+            return (f"bytearray({n_hnew}("
                     f"{n_hf}(bytes({prev})).digest(), "
-                    f"{n_hex}({sid}), {n_hf}).digest())")
+                    f"{n_hex}({sid}), {H(rec.hash_name)}).digest())")
         if rec.kdf == 8:
             return (f"bytearray({n_hf}({n_hf}({n_hex}({sid})).digest() "
                     f"+ bytes({prev})).digest())")
@@ -801,12 +818,11 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     add(f"            {v_pt} = {n_tbl}[{n_i}:{n_i} + {n_cl}]")
     add("            break")
     add(f"        {n_i} += {n_cl}")
-    add(f"    {v_ct} = getattr({n_b85}, {H(dec_attr)})"
+    add(f"    {v_ct} = getattr({n_bin}, {H(dec_attr)})"
         f"({v_pt}.decode({H('ascii')}))")
     add(f"    {v_k2} = {kdf_expr(p_prev, p_sid)}")
-    add("    if not " + f"{n_hmac}.compare_digest(")
-    add(f"            {n_hmac}.new(bytes({v_k2}), {v_ct}, "
-        f"{n_hf}).digest(), {v_tg}):")
+    add(f"    if {n_hnew}(bytes({v_k2}), {v_ct}, "
+        f"{H(rec.hash_name)}).digest() != {v_tg}:")
     add(f"        {n_cf} = True")
     add(f"        {n_dbg}()")
     add(f"        {v_k2}[{rec.flip_idx}] ^= 0x{rec.flip_xor:X}")
@@ -816,7 +832,7 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
         ks_input = f"{v_sa} + bytes({v_k2})"
     add(f"    {v_ks} = {n_ksf}({ks_input}, len({v_ct}))")
     add(f"    {v_pl} = bytes(a ^ b for a, b in zip({v_ct}, {v_ks}))")
-    add(f"    return getattr({n_comp}, {H('decompress')})({v_pl})")
+    add(f"    return {v_pl}")
     add()
 
     # ---- 启动函数：字符串表 + 命名空间 + 主程序 ----
@@ -833,6 +849,38 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
         if embed_assets else {}
     amap_literal = ', '.join(
         f'{aname!r}: {sidhex!r}' for aname, sidhex in asset_map.items())
+    # ---- 字符串表 Vault（F-17）----
+    # 不在 Python 里保留 tuple[str] 明文表：每个条目以 UTF-8 字节
+    # XOR 后拼进单一 bytes blob（bytes 不被 gc 跟踪），按索引现场解密；
+    # 构造时立刻把传入列表的条目覆盖为空串。攻击者先 copy 引用也拿不到
+    # 一份 1k 条的明文列表；要重建必须逐个调用 __getitem__。
+    add(f"class {n_vault}:")
+    add("    __slots__ = ('b', 'o', 'k')")
+    add("    def __init__(self, items, key):")
+    add("        blob = bytearray()")
+    add("        offs = []")
+    add("        for s in items:")
+    add("            raw = s.encode('utf-8')")
+    add("            enc = bytes(c ^ key[i % len(key)]")
+    add("                        for i, c in enumerate(raw))")
+    add("            offs.append((len(blob), len(raw)))")
+    add("            blob += enc")
+    add("        self.b = bytes(blob)")
+    add("        self.o = tuple(offs)")
+    add("        self.k = bytes(key)")
+    add("        for i in range(len(items)):")
+    add("            items[i] = ''")
+    add("    def __getitem__(self, idx):")
+    add("        start, n = self.o[idx]")
+    add("        data = self.b[start:start + n]")
+    add("        return bytes(c ^ self.k[i % len(self.k)]")
+    add("                     for i, c in enumerate(data)).decode('utf-8')")
+    add("    def __len__(self):")
+    add("        return len(self.o)")
+    add("    def corrupt(self):")
+    add("        self.b = b''")
+    add("        self.k = b'X'")
+    add()
     add(f"def {n_boot}():")
     add(f"    nonlocal {n_L}, {n_sk}, {n_sp}, {n_pd2}, {n_ns}, "
         f"{n_mainc}, {n_md}")
@@ -867,7 +915,8 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
         add(f"        {n_ns}[{H(mod)}] = {n_imp}({H(mod)})")
         add("    except Exception:")
         add(f"        {n_ns}[{H(mod)}] = None")
-    add(f"    {n_ns}[{H(strtable_name)}] = tuple({n_L})")
+    add(f"    {n_ns}[{H(strtable_name)}] = {n_vault}({n_L}, {n_sk})")
+    add(f"    {n_L} = None")
     add(f"    {n_ns}[{H('ASSETS_DIR')}] = {n_os}.path.join(")
     add(f"        {n_os}.path.dirname({n_os}.path.abspath(__file__)), "
         f"{adir!r})")
@@ -972,14 +1021,14 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     v_i = name('v')
     v_t2 = name('v')
     add(f"def {n_pt}():")
-    add(f"    if {n_L} is None:")
+    add(f"    if {n_ns}.get({H(strtable_name)}) is None:")
     add("        return")
     if self_hash:
         add(f"    {n_schk}()")
     add(f"    if {n_pd}():")
-    add(f"        for {v_i} in range(len({n_L})):")
-    add("            " + f"{n_L}[{v_i}] = chr(0xE000 + ({v_i} * 31 % 400))")
-    add(f"        {n_ns}[{H(strtable_name)}] = tuple({n_L})")
+    add(f"        {v_i} = {n_ns}.get({H(strtable_name)})")
+    add(f"        if hasattr({v_i}, {H('corrupt')}):")
+    add(f"            {v_i}.corrupt()")
     add("        return")
     add(f"    {v_t2} = {n_thr}.Timer(17.0, {n_pt})")
     add(f"    {v_t2}.daemon = True")
@@ -993,6 +1042,8 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     add(f"    {n_rc} = {n_ns}[{H(main_name)}]()")
     add("finally:")
     add(f"    {n_L} = None")
+    add(f"    if hasattr({n_ns}.get({H(strtable_name)}), {H('corrupt')}):")
+    add(f"        {n_ns}[{H(strtable_name)}].corrupt()")
     add(f"    {n_ns}[{H(strtable_name)}] = ()")
     add(f"    {n_acache}.clear()")
     add(f"    {n_tbl} = b''")

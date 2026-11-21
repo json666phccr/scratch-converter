@@ -21,7 +21,7 @@ from .interpreter import VMInterpreter
 from .loader import LoadedProject, LoadError, load_project
 from .module import RuntimeModule, build_module
 
-__version__ = "0.14.0"
+__version__ = "0.14.1"
 
 __all__ = [
     "run_project",
