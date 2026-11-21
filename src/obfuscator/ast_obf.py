@@ -512,30 +512,28 @@ def _inject_junk(tree: ast.Module, rng: random.Random, used: Set[str]) -> None:
 _PAD_CHARS = 'abcdefghijklmnopqrstuvwxyz0123456789'
 
 
-def _pad_expr(rng: random.Random, serial: int) -> str:
-    """按簇序号编码的恒真死代码表达式（形态唯一、取值无意义）。
+def _pad_expr(rng: random.Random) -> str:
+    """随机、恒可求值、无副作用的死代码表达式。
 
-    只改变常量值不改变字节码——结构指纹会忽略常量值，因此这里用
-    ``+n``/``-n`` 运算链的**长度与位模式**编码 serial，保证不同簇的
-    pad 字节码形态互不相同。表达式恒可求值（len 作用于字符串）。
+    不编码序号/顺序（v2.8 的 serial 位模式曾被 A12b 直接解码）；每次
+    调用独立随机，真簇与诱饵同分布，pad 本身不构成诱饵特征。
     """
     lit = ''.join(rng.choice(_PAD_CHARS)
                   for _ in range(rng.randrange(4, 13)))
     expr = f"len({lit!r})"
-    for bit in range(max(1, serial.bit_length())):
-        op = '+' if (serial >> bit) & 1 else '-'
-        expr += f" {op} {bit + 1}"
+    for _ in range(rng.randrange(1, 6)):
+        op = rng.choice(('+', '-', '^', '|', '&', '*'))
+        expr += f" {op} {rng.randrange(0, 97)}"
     return expr
 
 
-def _perturb_nested(tree: ast.Module, rng: random.Random,
-                    serial: int) -> None:
+def _perturb_nested(tree: ast.Module, rng: random.Random) -> None:
     """扰变嵌套代码对象（lambda / 推导式 / 生成器）。
 
     A12 复测发现：函数体本身被 pad 后，函数内嵌套的 lambda 与
     listcomp/genexpr/dictcomp 仍是原字节码——克隆函数会把这些嵌套
-    code object 原样带过去，结构指纹仍可凑出 60% 重叠。这里用按簇序
-    编码的恒真条件改写它们：语义不变，co_code/常量池形态改变。
+    code object 原样带过去，结构指纹仍可凑出 60% 重叠。这里用随机
+    恒真条件改写它们：语义不变，co_code/常量池形态改变。
     """
     nodes = [n for n in ast.walk(tree)
              if isinstance(n, (ast.Lambda, ast.ListComp, ast.SetComp,
@@ -543,33 +541,31 @@ def _perturb_nested(tree: ast.Module, rng: random.Random,
     for node in nodes:
         if isinstance(node, ast.Lambda):
             # (原返回值, pad)[0]：原表达式只求值一次，类型不变
-            pad = ast.parse(_pad_expr(rng, serial), mode='eval').body
+            pad = ast.parse(_pad_expr(rng), mode='eval').body
             node.body = ast.Subscript(
                 value=ast.Tuple(elts=[node.body, pad], ctx=ast.Load()),
                 slice=ast.Constant(value=0), ctx=ast.Load())
         else:
-            # 恒真过滤条件：abs(len(str) + 大常数 + 簇序运算链) >= 0
+            # 恒真过滤条件：abs(len(str) + 大常数 + 随机运算链) >= 0
             test = ast.parse(
-                f"abs({_pad_expr(rng, serial)} + 1048576) >= 0",
+                f"abs({_pad_expr(rng)} + 1048576) >= 0",
                 mode='eval').body
             node.generators[0].ifs.append(test)
     ast.fix_missing_locations(tree)
 
 
 def _inject_pads(tree: ast.Module, rng: random.Random,
-                 used: Set[str], serial: int) -> None:
-    """给每个函数体插入一条随机位置、按簇序编号的死赋值。
+                 used: Set[str]) -> None:
+    """给每个函数体插入一条随机位置、随机形态的死赋值。
 
-    A12：标识符重命名不改变 co_code，深拷贝簇可被结构指纹（co_code +
-    参数形状 + 常量类型结构）锁定。死代码改变 co_code / co_consts /
-    co_nlocals，且**真簇与诱饵用互不相同的 serial 注入**——"带死代码"
-    本身不构成诱饵特征，同一簇内所有函数共享该簇的 pad 形态。
-    赋值目标是全新随机局部名、值不被使用，语义不变。
+    A12：标识符重命名不改变 co_code，深拷贝簇可被结构指纹锁定。死代码
+    改变 co_code / co_consts / co_nlocals；真簇与诱饵同样注入，且形态
+    独立随机（无 serial 可解码）。
     """
     for func in [n for n in ast.walk(tree)
                  if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
         name = _random_name(rng, used)
-        stmt = ast.parse(f"{name} = {_pad_expr(rng, serial)}").body[0]
+        stmt = ast.parse(f"{name} = {_pad_expr(rng)}").body[0]
         # 只能插在首个顶层 return/raise 之前：CPython 不发射 return 之后
         # 的语句，插在末尾会让 pad 从 co_code 里消失（A12 复测发现）
         limit = len(func.body)
@@ -578,39 +574,70 @@ def _inject_pads(tree: ast.Module, rng: random.Random,
                 limit = index
                 break
         func.body.insert(rng.randrange(limit + 1), stmt)
-    _perturb_nested(tree, rng, serial)
+    _perturb_nested(tree, rng)
+    ast.fix_missing_locations(tree)
+
+
+def _mutate_decoy(tree: ast.Module, rng: random.Random) -> None:
+    """对**永不执行**的诱饵函数做结构突变（无需保持语义）。
+
+    A12b 用"pad 剥离 + 函数指纹覆盖率"识别克隆簇。随机死块/循环/推导
+    改变 co_code 与常量池，且不属于 pad 形态；即使剥离 pad，诱饵也不再
+    与任何真簇构成克隆对。
+    """
+    for func in [n for n in ast.walk(tree)
+                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+        limit = len(func.body)
+        for index, item in enumerate(func.body):
+            if isinstance(item, (ast.Return, ast.Raise)):
+                limit = index
+                break
+        for _ in range(rng.randrange(1, 4)):
+            kind = rng.randrange(4)
+            lit = ''.join(rng.choice(_PAD_CHARS)
+                          for _ in range(rng.randrange(4, 12)))
+            tag = rng.randrange(10 ** 6)
+            if kind == 0:
+                src = (f"for _m{tag} in ({rng.randrange(2, 9)},):\n"
+                       "    pass")
+            elif kind == 1:
+                src = "try:\n    pass\nexcept Exception:\n    pass"
+            elif kind == 2:
+                src = f"if len({lit!r}) > 0:\n    pass"
+            else:
+                src = (f"_m{tag} = [{rng.randrange(99)} "
+                       f"for _i in range({rng.randrange(1, 4)})]")
+            func.body.insert(rng.randrange(limit + 1),
+                             ast.parse(src).body[0])
     ast.fix_missing_locations(tree)
 
 
 def _pad_cluster_sources(sources: List[str], rng: random.Random,
-                         used: Set[str], serial_start: int = 0
-                         ) -> List[str]:
-    """对真簇源码做与诱饵相同的结构扰变（簇 i 用 serial_start+i）。"""
+                         used: Set[str]) -> List[str]:
+    """对真簇源码做与诱饵相同的 pad/嵌套扰变。"""
     out: List[str] = []
-    for index, source in enumerate(sources):
+    for source in sources:
         try:
             tree = ast.parse(source)
         except SyntaxError:
             out.append(source)
             continue
-        _inject_pads(tree, rng, used, serial_start + index)
+        _inject_pads(tree, rng, used)
         out.append("\n\n".join(ast.unparse(item) for item in tree.body))
     return out
 
 
 def _make_decoy_clusters(clusters: List[str], rng: random.Random,
-                         used: Set[str], serial_start: int = 0
-                         ) -> List[Tuple[str, str]]:
+                         used: Set[str]) -> List[Tuple[str, str]]:
     """从**多个真实簇**拼接诱饵，返回 [(源码, 入口函数名)]。
 
-    v2.8（A12）：不再深拷贝单一真簇——
+    v2.10（A12b）：不再深拷贝单一真簇——
 
-    - 从 2~3 个真簇各取等量成员拼接：攻击者若剥离死代码做归一化，
-      与任一真簇的函数指纹多重集重叠也低于 55% 判据；
-    - 每个函数注入随机形态死代码（真簇同样注入），co_code / 常量池
-      结构指纹不再与源簇重合；
-    - 入口函数名作为 stage1 trampoline 名，导出名仍可见；
-    - 簇在发射表中的位置由调用方随机交织，下标序不再指示诱饵。
+    - 从 2~3 个真簇各取等量成员拼接；
+    - 每个函数注入随机 pad（真簇同样注入，无 serial 可解码）；
+    - 追加随机死块/循环/推导突变（诱饵永不执行，无需保语义），
+      即使攻击者剥离 pad，也不再与真簇构成克隆对；
+    - 入口函数名作为 stage1 trampoline 名；簇位置随机交织。
     """
     import copy as _copy
 
@@ -672,7 +699,8 @@ def _make_decoy_clusters(clusters: List[str], rng: random.Random,
             elif isinstance(n, (ast.Global, ast.Nonlocal)):
                 n.names = [mapping.get(x, x) for x in n.names]
 
-        _inject_pads(clone, rng, used, serial_start + offset)
+        _inject_pads(clone, rng, used)
+        _mutate_decoy(clone, rng)
 
         entry = next(
             (n.name for n in clone.body
@@ -836,9 +864,8 @@ def obfuscate_module(tree: ast.Module,
         tree, rng, cluster_helper, mapping.get('main', 'main'))
 
     # 诱饵：多簇拼接 + 结构扰变（真簇同样扰变，消除"带 pad"特征）
-    decoy_pairs = _make_decoy_clusters(clusters, rng, used,
-                                       serial_start=len(clusters))
-    clusters = _pad_cluster_sources(clusters, rng, used, serial_start=0)
+    decoy_pairs = _make_decoy_clusters(clusters, rng, used)
+    clusters = _pad_cluster_sources(clusters, rng, used)
 
     # 真假簇随机交织：发射下标不再"真簇在前、诱饵连续在后"（攻击方
     # 的"下标较大者为诱饵"判据失效）

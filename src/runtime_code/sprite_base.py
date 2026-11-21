@@ -34,6 +34,7 @@ SPRITE_BASE = r'''class ScratchSprite:
         self.costumes = []
         self.sounds = []
         self._handlers = {}
+        self._handler_keys = set()
         self._conditions = []
         self._frame_hats = []
         self._runtime = None
@@ -541,6 +542,27 @@ SPRITE_BASE = r'''class ScratchSprite:
                     self._runtime.warp_end()
 
     def _register(self, event, func):
+        # 反"替代 self"重放：注册时保存的是**绑定到真实角色**的守卫。
+        # 正常调度无参调用 -> 执行原 handler；外部用 Recorder 冒充 self
+        # 调用（带额外位置/关键字参数）-> 直接返回，不产生任何可记录
+        # 的 getattr/setattr 操作。运行时始终用真实 self，语义不变。
+        import types as _types
+        owner = getattr(func, '__self__', None)
+        key = (event, getattr(func, '__func__', func), id(owner))
+        if key in self._handler_keys:
+            return
+        self._handler_keys.add(key)
+        if owner is not None and callable(getattr(func, '__func__', None)):
+            _orig = func
+            _name = getattr(_orig, '__name__', 'handler')
+
+            def _guard(_s, *_a, **_k):
+                if _a or _k:
+                    return None
+                return _orig()
+
+            _guard.__name__ = _name
+            func = _types.MethodType(_guard, owner)
         handlers = self._handlers.setdefault(event, [])
         if func not in handlers:
             handlers.append(func)
@@ -1301,6 +1323,7 @@ SPRITE_BASE = r'''class ScratchSprite:
                 continue
             setattr(clone, key, value.copy() if isinstance(value, (list, dict)) else value)
         clone._handlers = {}
+        clone._handler_keys = set()
         clone._conditions = []
         clone._frame_hats = []
         # Clones+ 的“克隆时设置变量”需要在run()注册帽子前就生效

@@ -512,7 +512,14 @@ class PythonGenerator:
                                 doc: Optional[str] = None) -> List[str]:
         if name is None or doc is None:
             name, doc, _event = self._event_info(stmt)
-        lines = [f"    def {name}(self):", f'        """{doc}"""']
+        class_name = sanitize_name(
+            getattr(self.current_sprite, 'name', ''), "Sprite")
+        lines = [f"    def {name}(self):", f'        """{doc}"""',
+                 # 反"替换 self"重放：Recorder 等非本类实例调用事件方法
+                 # 直接返回，不产生任何 getattr/setattr 记录。真实角色/
+                 # 克隆体都是本类实例，语义不变。
+                 f"        if type(self) is not {class_name}:",
+                 "            return None"]
         body = self._emit_chain(stmt.next, 2)
         if body:
             lines.extend(body)

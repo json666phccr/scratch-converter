@@ -52,7 +52,10 @@ _INJECTED_MODULES = (
     'base64', 'argparse', 'threading', 'json', 'functools', 'heapq',
     '_thread', 'pygame',
 )
-_HASHES = ('sha256', 'sha384', 'sha512', 'blake2b', 'sha3_256', 'sha3_512')
+# 只用 CPython `_hashlib`（OpenSSL C 绑定）可提供的哈希族：加载器直调
+# C 级构造函数，Python 层对 hashlib 的 monkeypatch 钩子拿不到密钥输入。
+# blake2b 不在 _hashlib 中（会回落到可被钩子的 hashlib），故移除。
+_HASHES = ('sha256', 'sha384', 'sha512', 'sha3_256', 'sha3_512')
 _COMPRESSION = ('zlib', 'bz2', 'lzma')
 _ENCODERS = ('b85', 'b64')
 _FLIP_XORS = (0x37, 0x5A, 0xA7, 0x91, 0x6C, 0xB3, 0xE2)
@@ -336,6 +339,28 @@ def _sid_hex(sid: str) -> str:
     return sid.encode().hex()
 
 
+def _pack_rows(segments: Dict[str, Tuple[bytes, bytes, bytes]],
+               encoder) -> bytes:
+    """把分段表压成单一二进制 blob（无 Python 容器结构）。
+
+    字段：sidlen/sid-hex/saltlen/salt/taglen/tag/ctlen/ct-ascii。
+    sid/tag/ct 长度均 <256，ct 用 4 字节大端长度。
+    """
+    out = bytearray()
+    for sid, (salt, tag, ct) in segments.items():
+        sid_b = sid.encode('ascii')
+        ct_b = encoder(ct).encode('ascii')
+        out.append(len(sid_b))
+        out += sid_b
+        out.append(len(salt))
+        out += salt
+        out.append(len(tag))
+        out += tag
+        out += len(ct_b).to_bytes(4, 'big')
+        out += ct_b
+    return bytes(out)
+
+
 def loader_source(spec: PayloadSpec, *, main_name: str,
                   strtable_name: str, cluster_helper: str,
                   asset_helper: str, embed_assets: bool,
@@ -414,7 +439,17 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     n_dbg = name('g')
     n_boot = name('b')
     n_bind = name('b')
-    frag_names = [name('f') for _ in rec.fragments]
+    n_lib = name('h')       # _hashlib（C 级 OpenSSL 绑定）
+    n_bad = name('b')       # 运行时插桩检测标志
+    n_fb = name('f')        # 64 字节片段 blob
+    n_tbl = name('t')       # 分段表二进制 blob
+    n_rc = name('r')
+    n_i = name('i')
+    n_sn = name('s')
+    n_sx = name('s')
+    n_sl = name('s')
+    n_tl = name('t')
+    n_cl = name('c')
 
     str_sid_hex = _sid_hex(rec.str_sid)
     main_sid_hex = _sid_hex(rec.main_sid)
@@ -439,6 +474,25 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     def add(line: str = '') -> None:
         L.append(line)
 
+    def emit_blob(var: str, text: str, chunk: int) -> None:
+        """把 base85 文本拆成随机命名的小块，打乱赋值序、按原序拼接。
+
+        Cython 压缩字符串表按源码出现序存放常量；攻击者从 .rodata
+        解压后只能看到一串无序小块，必须分析巨大的 init 函数才能还原
+        拼接顺序。纯 Python 下源码可读（本来就不防），但通用正则/长串
+        定位失效。
+        """
+        pieces = [text[i:i + chunk] for i in range(0, len(text), chunk)]
+        names = [name('s') for _ in pieces]
+        order = list(range(len(pieces)))
+        rng.shuffle(order)
+        for index in order:
+            add(f"{names[index]} = {pieces[index]!r}")
+        add(f"{var} = getattr({n_b85}, {H('b85decode')})(''.join((")
+        for start in range(0, len(names), 8):
+            add("    " + ", ".join(names[start:start + 8]) + ",")
+        add(")))")
+
     # ---- imports（字符串常量运行时构造）----
     add(f"{n_imp} = __import__")
     add(f"{n_hex} = bytes.fromhex")
@@ -447,9 +501,26 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
         add(f"{binding} = {n_imp}({H(mod)})")
     add(f"{n_bi} = {n_imp}({H('builtins')})")
     add(f"{n_ex} = getattr({n_bi}, {H('exec')})")
-    add(f"{n_hf} = getattr({n_hash}, {H(rec.hash_name)})")
-    add(f"{n_kh} = getattr({n_hash}, {H(rec.ks_hash_name)})")
-    add(f"{n_h256} = getattr({n_hash}, {H('sha256')})")
+    # 哈希优先走 _hashlib 的 C 级 OpenSSL 构造函数：Python 层对
+    # hashlib.sha256 的 monkeypatch（A13b 钩子）拿不到任何密钥输入。
+    add("try:")
+    add(f"    {n_lib} = {n_imp}({H('_hashlib')})")
+    add("except Exception:")
+    add(f"    {n_lib} = None")
+    for var, hname in ((n_hf, rec.hash_name), (n_kh, rec.ks_hash_name),
+                       (n_h256, 'sha256')):
+        add(f"{var} = getattr({n_lib}, {H('openssl_' + hname)}, None) "
+            f"if {n_lib} is not None else None")
+        add(f"if {var} is None:")
+        add(f"    {var} = getattr({n_hash}, {H(hname)})")
+    # 反插桩：sys.exit / 实际使用的哈希 / marshal.loads 必须是 C 级
+    # builtin（Python 包装函数即视为被 hook）。命中后不把真实片段交给
+    # 任何哈希函数，并在 dec 入口直接返回空，避免密钥经钩子外泄。
+    add(f"{n_bad} = (type({n_sys}.exit) is not type({n_bi}.len) or")
+    add(f"    type({n_hf}) is not type({n_bi}.len) or")
+    add(f"    type({n_kh}) is not type({n_bi}.len) or")
+    add(f"    type({n_h256}) is not type({n_bi}.len) or")
+    add(f"    type({n_mar}.loads) is not type({n_bi}.len))")
     add(f"{n_cf} = False")
     add(f"{n_bind} = b''")
     # 命名空间最小化：这些名字由 _boot 赋值、由 _clh/_alh/_pt 读取，
@@ -461,27 +532,22 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
         ph_index = len(L)
     add()
 
-    # ---- 密钥分裂片段（算术派生 + 异或混合，两种形态随机）----
-    for index, (fname, fragment) in enumerate(
-            zip(frag_names, rec.fragments)):
-        derived_here = [d for d in rec.derived if d[0] == index]
-        if derived_here:
-            _, parent, mult, addend, xor_c, form = derived_here[0]
-            if form:
-                add(f"{fname} = (({frag_names[parent]} ^ 0x{xor_c:X}) "
-                    f"* 0x{mult:X} + 0x{addend:X}) & 0x{_MASK64:X}")
-            else:
-                add(f"{fname} = ({frag_names[parent]} * 0x{mult:X} "
-                    f"+ 0x{addend:X}) & 0x{_MASK64:X}")
-        else:
-            add(f"{fname} = 0x{fragment:016X}")
-    add(f"{n_k} = bytearray({n_hf}(b''.join(")
-    add("    t.to_bytes(8, 'big') for t in ("
-        + ", ".join(frag_names) + "))).digest())")
+    # ---- 密钥片段：单一不透明 blob ----
+    # 不再以 8 个整数赋值/派生公式出现（A11b 的整数扫描、S3 的 LE64/
+    # base-32 提取均失去锚点）。派生公式只在生成端使用，运行端只看到
+    # 一段 base85 文本；解出的 64 字节再按大端切分。
+    frag_blob = b''.join(f.to_bytes(8, 'big') for f in rec.fragments)
+    frag_b85 = base64.b85encode(frag_blob).decode('ascii')
+    emit_blob(n_fb, frag_b85, 24)
+    add(f"{n_k} = bytearray({n_hf}("
+        f"bytes(64) if {n_bad} else {n_fb}).digest())")
     add()
 
     # ---- 许可证绑定（Tier 2）：fp 参与主密钥派生 ----
     if rec.license_payload_b64 is not None:
+        # 插桩环境下不读取/哈希机器指纹（避免 fp 经 hashlib 钩子外泄），
+        # 许可证绑定整体跳过，后续 dec 也会因 n_bad 直接返回空。
+        lic_start = len(L)
         reg_path = 'SOFTWARE\\Microsoft\\Cryptography'
         add(f"{n_lpb} = {n_b85}.b64decode({rec.license_payload_b64!r})")
         add(f"{n_lsb} = {n_b85}.b64decode({rec.license_sig_b64!r})")
@@ -530,6 +596,10 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
                 f"{rec.license_expires}:")
             add(f"    {n_cr}()")
         add()
+        for _idx in range(lic_start, len(L)):
+            if L[_idx]:
+                L[_idx] = '    ' + L[_idx]
+        L.insert(lic_start, f"if not {n_bad}:")
 
     # ---- 反调试探针（含 builtins 完整性检查）----
     # 函数内参数/局部名一律随机化：Cython 编译后函数签名存于 code object，
@@ -540,6 +610,8 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     add(f"def {n_pd}():")
     add("    try:")
     add(f"        if {n_sys}.gettrace() is not None:")
+    add("            return True")
+    add(f"        if {n_sys}.getprofile() is not None:")
     add("            return True")
     add("    except Exception:")
     add("        pass")
@@ -581,7 +653,7 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     add(f"    {n_cf} = True")
     add(f"    {n_k}[{rec.corrupt_idx}] ^= 0x{rec.corrupt_xor:X}")
     add(f"    {n_dbg}()")
-    add(f"if {n_pd}():")
+    add(f"if {n_bad} or {n_pd}():")
     add(f"    {n_cr}()")
     add(f"if {n_sys}.version_info[:2] != {spec.version!r}:")
     add(f"    {n_cr}()")
@@ -609,22 +681,15 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
         add(f"{n_schk}()")
     add()
 
-    # ---- 分段表 ----
-    if rec.table_form == 0:
-        add(f"{n_segs} = {{")
-        for sid, (salt, tag, ct) in spec.segments.items():
-            parts = ", ".join(repr(chunk) for chunk in _chunks(
-                rec.encode_text(ct)))
-            add(f"    {sid!r}: ({salt!r}, {tag!r}, [{parts}]),")
-        add("}")
-    else:
-        add(f"{n_rows} = [")
-        for sid, (salt, tag, ct) in spec.segments.items():
-            parts = ", ".join(repr(chunk) for chunk in _chunks(
-                rec.encode_text(ct)))
-            add(f"    [{sid!r}, {salt!r}, {tag!r}, [{parts}]],")
-        add("]")
-        add(f"{n_segs} = {{r[0]: (r[1], r[2], r[3]) for r in {n_rows}}}")
+    # ---- 分段表：单一二进制 blob ----
+    # 不再生成 {sid: (salt, tag, ct)} 字典或行列表（A11b/A13b 的
+    # literal_eval / gc 行扫描失去锚点）。格式：
+    #   [1B sidlen][sid-hex][1B saltlen][salt][1B taglen][tag]
+    #   [4B ctlen][ct-ascii]
+    # 运行端按 sid 线性查找；61 段量级，dec 仅懒加载调用，成本可忽略。
+    tbl_blob = _pack_rows(spec.segments, rec.encode_text)
+    tbl_b85 = base64.b85encode(tbl_blob).decode('ascii')
+    emit_blob(n_tbl, tbl_b85, 4096)
     acc_variant = rng.randrange(2)
     p_s = name('p')
     p_n = name('p')
@@ -692,12 +757,16 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     v_sa = name('v')
     v_tg = name('v')
     v_pt = name('v')
+    v_sid2 = name('s')
+    v_stored = name('s')
     v_ct = name('v')
     v_k2 = name('v')
     v_ks = name('v')
     v_pl = name('v')
     add(f"def {n_dec}({p_sid}, {p_prev}):")
     add(f"    nonlocal {n_cf}")
+    add(f"    if {n_bad}:")
+    add("        return b''")
     if frame_check:
         # 调用方校验按**代码对象身份**（不是名字）：只允许 _boot/_clh/_alh
         # 三个已知函数的 code object。截断重编译或尾部追加的代码即使
@@ -708,9 +777,32 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
         add(f"            {v_fr}.f_code is not {n_clh}.__code__ and")
         add(f"            {v_fr}.f_code is not {n_alh}.__code__):")
         add(f"        {n_cr}()")
-    add(f"    {v_sa}, {v_tg}, {v_pt} = {n_segs}[{p_sid}]")
+    # 从二进制 blob 中按 sid 线性查找一行；不构造 dict/list
+    add(f"    {v_sid2} = {p_sid}.encode({H('ascii')})")
+    add(f"    {n_i} = 0")
+    add(f"    {v_pt} = b''")
+    add(f"    while {n_i} < len({n_tbl}):")
+    add(f"        {n_sn} = {n_tbl}[{n_i}]")
+    add(f"        {n_i} += 1")
+    add(f"        {v_stored} = {n_tbl}[{n_i}:{n_i} + {n_sn}]")
+    add(f"        {n_i} += {n_sn}")
+    add(f"        {n_sl} = {n_tbl}[{n_i}]")
+    add(f"        {n_i} += 1")
+    add(f"        {v_sa} = {n_tbl}[{n_i}:{n_i} + {n_sl}]")
+    add(f"        {n_i} += {n_sl}")
+    add(f"        {n_tl} = {n_tbl}[{n_i}]")
+    add(f"        {n_i} += 1")
+    add(f"        {v_tg} = {n_tbl}[{n_i}:{n_i} + {n_tl}]")
+    add(f"        {n_i} += {n_tl}")
+    add(f"        {n_cl} = int.from_bytes("
+        f"{n_tbl}[{n_i}:{n_i} + 4], {H('big')})")
+    add(f"        {n_i} += 4")
+    add(f"        if {v_stored} == {v_sid2}:")
+    add(f"            {v_pt} = {n_tbl}[{n_i}:{n_i} + {n_cl}]")
+    add("            break")
+    add(f"        {n_i} += {n_cl}")
     add(f"    {v_ct} = getattr({n_b85}, {H(dec_attr)})"
-        f"(''.join({v_pt}))")
+        f"({v_pt}.decode({H('ascii')}))")
     add(f"    {v_k2} = {kdf_expr(p_prev, p_sid)}")
     add("    if not " + f"{n_hmac}.compare_digest(")
     add(f"            {n_hmac}.new(bytes({v_k2}), {v_ct}, "
@@ -880,6 +972,8 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     v_i = name('v')
     v_t2 = name('v')
     add(f"def {n_pt}():")
+    add(f"    if {n_L} is None:")
+    add("        return")
     if self_hash:
         add(f"    {n_schk}()")
     add(f"    if {n_pd}():")
@@ -893,15 +987,25 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     add(f"{n_pt}()")
     add()
 
-    # ---- 入口（SCRATCH_OBF_DEBUG=1 时输出诊断，发布模式静默）----
+    # ---- 入口：主程序返回后先擦除密钥/表/明文字符串，再退出 ----
+    # A13b 在 sys.exit 钩子里扫描 gc：此时 rows/字符串表/kroot 已清空。
     add("try:")
-    add(f"    {n_sys}.exit({n_ns}[{H(main_name)}]())")
-    add("except SystemExit:")
-    add("    raise")
-    add("except Exception:")
-    add(f"    if {n_cf}:")
-    add(f"        {n_dbg}()")
-    add("    raise")
+    add(f"    {n_rc} = {n_ns}[{H(main_name)}]()")
+    add("finally:")
+    add(f"    {n_L} = None")
+    add(f"    {n_ns}[{H(strtable_name)}] = ()")
+    add(f"    {n_acache}.clear()")
+    add(f"    {n_tbl} = b''")
+    add(f"    {n_fb} = b''")
+    add(f"    {n_k}[:] = b''")
+    add(f"    {n_sk} = None")
+    add(f"    {n_sp} = None")
+    add(f"    {n_pd2} = None")
+    add(f"    {n_mainc} = None")
+    add(f"    {n_md} = None")
+    add(f"    {n_amap} = {{}}")
+    add(f"    {n_bind} = b''")
+    add(f"{n_sys}.exit({n_rc})")
 
     # ---- 命名空间最小化 + ph 行插入 ----
     # 整个加载器收进单一入口函数，模块级只剩 def/<call>/del。A13 在
@@ -914,8 +1018,13 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     body: List[str] = [f"def {entry_name}():"]
     for line in L:
         body.append(("    " + line) if line else "")
-    body.append(f"{entry_name}()")
-    body.append(f"del {entry_name}")
+    # 入口在 try/finally 中调用：即使 sys.exit 抛出 SystemExit 或被插桩
+    # 侧提前异常，也会删除入口函数名，避免通过 `__code__.co_consts`
+    # 反查载荷材料。
+    body.append("try:")
+    body.append(f"    {entry_name}()")
+    body.append("finally:")
+    body.append(f"    del {entry_name}")
 
     # ---- ph：全部源码（除本行）+ binding 盐参与 n_schk 哈希 ----
     # 生成端与运行端以相同规则过滤 #obf-ichk 行后求哈希；盐值

@@ -314,7 +314,7 @@ def test_obfuscator_tamper_detected():
         lines = source.splitlines()
         target = None
         for index, line in enumerate(lines):
-            if len(line) > 500 and "', '" in line:
+            if len(line) > 500 and " = '" in line:
                 target = index
                 break
         assert target is not None, "未找到密文数据行"
@@ -442,10 +442,13 @@ def test_obfuscator_no_static_anchors():
         # 固定段标识锚点（'str'/'main' 的 hex）必须不存在
         assert "'737472'" not in source, "存在 'str' 锚点"
         assert "'6d61696e'" not in source, "存在 'main' 锚点"
-        # 至少一个片段由算术派生（非常量），通用解包器的常量假设失效
-        assert "& 0xFFFFFFFFFFFFFFFF" in source, "缺少算术派生片段"
-        # builtins 完整性探针存在（堵 exec/marshal.loads hook）
-        assert "is not type(" in source, "缺少 builtins 完整性探针"
+        # 片段/分段表以不透明 blob 存在：无 8 整数元组锚点、无行列表、
+        # 无逐片段算术派生；A11b 的整数扫描/表 literal_eval 失效
+        assert "for t in (" not in source, "存在片段元组锚点"
+        assert "& 0xFFFFFFFFFFFFFFFF" not in source, "存在逐片段派生常量"
+        assert "bytes(64)" in source, "缺少片段 blob"
+        # builtins/哈希/sys.exit 完整性探针存在
+        assert "is not type(" in source, "缺少完整性探针"
 
     print("  [PASS] 静态结构锚点清除通过")
     return True
@@ -733,7 +736,10 @@ def test_obfuscator_tail_patch_resisted():
                 capture_output=True, text=True, timeout=90,
                 stdin=subprocess.DEVNULL,
                 env={**os.environ, "SCRATCH_OBF_DEBUG": "1"})
-            assert 'integrity' in (proc.stderr or ''), name
+            # tail-delete 会删掉 finally 的必填语句 -> 模块语法错误，
+            # 在自校验运行前就失败；其余变体应命中 integrity 诊断
+            if name != "tail-delete":
+                assert 'integrity' in (proc.stderr or ''), name
 
     print("  [PASS] 尾部 patch 抵抗通过")
     return True
@@ -843,14 +849,12 @@ def test_loader_namespace_minimized():
 os.environ['SDL_VIDEODRIVER'] = 'dummy'
 os.environ['SDL_AUDIODRIVER'] = 'dummy'
 sys.argv = ['probe', '--headless', '--frames', '1', '--no-audio']
-real_exit = sys.exit
-sys.exit = lambda *a: None          # 让入口函数正常返回并执行 del
 src = open(%r, encoding='utf-8').read()
 ns = {'__name__': 'probe', '__file__': %r}
 try:
     exec(compile(src, %r, 'exec'), ns)
-finally:
-    sys.exit = real_exit
+except SystemExit:
+    pass                            # 入口先擦除，再 sys.exit
 
 funcs = [v for v in ns.values() if isinstance(v, types.FunctionType)]
 assert not funcs, f'入口函数未从命名空间移除: {len(funcs)}'
@@ -876,7 +880,7 @@ for value in ns.values():
         assert len(rows) < 3, '命名空间仍存在分段表'
 
 long_strs = [v for v in ns.values()
-             if isinstance(v, list) and len(v) > 100
+             if isinstance(v, (list, tuple)) and len(v) > 100
              and all(isinstance(x, str) for x in v)]
 assert not long_strs, '命名空间仍存在明文字符串表'
 ''' % (output, output, output))
@@ -887,6 +891,56 @@ assert not long_strs, '命名空间仍存在明文字符串表'
         assert proc.returncode == 0, (proc.stdout or '') + (proc.stderr or '')
 
     print("  [PASS] 加载器命名空间最小化通过")
+    return True
+
+
+def test_loader_antihook():
+    """OBF-2l A13b 回归：hashlib/sys.exit 被 Python 层包装时，加载器
+    不把片段交给哈希函数，且不会在钩子点产生可 dump 状态"""
+    print("[测试105l] 加载器反插桩")
+
+    with tempfile.TemporaryDirectory() as folder:
+        project_json = make_project({
+            "hat": block("event_whenflagclicked", None, None, top_level=True),
+        }, name="HookSprite")
+        project_json["targets"].insert(0, _stage_target())
+        sb3 = _write_sb3(folder, project_json)
+        output = os.path.join(folder, "protected.py")
+        obfuscate_sb3(sb3, output, embed_assets=True, seed=31)
+
+        probe = os.path.join(folder, "probe.py")
+        hook_flag = os.path.join(folder, "hook.txt")
+        with open(probe, "w", encoding="utf-8") as handle:
+            handle.write('''import hashlib, os, sys
+os.environ['SDL_VIDEODRIVER'] = 'dummy'
+os.environ['SDL_AUDIODRIVER'] = 'dummy'
+sys.argv = ['probe', '--headless', '--frames', '1', '--no-audio']
+_real = hashlib.sha256
+def _wrapped(*a, **k):
+    return _real(*a, **k)
+hashlib.sha256 = _wrapped
+def _hook(*a, **k):
+    open(%r, 'wb').write(b'HOOK')
+    raise SystemExit(1)
+sys.exit = _hook
+src = open(%r, encoding='utf-8').read()
+try:
+    exec(compile(src, %r, 'exec'),
+         {'__name__': 'probe', '__file__': %r})
+except SystemExit:
+    raise
+except Exception:
+    pass
+''' % (hook_flag, output, output, output))
+        proc = subprocess.run(
+            [sys.executable, probe], capture_output=True, text=True,
+            timeout=180, stdin=subprocess.DEVNULL,
+            env={**os.environ, "SDL_VIDEODRIVER": "dummy"})
+        assert not os.path.exists(hook_flag), (
+            "钩子被执行：加载器未识别插桩\n"
+            + (proc.stdout or '') + (proc.stderr or ''))
+
+    print("  [PASS] 加载器反插桩通过")
     return True
 
 
@@ -979,4 +1033,5 @@ TESTS = [
     test_dec_caller_identity,
     test_decoy_structure_perturbed,
     test_loader_namespace_minimized,
+    test_loader_antihook,
 ]
