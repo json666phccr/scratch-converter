@@ -819,6 +819,79 @@ except Exception:
     return True
 
 
+def test_decoy_structure_perturbed():
+    """OBF-2j A12 回归：诱饵簇与真簇不得构成结构克隆对
+
+    复刻攻击方判据：co_code + 参数形状 + 常量类型结构（忽略标识符）
+    的多重集重叠率 >=55% 即克隆对。诱饵从多个真簇拼接；真/假函数
+    注入互不重叠的簇序 pad，嵌套推导式/lambda 同步扰变；簇序随机交织。
+    """
+    print("[测试105j] 诱饵结构扰变")
+
+    import ast
+    import hashlib
+    from collections import Counter
+    from obfuscator.ast_obf import obfuscate_module
+
+    def code_fp(code):
+        consts = []
+        for const in code.co_consts:
+            if isinstance(const, type(code)):
+                consts.append(('code', code_fp(const)))
+            else:
+                consts.append((type(const).__name__,))
+        return (code.co_argcount, code.co_posonlyargcount,
+                code.co_kwonlyargcount, code.co_nlocals, code.co_flags,
+                code.co_code, tuple(consts))
+
+    def all_codes(code):
+        out = [code]
+        for const in code.co_consts:
+            if isinstance(const, type(code)):
+                out.extend(all_codes(const))
+        return out
+
+    def multiset(code):
+        return Counter(
+            hashlib.sha256(repr(code_fp(f)).encode()).hexdigest()
+            for f in all_codes(code)[1:])
+
+    source = (
+        "class Base:\n"
+        "    def step(self, x):\n"
+        "        return x + 1\n"
+        "def g(xs):\n"
+        "    ys = [x * 2 for x in xs if x > 0]\n"
+        "    zs = {x: x + 1 for x in xs}\n"
+        "    f = lambda v: v + 1\n"
+        "    return sum(f(v) for v in ys) + len(zs)\n"
+        + "".join(
+            f"def f{i}(x):\n"
+            f"    if x > {i}:\n"
+            f"        return x * {i}\n"
+            f"    return x + {i}\n"
+            for i in range(10))
+        + "def main():\n"
+          "    return 1\n")
+
+    for seed in range(12):
+        tree = ast.parse(source)
+        result = obfuscate_module(tree, seed)
+        assert result.decoy_count >= 1, f"seed={seed} 未生成诱饵"
+        fps = [multiset(compile(src, '<c>', 'exec'))
+               for src in result.clusters]
+        for a in range(len(fps)):
+            for b in range(a + 1, len(fps)):
+                common = sum((fps[a] & fps[b]).values())
+                smaller = min(sum(fps[a].values()), sum(fps[b].values()))
+                assert not (smaller and common / smaller >= 0.55), (
+                    f"seed={seed} cluster {a}/{b} 结构克隆 "
+                    f"{common}/{smaller}")
+
+    print("  [PASS] 诱饵结构扰变通过")
+    return True
+
+
 TESTS = [
     test_obfuscator_constant_folding,
     test_obfuscator_end_to_end,
@@ -833,4 +906,5 @@ TESTS = [
     test_obfuscator_tail_patch_resisted,
     test_recipe_derivation_order,
     test_dec_caller_identity,
+    test_decoy_structure_perturbed,
 ]

@@ -35,7 +35,7 @@ from .folding import fold_project
 from .foreign_names import collect_foreign_method_names
 from .payload import build_payload, compile_module, loader_source
 
-__version__ = "2.7.0"
+__version__ = "2.8.0"
 
 
 class ObfuscationError(Exception):
@@ -310,8 +310,7 @@ def obfuscate_sb3(input_path: str,
 
         spec = build_payload(
             stage1_code, result.clusters, result.str_entries,
-            payload_assets, seed, license=license_binding,
-            decoy_sources=result.decoy_clusters)
+            payload_assets, seed, license=license_binding)
         asset_dir_name = (
             os.path.splitext(os.path.basename(output_path))[0] + '_assets')
         source = loader_source(
@@ -362,7 +361,7 @@ def obfuscate_sb3(input_path: str,
             folded=fold,
             clusters=len(result.clusters),
             strings=len(result.str_entries),
-            decoy_clusters=len(result.decoy_clusters),
+            decoy_clusters=result.decoy_count,
         )
     finally:
         loaded.close()

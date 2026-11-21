@@ -239,8 +239,7 @@ class PayloadSpec:
 def build_payload(stage1_code, cluster_sources: List[str],
                   str_entries: List[str], assets: Dict[str, bytes],
                   seed=None,
-                  license: Optional[Tuple[bytes, bytes, bytes]] = None,
-                  decoy_sources: Optional[List[str]] = None
+                  license: Optional[Tuple[bytes, bytes, bytes]] = None
                   ) -> PayloadSpec:
     rng = random.Random(seed)
     recipe = make_recipe(rng, len(cluster_sources), sorted(assets))
@@ -295,21 +294,8 @@ def build_payload(stage1_code, cluster_sources: List[str],
                        'exec', dont_inherit=True)
         encrypt(recipe.cluster_sids[index], marshal.dumps(code), digest_main)
 
-    # 诱饵簇：与真簇同规格加密入表，但加载器永不调用——静态解包者
-    # 解出后真假难辨，必须逐个执行/反编译才能辨识（提高成品率门槛）。
-    # sid 追加进 cluster_sids：诱饵 trampoline（stage1 引用 csid 下标）
-    # 使 sid 可达性与真簇一致，引用计数判据失效
-    for decoy_source in (decoy_sources or ()):
-        code = compile(decoy_source, f"<{rng.randrange(16 ** 12):012x}>",
-                       'exec', dont_inherit=True)
-        sid = ''.join(rng.choice(_SID_ALPHABET) for _ in
-                      range(rng.randrange(10, 17)))
-        while not sid[0].isalpha():
-            sid = ''.join(rng.choice(_SID_ALPHABET)
-                          for _ in range(rng.randrange(10, 17)))
-        recipe.cluster_sids.append(sid)
-        encrypt(sid, marshal.dumps(code), digest_main)
-
+    # 诱饵簇已在 ast_obf 阶段与真簇随机交织（v2.8/A12），此处按统一
+    # 簇序加密——加载器只按下标取段，不区分真假。
     for name, data in assets.items():
         encrypt(recipe.asset_sids[name], data, digest_main)
 
