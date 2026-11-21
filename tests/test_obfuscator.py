@@ -708,8 +708,10 @@ def test_obfuscator_tail_patch_resisted():
         variants = {
             "tail-append": source + "\nprint('INJECTED-OK')\n",
             "tail-delete": "\n".join(lines[:-1]) + "\n",
-            "probe-nop": source.replace(
-                "    return False", "    return False\ndef _zz(): pass", 1),
+            # 行内加注释：保持缩进与语法合法，只改内容——自校验应察觉。
+            # （v2.9 起加载器整体缩进在入口函数内，不能再插模块级 def）
+            "line-edit": source.replace(
+                "    return False", "    return False  # mutated", 1),
         }
         for name, mutated in variants.items():
             path = os.path.join(folder, f"p_{name}.py")
@@ -796,12 +798,14 @@ except Stop:
     pass
 finally:
     sys.exit = real_exit
+# 加载器已整体收进入口函数，dec 不再是模块属性——从活动对象里找。
+import gc
 dec = None
-for v in list(ns.values()):
-    code = getattr(v, '__code__', None)
-    if code is not None and code.co_name.startswith('_') \\
-            and '_getframe' in code.co_names:
-        dec = v
+for obj in gc.get_objects():
+    code = getattr(obj, '__code__', None)
+    if code is not None and '_getframe' in code.co_names \\
+            and 'compare_digest' in code.co_names:
+        dec = obj
         break
 assert dec is not None
 try:
@@ -816,6 +820,73 @@ except Exception:
         assert 'integrity' in (proc.stderr or ''), proc.stderr[-400:]
 
     print("  [PASS] dec 调用方身份通过")
+    return True
+
+
+def test_loader_namespace_minimized():
+    """OBF-2k A13 回归：加载器整体收进入口函数后，import/exec 完成时
+    模块命名空间不再暴露 8 片段整数串、分段表、明文字符串表"""
+    print("[测试105k] 加载器命名空间最小化")
+
+    with tempfile.TemporaryDirectory() as folder:
+        project_json = make_project({
+            "hat": block("event_whenflagclicked", None, None, top_level=True),
+        }, name="NsSprite")
+        project_json["targets"].insert(0, _stage_target())
+        sb3 = _write_sb3(folder, project_json)
+        output = os.path.join(folder, "protected.py")
+        obfuscate_sb3(sb3, output, embed_assets=True, seed=17)
+
+        probe = os.path.join(folder, "probe.py")
+        with open(probe, "w", encoding="utf-8") as handle:
+            handle.write('''import os, re, sys, types
+os.environ['SDL_VIDEODRIVER'] = 'dummy'
+os.environ['SDL_AUDIODRIVER'] = 'dummy'
+sys.argv = ['probe', '--headless', '--frames', '1', '--no-audio']
+real_exit = sys.exit
+sys.exit = lambda *a: None          # 让入口函数正常返回并执行 del
+src = open(%r, encoding='utf-8').read()
+ns = {'__name__': 'probe', '__file__': %r}
+try:
+    exec(compile(src, %r, 'exec'), ns)
+finally:
+    sys.exit = real_exit
+
+funcs = [v for v in ns.values() if isinstance(v, types.FunctionType)]
+assert not funcs, f'入口函数未从命名空间移除: {len(funcs)}'
+
+runs, run = [], []
+for value in ns.values():
+    if isinstance(value, int) and not isinstance(value, bool):
+        run.append(value)
+    else:
+        if len(run) >= 8:
+            runs.append(run)
+        run = []
+assert not runs, '命名空间仍存在 8 片段整数串'
+
+for value in ns.values():
+    if isinstance(value, (list, tuple)) and len(value) >= 3:
+        rows = [r for r in value[:3]
+                if isinstance(r, (list, tuple)) and len(r) == 4
+                and isinstance(r[0], str)
+                and re.fullmatch(r'[0-9a-f]{16,64}', r[0] or 'x')
+                and isinstance(r[1], (bytes, bytearray))
+                and isinstance(r[2], (bytes, bytearray))]
+        assert len(rows) < 3, '命名空间仍存在分段表'
+
+long_strs = [v for v in ns.values()
+             if isinstance(v, list) and len(v) > 100
+             and all(isinstance(x, str) for x in v)]
+assert not long_strs, '命名空间仍存在明文字符串表'
+''' % (output, output, output))
+        proc = subprocess.run(
+            [sys.executable, probe], capture_output=True, text=True,
+            timeout=180, stdin=subprocess.DEVNULL,
+            env={**os.environ, "SDL_VIDEODRIVER": "dummy"})
+        assert proc.returncode == 0, (proc.stdout or '') + (proc.stderr or '')
+
+    print("  [PASS] 加载器命名空间最小化通过")
     return True
 
 
@@ -907,4 +978,5 @@ TESTS = [
     test_recipe_derivation_order,
     test_dec_caller_identity,
     test_decoy_structure_perturbed,
+    test_loader_namespace_minimized,
 ]

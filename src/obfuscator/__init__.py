@@ -35,7 +35,7 @@ from .folding import fold_project
 from .foreign_names import collect_foreign_method_names
 from .payload import build_payload, compile_module, loader_source
 
-__version__ = "2.8.0"
+__version__ = "2.9.0"
 
 
 class ObfuscationError(Exception):

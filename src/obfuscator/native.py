@@ -8,12 +8,15 @@
       main.py            纯 Python 壳（import core）
       core.cpXXX-xxx.pyd 原生扩展：解密 + 许可证绑定 + exec 全在原生代码里
 
-字节码级工具（marshal dump / pycdc / exec hook）对原生扩展完全失效，
-只能上 IDA/Ghidra 级逆向。构建失败给出清晰提示并建议回退 Tier 1。
+字节码级工具（marshal dump / pycdc / exec hook）对原生扩展失效；
+反编译主 init 函数有实际摩擦。但 native 不等于加密：Cython 压缩字符串
+表、片段编码、运行期 import 后的内存状态都是可提取的数据（见
+docs/obfuscator-hardening.md §15）。数据保密需配合 --license-file
+（机器指纹不出分发物）或服务端授权。
 
 注意：native 模式下 loader 的调用栈指纹校验被禁用（Cython 代码的
-co_filename 是编译期 .pyx 路径，指纹语义不适用）——原生编译本身
-提供更强的保护。
+co_filename 是编译期 .pyx 路径，指纹语义不适用）；loader 整体收进
+单一入口函数，模块命名空间在启动后不再暴露片段/分段表/字符串表。
 """
 
 from __future__ import annotations

@@ -452,6 +452,11 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     add(f"{n_h256} = getattr({n_hash}, {H('sha256')})")
     add(f"{n_cf} = False")
     add(f"{n_bind} = b''")
+    # 命名空间最小化：这些名字由 _boot 赋值、由 _clh/_alh/_pt 读取，
+    # 先在外层入口函数中占位（nonlocal 绑定），使数据成为闭包局部变量
+    # 而不是模块属性（A13：import 后 vars(core) 不再暴露）。
+    add(f"{n_L} = {n_sk} = {n_sp} = {n_pd2} = {n_ns} = "
+        f"{n_mainc} = {n_md} = None")
     if self_hash:
         ph_index = len(L)
     add()
@@ -572,7 +577,7 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     add("    except Exception:")
     add("        pass")
     add(f"def {n_cr}():")
-    add(f"    global {n_cf}")
+    add(f"    nonlocal {n_cf}")
     add(f"    {n_cf} = True")
     add(f"    {n_k}[{rec.corrupt_idx}] ^= 0x{rec.corrupt_xor:X}")
     add(f"    {n_dbg}()")
@@ -692,7 +697,7 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     v_ks = name('v')
     v_pl = name('v')
     add(f"def {n_dec}({p_sid}, {p_prev}):")
-    add(f"    global {n_cf}")
+    add(f"    nonlocal {n_cf}")
     if frame_check:
         # 调用方校验按**代码对象身份**（不是名字）：只允许 _boot/_clh/_alh
         # 三个已知函数的 code object。截断重编译或尾部追加的代码即使
@@ -737,7 +742,7 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     amap_literal = ', '.join(
         f'{aname!r}: {sidhex!r}' for aname, sidhex in asset_map.items())
     add(f"def {n_boot}():")
-    add(f"    global {n_L}, {n_sk}, {n_sp}, {n_pd2}, {n_ns}, "
+    add(f"    nonlocal {n_L}, {n_sk}, {n_sp}, {n_pd2}, {n_ns}, "
         f"{n_mainc}, {n_md}")
     add(f"    {n_L} = []")
     add(f"    {n_sk} = {kdf_expr(kroot_expr, str_sid_lit)}")
@@ -898,19 +903,33 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     add(f"        {n_dbg}()")
     add("    raise")
 
-    # ---- ph 行插入：全部源码（除本行）+ binding 盐参与 n_schk 哈希 ----
+    # ---- 命名空间最小化 + ph 行插入 ----
+    # 整个加载器收进单一入口函数，模块级只剩 def/<call>/del。A13 在
+    # import 后扫描 vars(core) 的手法不再命中：8 片段、分段表、明文字符串
+    # 表都是入口函数的局部（闭包）变量，不是模块属性。
+    entry_name = name('e')
+    if self_hash:
+        # 占位行同样带 #obf-ichk：生成端与运行端都把它排除出哈希
+        L.insert(ph_index, "__PH_LINE__  #obf-ichk")
+    body: List[str] = [f"def {entry_name}():"]
+    for line in L:
+        body.append(("    " + line) if line else "")
+    body.append(f"{entry_name}()")
+    body.append(f"del {entry_name}")
+
+    # ---- ph：全部源码（除本行）+ binding 盐参与 n_schk 哈希 ----
     # 生成端与运行端以相同规则过滤 #obf-ichk 行后求哈希；盐值
     # （许可证 binding，含机器指纹）只用于生成端计算 ph，不写入文件
     if self_hash:
-        ph_line = f"{n_ph} = None  #obf-ichk"
-        lines = L[:ph_index] + [ph_line] + L[ph_index:]
         filtered = '\n'.join(
-            x for x in lines if '#obf-ichk' not in x) + '\n'
+            x for x in body if '#obf-ichk' not in x) + '\n'
         ph = _hash_fn(rec.hash_name)(
             filtered.encode('utf-8') + selfcheck_salt).digest()
-        L[:] = (L[:ph_index]
-                + [f"{n_ph} = {ph!r}  #obf-ichk"] + L[ph_index:])
-    return "\n".join(L) + "\n"
+        for index, line in enumerate(body):
+            if '__PH_LINE__' in line:
+                body[index] = f"    {n_ph} = {ph!r}  #obf-ichk"
+                break
+    return "\n".join(body) + "\n"
 
 
 def compile_module(tree, seed=None):

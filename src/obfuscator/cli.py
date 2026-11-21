@@ -64,6 +64,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.native:
         print("分发内容: main.py + 原生扩展（已剥离调试信息，"
               "字节码级工具无效）")
+        if not args.license_file:
+            print("警告: native 无许可证时密钥材料仍以数据形式存在于扩展中"
+                  "——压缩字符串表与片段编码可被提取，import 后也可能被"
+                  "运行时 dump。native 本身不等于加密；数据保密需配合 "
+                  "--license-file（指纹不出分发物）或服务端授权。")
     if args.license_file:
         print("许可证绑定: 已启用（指纹不在分发物中，离线复算密钥不可行；"
               "产物只能在 --license-fp 对应的机器上运行）")
