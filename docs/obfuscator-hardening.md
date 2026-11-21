@@ -729,6 +729,26 @@ v2.4 的反击：**消灭可解析的固定形状本身**。
 （`HOOKS []`）；GC 中 100+ 字符串容器均为 pygame 内部表，不含业务
 标记（`TABLES_WITH_MARKER []`）。
 
+### 16.7 v3.2（0.14.2 / 3.2.0）F-21/F-22 收口
+
+- **F-22（Medium）启动明文窗口**：去掉 `n_L = []` + 逐条 `append(str)`。
+  boot 把每个解密出的 UTF-8 **字节**直接加密写入 Vault（`add(raw)`），
+  全程没有 `list[str]`；2 ms GC 轮询不再能抓到 1,147/1,140 条明文
+  （OBF-2m 回归）。
+- **F-17 外部取表**：Vault `__getitem__` 增加调用方 code object 白名单
+  （`allow_tree` 在 stage1/簇 exec 前登记全部嵌套 code object）。
+  外部线程/脚本拿到 Vault 后调用返回 `''`（实测 1260 次全部 `''`）。
+  **native 不启用该守卫**（Cython 帧语义不同，且 C 层攻击本就绕过）；
+  C 层 `PyObject_GetItem` 仍可能取到明文，这是客户端残余边界。
+- **F-21（Medium）`marshal.loads` 截获串表**：字符串表改为自定义
+  `[count][len][bytes]` 二进制格式，不再经过 marshal；包装
+  `marshal.loads` 只能看到主载荷/簇 code object，不再看到
+  `list[1140]` 串表密文。code object 仍经 marshal（P1 native codegen
+  才能根治），文档不宣称已关闭。
+- **fail-closed**：标签不符立即返回空（去掉压缩后，错误密钥可能
+  marshal 出“可执行”垃圾并进入主循环/挂起；现在 boot 快速失败）。
+- **F-18/F-19/C 层 hook**：仍未修复，按 §16.5 边界如实记录。
+
 Tier 1+Tier 2 能给到的是“**未适配脚本失效 + 适配成本显著上升 + 离线/
 错机门禁**”，不是“不可还原”。内容级保密仍需要外部密钥或服务端授权
 （当前不做 Tier 3）。

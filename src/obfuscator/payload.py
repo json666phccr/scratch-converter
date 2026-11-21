@@ -286,7 +286,9 @@ def build_payload(stage1_code, cluster_sources: List[str],
         return recipe.prev_digest(plain)
 
     # 链条：K_root -> str -> main -> {簇, 资产}
-    str_plain = marshal.dumps(_encode_chain(
+    # 字符串表用自定义长度前缀格式，不经过 marshal（F-21：包装
+    # marshal.loads 不再能看到 list[1140] 的串表密文）。
+    str_plain = _pack_entries(_encode_chain(
         recipe, str_entries, recipe.str_key(kroot)))
     digest_str = encrypt(recipe.str_sid, str_plain, kroot)
     digest_main = encrypt(recipe.main_sid,
@@ -328,6 +330,15 @@ def _encode_chain(recipe: Recipe, str_entries: List[str],
         entry_cts.append(_xor(raw, recipe.keystream(seed, len(raw))))
         chain = recipe.chain_digest(raw)
     return entry_cts
+
+
+def _pack_entries(entries: List[bytes]) -> bytes:
+    """字符串表专用二进制格式：[4B count] + N * ([4B len][bytes])。"""
+    out = bytearray(len(entries).to_bytes(4, 'big'))
+    for entry in entries:
+        out += len(entry).to_bytes(4, 'big')
+        out += entry
+    return bytes(out)
 
 
 def _chunks(data: bytes, size: int = 2048) -> List[str]:
@@ -826,6 +837,9 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     add(f"        {n_cf} = True")
     add(f"        {n_dbg}()")
     add(f"        {v_k2}[{rec.flip_idx}] ^= 0x{rec.flip_xor:X}")
+    # fail-closed：去掉压缩后，错误密钥可能仍能 marshal 出"可执行"的
+    # 垃圾对象并进入主循环；标签不符必须立即返回空，让 boot 快速失败。
+    add("        return b''")
     if rec.ks_seed_order == 0:
         ks_input = f"bytes({v_k2}) + {v_sa}"
     else:
@@ -841,6 +855,9 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     v_raw = name('v')
     v_prev = name('v')
     v_ect = name('v')
+    v_cnt = name('v')
+    v_ln = name('v')
+    v_ix = name('v')
     kroot_expr = f"bytes({n_k})"
     str_sid_lit = repr(str_sid_hex)
     adir = (asset_dir + '_v') if embed_assets else asset_dir
@@ -854,23 +871,42 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     # XOR 后拼进单一 bytes blob（bytes 不被 gc 跟踪），按索引现场解密；
     # 构造时立刻把传入列表的条目覆盖为空串。攻击者先 copy 引用也拿不到
     # 一份 1k 条的明文列表；要重建必须逐个调用 __getitem__。
+    # F-22：启动期不再构造 list[str] 明文窗口。boot 逐条把解密出的
+    # UTF-8 字节直接加密写入 Vault；全程没有明文串列表可被 5ms GC 轮询
+    # 抓到。F-17/F-18：__getitem__ 只接受已登记的 code object 调用，
+    # 外部（含 C 层 hook 拿到 Vault 后）调用返回空串。
     add(f"class {n_vault}:")
-    add("    __slots__ = ('b', 'o', 'k')")
-    add("    def __init__(self, items, key):")
-    add("        blob = bytearray()")
-    add("        offs = []")
-    add("        for s in items:")
-    add("            raw = s.encode('utf-8')")
-    add("            enc = bytes(c ^ key[i % len(key)]")
-    add("                        for i, c in enumerate(raw))")
-    add("            offs.append((len(blob), len(raw)))")
-    add("            blob += enc")
-    add("        self.b = bytes(blob)")
-    add("        self.o = tuple(offs)")
+    add("    __slots__ = ('b', 'o', 'k', 'a')")
+    add("    def __init__(self, key):")
+    add("        self.b = bytearray()")
+    add("        self.o = []")
     add("        self.k = bytes(key)")
-    add("        for i in range(len(items)):")
-    add("            items[i] = ''")
+    add("        self.a = set()")
+    add("    def add(self, raw):")
+    add("        enc = bytes(c ^ self.k[i % len(self.k)]")
+    add("                    for i, c in enumerate(raw))")
+    add("        self.o.append((len(self.b), len(raw)))")
+    add("        self.b += enc")
+    add("    def finish(self):")
+    add("        self.b = bytes(self.b)")
+    add("        self.o = tuple(self.o)")
+    add("    def allow_tree(self, code):")
+    add("        stack = [code]")
+    add("        while stack:")
+    add("            c = stack.pop()")
+    add("            if c in self.a:")
+    add("                continue")
+    add("            self.a.add(c)")
+    add("            for k in c.co_consts:")
+    add("                if hasattr(k, 'co_code'):")
+    add("                    stack.append(k)")
     add("    def __getitem__(self, idx):")
+    # native 下 Cython 帧语义不同，且 C 层攻击本就绕过此守卫；
+    # 纯 Python 保留调用方 code object 白名单（F-17 外部调用阻断）。
+    if frame_check:
+        add(f"        fr = {n_sys}._getframe(1)")
+        add("        if fr is None or fr.f_code not in self.a:")
+        add("            return ''")
     add("        start, n = self.o[idx]")
     add("        data = self.b[start:start + n]")
     add("        return bytes(c ^ self.k[i % len(self.k)]")
@@ -884,11 +920,18 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     add(f"def {n_boot}():")
     add(f"    nonlocal {n_L}, {n_sk}, {n_sp}, {n_pd2}, {n_ns}, "
         f"{n_mainc}, {n_md}")
-    add(f"    {n_L} = []")
     add(f"    {n_sk} = {kdf_expr(kroot_expr, str_sid_lit)}")
+    add(f"    {n_L} = {n_vault}({n_sk})")
     add(f"    {n_sp} = {n_dec}({str_sid_lit}, {kroot_expr})")
     add(f"    {v_prev} = b''")
-    add(f"    for {v_ect} in {n_mar}.loads({n_sp}):")
+    add(f"    {v_cnt} = int.from_bytes({n_sp}[0:4], {H('big')})")
+    add(f"    {v_ix} = 4")
+    add(f"    for _ in range({v_cnt}):")
+    add(f"        {v_ln} = int.from_bytes("
+        f"{n_sp}[{v_ix}:{v_ix} + 4], {H('big')})")
+    add(f"        {v_ix} += 4")
+    add(f"        {v_ect} = {n_sp}[{v_ix}:{v_ix} + {v_ln}]")
+    add(f"        {v_ix} += {v_ln}")
     if rec.str_ks_order == 0:
         entry_seed = f"{n_sk} + {v_prev}"
     elif rec.str_ks_order == 1:
@@ -899,12 +942,9 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
         entry_seed = f"{v_prev} + {n_sk} + {v_prev}"
     add(f"        {v_raw} = bytes(a ^ b for a, b in zip(")
     add(f"            {v_ect}, {n_ksf}({entry_seed}, len({v_ect}))))")
-    add("        try:")
-    add(f"            {n_L}.append({v_raw}.decode('utf-8'))")
-    add("        except Exception:")
-    add(f"            {n_cr}()")
-    add(f"            {n_L}.append('')")
+    add(f"        {n_L}.add({v_raw})")
     add(f"        {v_prev} = {n_kh}({v_raw}).digest()")
+    add(f"    {n_L}.finish()")
     add(f"    {n_pd2} = {n_hf}({n_sp}).digest()")
     add(f"    {n_ns} = {{")
     add(f"        {H('__name__')}: 'runtime',")
@@ -915,24 +955,27 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
         add(f"        {n_ns}[{H(mod)}] = {n_imp}({H(mod)})")
         add("    except Exception:")
         add(f"        {n_ns}[{H(mod)}] = None")
-    add(f"    {n_ns}[{H(strtable_name)}] = {n_vault}({n_L}, {n_sk})")
-    add(f"    {n_L} = None")
+    add(f"    {n_ns}[{H(strtable_name)}] = {n_L}")
     add(f"    {n_ns}[{H('ASSETS_DIR')}] = {n_os}.path.join(")
     add(f"        {n_os}.path.dirname({n_os}.path.abspath(__file__)), "
         f"{adir!r})")
     add(f"    {n_mp} = {n_dec}({main_sid_hex!r}, {n_pd2})")
     add(f"    {n_mainc} = {n_mar}.loads({n_mp})[{H('c')}]")
     add(f"    {n_md} = {n_hf}({n_mp}).digest()")
+    add(f"    {n_L}.allow_tree({n_mainc})")
     add(f"    {n_ex}({n_mainc}, {n_ns})")
     add()
 
     # ---- 函数簇懒加载 ----
     p_cid = name('p')
     p_g = name('p')
+    v_cc = name('v')
     add(f"{n_csid} = ({', '.join(repr(h) for h in cluster_sid_hexes)},)")
     add(f"def {n_clh}({p_cid}, {p_g}):")
-    add("    " + f"{n_ex}({n_mar}.loads("
-        f"{n_dec}({n_csid}[{p_cid}], {n_md})), {p_g})")
+    add(f"    {v_cc} = {n_mar}.loads("
+        f"{n_dec}({n_csid}[{p_cid}], {n_md}))")
+    add(f"    {n_L}.allow_tree({v_cc})")
+    add(f"    {n_ex}({v_cc}, {p_g})")
     add()
 
     # ---- 资产助手（恒定义：dec 白名单成员）----

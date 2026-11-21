@@ -950,6 +950,68 @@ except Exception:
     return True
 
 
+def test_vault_no_plaintext_window():
+    """OBF-2m F-22 回归：启动期 2ms GC 轮询抓不到 list[str] 明文表
+    （字符串逐条直接加密进 Vault，没有 list[str] 明文窗口）"""
+    print("[测试105m] Vault 启动明文窗口")
+
+    with tempfile.TemporaryDirectory() as folder:
+        project_json = make_project({
+            "hat": block("event_whenflagclicked", "say", None,
+                         top_level=True),
+            "say": block("looks_say", None, "hat",
+                         {"MESSAGE": [1, [10, "TOP SECRET UNIQUE"]]}),
+        }, name="VaultSprite")
+        project_json["targets"].insert(0, _stage_target())
+        sb3 = _write_sb3(folder, project_json)
+        output = os.path.join(folder, "protected.py")
+        obfuscate_sb3(sb3, output, embed_assets=True, seed=41)
+
+        probe = os.path.join(folder, "probe.py")
+        with open(probe, "w", encoding="utf-8") as handle:
+            handle.write('''import gc, os, sys, threading, time
+os.environ['SDL_VIDEODRIVER'] = 'dummy'
+os.environ['SDL_AUDIODRIVER'] = 'dummy'
+sys.argv = ['probe', '--headless', '--frames', '30', '--no-audio']
+marker = 'TOP SECRET UNIQUE'
+plain = []
+stop = False
+
+def poll():
+    while not stop:
+        for obj in gc.get_objects():
+            try:
+                if isinstance(obj, (list, tuple)) and len(obj) > 100 \\
+                        and all(isinstance(x, str) for x in obj):
+                    if any(marker in x for x in obj):
+                        plain.append(len(obj))
+            except Exception:
+                pass
+        time.sleep(0.002)
+
+thread = threading.Thread(target=poll, daemon=True)
+thread.start()
+src = open(%r, encoding='utf-8').read()
+try:
+    exec(compile(src, %r, 'exec'),
+         {'__name__': 'probe', '__file__': %r})
+except SystemExit:
+    pass
+finally:
+    stop = True
+    thread.join(0.3)
+print('F22', plain[:3])
+''' % (output, output, output))
+        proc = subprocess.run(
+            [sys.executable, probe], capture_output=True, text=True,
+            timeout=180, stdin=subprocess.DEVNULL,
+            env={**os.environ, "SDL_VIDEODRIVER": "dummy"})
+        assert 'F22 []' in (proc.stdout or ''), proc.stdout + proc.stderr
+
+    print("  [PASS] Vault 启动明文窗口通过")
+    return True
+
+
 def test_decoy_structure_perturbed():
     """OBF-2j A12 回归：诱饵簇与真簇不得构成结构克隆对
 
@@ -1040,4 +1102,5 @@ TESTS = [
     test_decoy_structure_perturbed,
     test_loader_namespace_minimized,
     test_loader_antihook,
+    test_vault_no_plaintext_window,
 ]
