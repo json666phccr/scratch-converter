@@ -100,6 +100,8 @@ class Recipe:
     license_payload_b64: Optional[str] = None
     license_sig_b64: Optional[str] = None
     license_expires: Optional[int] = None
+    # 只在生成端使用：把许可证 binding 摘要作为自校验盐（不落盘）
+    license_bind: Optional[bytes] = None
 
     # ---- 生成端密码学 ----
     def kroot(self) -> bytes:
@@ -180,21 +182,26 @@ def make_recipe(rng: random.Random, cluster_count: int,
                 return token
 
     fragments = [rng.getrandbits(64) for _ in range(8)]
-    derived: List[Tuple[int, int, int, int, int, int]] = []
     derived_count = rng.choice((1, 2, 3))
-    # 派生下标唯一且父片段下标更小，保证加载器按序赋值可行
     candidate_idx = list(range(1, 8))
     rng.shuffle(candidate_idx)
+    specs: List[Tuple[int, int, int, int, int, int]] = []
     for idx in candidate_idx[:derived_count]:
         parent = rng.randrange(idx)
         mult = (rng.getrandbits(32) | 1)
         add = rng.getrandbits(48)
         xor_c = rng.getrandbits(16)
         form = rng.randrange(2)
-        derived.append((idx, parent, mult, add, xor_c, form))
+        specs.append((idx, parent, mult, add, xor_c, form))
+    # D10 修复：派生必须按 idx 升序计算（父先于子）。此前按 shuffle 序
+    # 计算而加载器按 index 序发射，子片段先于父处理时两端 K_root 分歧，
+    # 约 12.8% 的种子产物自砖。
+    specs.sort()
+    derived: List[Tuple[int, int, int, int, int, int]] = []
+    for idx, parent, mult, add, xor_c, form in specs:
         base = (fragments[parent] ^ xor_c) if form else fragments[parent]
         fragments[idx] = (base * mult + add) & _MASK64
-    derived.sort()
+        derived.append((idx, parent, mult, add, xor_c, form))
 
     return Recipe(
         hash_name=rng.choice(_HASHES),
@@ -250,6 +257,7 @@ def build_payload(stage1_code, cluster_sources: List[str],
         recipe.license_payload_b64 = base64.b64encode(
             payload_bytes).decode('ascii')
         recipe.license_sig_b64 = base64.b64encode(sig_bytes).decode('ascii')
+        recipe.license_bind = binding
         try:
             import json
             data = json.loads(payload_bytes.decode('utf-8'))
@@ -347,7 +355,8 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
                   asset_helper: str, embed_assets: bool,
                   asset_dir: str = 'assets', seed=None,
                   frame_check: bool = True,
-                  self_hash: bool = True) -> str:
+                  self_hash: bool = True,
+                  selfcheck_salt: bytes = b'') -> str:
     rng = random.Random(seed)
     rec = spec.recipe
     used: set = set()
@@ -417,6 +426,8 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     n_tx = name('t')
     n_schk = name('k')
     n_dbg = name('g')
+    n_boot = name('b')
+    n_bind = name('b')
     frag_names = [name('f') for _ in rec.fragments]
 
     str_sid_hex = _sid_hex(rec.str_sid)
@@ -454,6 +465,7 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     add(f"{n_kh} = getattr({n_hash}, {H(rec.ks_hash_name)})")
     add(f"{n_h256} = getattr({n_hash}, {H('sha256')})")
     add(f"{n_cf} = False")
+    add(f"{n_bind} = b''")
     if self_hash:
         ph_index = len(L)
     add()
@@ -519,8 +531,9 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
         # 指纹哈希固定 sha256，与签发端 license.machine_fingerprint 一致
         add(f"    return {n_h256}(b'|'.join({v_parts})).digest()")
         add(f"{n_fpv} = {n_fpf}()")
+        add(f"{n_bind} = {n_hf}({n_lpb} + {n_lsb} + {n_fpv}).digest()")
         add(f"{n_k} = bytearray({n_hf}(bytes({n_k}) + "
-            f"{n_hf}({n_lpb} + {n_lsb} + {n_fpv}).digest()).digest())")
+            f"{n_bind}).digest())")
         if rec.license_expires is not None:
             add(f"if {n_imp}({H('time')}).time() > "
                 f"{rec.license_expires}:")
@@ -583,11 +596,11 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     add(f"    {n_cr}()")
     add()
 
-    # ---- 源码完整性自校验（覆盖到 EOF）----
-    # ph 行（含 #obf-ichk 标记）之外的全部加载器源码——包括分段表、dec、
-    # 调用点、周期探针与入口——参与哈希。启动与周期探针双重校验：
-    # 追加/删行/改行任一变化 -> Silent Corrupt（重算哈希可绕，Tier 1 边界，
-    # 但每次 patch 都需要理解机制并重算）
+    # ---- 源码完整性自校验（覆盖到 EOF，哈希与许可证 binding 耦合）----
+    # ph 行之外的**全部**源码参与哈希；且哈希输入追加 n_bind：
+    # 许可证产物下 n_bind 含机器指纹（不在分发物中），攻击者无法重算 ph
+    # ——追加/删行/改行即 Silent Corrupt，重算哈希在无 fp 时不可行。
+    # 无许可证产物 n_bind = b''（Tier 1 边界：可重算，如实文档化）。
     if self_hash:
         add(f"def {n_schk}():")
         add("    try:")
@@ -597,8 +610,8 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
             f".replace('\\r', '\\n')")
         add(f"        {n_tx} = '\\n'.join(x for x in {n_tx}.split('\\n') "
             f"if {H('#obf-ichk')} not in x)")
-        add(f"        if {n_hf}({n_tx}.encode({H('utf-8')})).digest() "
-            f"!= {n_ph}:")
+        add(f"        if {n_hf}({n_tx}.encode({H('utf-8')}) + {n_bind})"
+            f".digest() != {n_ph}:")
         add(f"            {n_cr}()")
         add("    except Exception:")
         add(f"        {n_cr}()")
@@ -695,13 +708,14 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     add(f"def {n_dec}({p_sid}, {p_prev}):")
     add(f"    global {n_cf}")
     if frame_check:
-        # 调用方校验双重：源文件 + 函数名白名单（模块帧/clh/alh）——
-        # 同文件追加的钩子代码 co_name 不在白名单内，直接腐蚀
+        # 调用方校验按**代码对象身份**（不是名字）：只允许 _boot/_clh/_alh
+        # 三个已知函数的 code object。截断重编译或尾部追加的代码即使
+        # co_name 恰为 '<module>'，其 code 对象也不在白名单内 -> 腐蚀。
         add(f"    {v_fr} = {n_sys}._getframe(1)")
-        add(f"    if {v_fr} is None or " +
-            f"{n_os}.path.abspath(__file__) != "
-            f"{v_fr}.f_code.co_filename or {v_fr}.f_code.co_name "
-            f"not in ({H('<module>')}, {H(n_clh)}, {H(n_alh)}):")
+        add(f"    if {v_fr} is None or (")
+        add(f"            {v_fr}.f_code is not {n_boot}.__code__ and")
+        add(f"            {v_fr}.f_code is not {n_clh}.__code__ and")
+        add(f"            {v_fr}.f_code is not {n_alh}.__code__):")
         add(f"        {n_cr}()")
     add(f"    {v_sa}, {v_tg}, {v_pt} = {n_segs}[{p_sid}]")
     add(f"    {v_ct} = getattr({n_b85}, {H(dec_attr)})"
@@ -722,17 +736,28 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     add(f"    return getattr({n_comp}, {H('decompress')})({v_pl})")
     add()
 
-    # ---- 字符串表（链式解码，一次性展开）----
+    # ---- 启动函数：字符串表 + 命名空间 + 主程序 ----
+    # dec 的调用方身份白名单成员之一。把全部解密调用收进已知函数后，
+    # 攻击者从自己的代码调用 dec 一律被拒（身份而非名字）。
     v_raw = name('v')
     v_prev = name('v')
     v_ect = name('v')
     kroot_expr = f"bytes({n_k})"
     str_sid_lit = repr(str_sid_hex)
-    add(f"{n_L} = []")
-    add(f"{n_sk} = {kdf_expr(kroot_expr, str_sid_lit)}")
-    add(f"{n_sp} = {n_dec}({str_sid_lit}, {kroot_expr})")
-    add(f"{v_prev} = b''")
-    add(f"for {v_ect} in {n_mar}.loads({n_sp}):")
+    adir = (asset_dir + '_v') if embed_assets else asset_dir
+    asset_map = {aname: _sid_hex(sid)
+                 for aname, sid in rec.asset_sids.items()} \
+        if embed_assets else {}
+    amap_literal = ', '.join(
+        f'{aname!r}: {sidhex!r}' for aname, sidhex in asset_map.items())
+    add(f"def {n_boot}():")
+    add(f"    global {n_L}, {n_sk}, {n_sp}, {n_pd2}, {n_ns}, "
+        f"{n_mainc}, {n_md}")
+    add(f"    {n_L} = []")
+    add(f"    {n_sk} = {kdf_expr(kroot_expr, str_sid_lit)}")
+    add(f"    {n_sp} = {n_dec}({str_sid_lit}, {kroot_expr})")
+    add(f"    {v_prev} = b''")
+    add(f"    for {v_ect} in {n_mar}.loads({n_sp}):")
     if rec.str_ks_order == 0:
         entry_seed = f"{n_sk} + {v_prev}"
     elif rec.str_ks_order == 1:
@@ -741,28 +766,32 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
         entry_seed = f"{n_sk} + {v_prev} + {n_sk}"
     else:
         entry_seed = f"{v_prev} + {n_sk} + {v_prev}"
-    add(f"    {v_raw} = bytes(a ^ b for a, b in zip(")
-    add(f"        {v_ect}, {n_ksf}({entry_seed}, len({v_ect}))))")
-    add("    try:")
-    add(f"        {n_L}.append({v_raw}.decode('utf-8'))")
-    add("    except Exception:")
-    add(f"        {n_cr}()")
-    add(f"        {n_L}.append('')")
-    add(f"    {v_prev} = {n_kh}({v_raw}).digest()")
-    add(f"{n_pd2} = {n_hf}({n_sp}).digest()")
-    add()
-
-    # ---- 命名空间与模块注入 ----
-    add(f"{n_ns} = {{")
-    add(f"    {H('__name__')}: 'runtime',")
-    add(f"    {H('__file__')}: {n_os}.path.abspath(__file__),")
-    add("}")
+    add(f"        {v_raw} = bytes(a ^ b for a, b in zip(")
+    add(f"            {v_ect}, {n_ksf}({entry_seed}, len({v_ect}))))")
+    add("        try:")
+    add(f"            {n_L}.append({v_raw}.decode('utf-8'))")
+    add("        except Exception:")
+    add(f"            {n_cr}()")
+    add(f"            {n_L}.append('')")
+    add(f"        {v_prev} = {n_kh}({v_raw}).digest()")
+    add(f"    {n_pd2} = {n_hf}({n_sp}).digest()")
+    add(f"    {n_ns} = {{")
+    add(f"        {H('__name__')}: 'runtime',")
+    add(f"        {H('__file__')}: {n_os}.path.abspath(__file__),")
+    add("    }")
     for mod in _INJECTED_MODULES:
-        add("try:")
-        add(f"    {n_ns}[{H(mod)}] = {n_imp}({H(mod)})")
-        add("except Exception:")
-        add(f"    {n_ns}[{H(mod)}] = None")
-    add(f"{n_ns}[{H(strtable_name)}] = tuple({n_L})")
+        add("    try:")
+        add(f"        {n_ns}[{H(mod)}] = {n_imp}({H(mod)})")
+        add("    except Exception:")
+        add(f"        {n_ns}[{H(mod)}] = None")
+    add(f"    {n_ns}[{H(strtable_name)}] = tuple({n_L})")
+    add(f"    {n_ns}[{H('ASSETS_DIR')}] = {n_os}.path.join(")
+    add(f"        {n_os}.path.dirname({n_os}.path.abspath(__file__)), "
+        f"{adir!r})")
+    add(f"    {n_mp} = {n_dec}({main_sid_hex!r}, {n_pd2})")
+    add(f"    {n_mainc} = {n_mar}.loads({n_mp})[{H('c')}]")
+    add(f"    {n_md} = {n_hf}({n_mp}).digest()")
+    add(f"    {n_ex}({n_mainc}, {n_ns})")
     add()
 
     # ---- 函数簇懒加载 ----
@@ -772,36 +801,29 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     add(f"def {n_clh}({p_cid}, {p_g}):")
     add("    " + f"{n_ex}({n_mar}.loads("
         f"{n_dec}({n_csid}[{p_cid}], {n_md})), {p_g})")
-    add(f"{n_ns}[{H(cluster_helper)}] = {n_clh}")
     add()
 
-    # ---- 主程序 ----
-    add(f"{n_mp} = {n_dec}({main_sid_hex!r}, {n_pd2})")
-    add(f"{n_mainc} = {n_mar}.loads({n_mp})[{H('c')}]")
-    add(f"{n_md} = {n_hf}({n_mp}).digest()")
-    add(f"{n_ex}({n_mainc}, {n_ns})")
+    # ---- 资产助手（恒定义：dec 白名单成员）----
+    p_bn = name('p')
+    v_d = name('v')
+    add(f"{n_amap} = {{{amap_literal}}}")
+    add(f"{n_acache} = {{}}")
+    add(f"def {n_alh}({p_bn}):")
+    add(f"    {v_d} = {n_acache}.get({p_bn})")
+    add(f"    if {v_d} is None:")
+    add(f"        {v_d} = {n_dec}({n_amap}[{p_bn}], {n_md})")
+    add(f"        {n_acache}[{p_bn}] = {v_d}")
+    add(f"    return {v_d}")
+    add()
+
+    # ---- 启动 ----
+    add(f"{n_boot}()")
+    add(f"{n_ns}[{H(cluster_helper)}] = {n_clh}")
+    add(f"{n_ns}[{H(asset_helper)}] = {n_alh}")
     add()
 
     # ---- 资产：内嵌虚拟 FS / 外部目录 ----
     if embed_assets:
-        asset_map = {aname: _sid_hex(sid)
-                     for aname, sid in rec.asset_sids.items()}
-        amap_literal = ', '.join(
-            f'{name!r}: {sidhex!r}' for name, sidhex in asset_map.items())
-        add(f"{n_vdir} = {n_os}.path.join({n_os}.path.dirname(")
-        add(f"    {n_os}.path.abspath(__file__)), {asset_dir + '_v'!r})")
-        add(f"{n_ns}[{H('ASSETS_DIR')}] = {n_vdir}")
-        add(f"{n_amap} = {{{amap_literal}}}")
-        add(f"{n_acache} = {{}}")
-        p_bn = name('p')
-        v_d = name('v')
-        add(f"def {n_alh}({p_bn}):")
-        add(f"    {v_d} = {n_acache}.get({p_bn})")
-        add(f"    if {v_d} is None:")
-        add(f"        {v_d} = {n_dec}({n_amap}[{p_bn}], {n_md})")
-        add(f"        {n_acache}[{p_bn}] = {v_d}")
-        add(f"    return {v_d}")
-        add(f"{n_ns}[{H(asset_helper)}] = {n_alh}")
         add(f"if {n_amap}:")
         add(f"    {n_exw} = {n_os}.path.exists")
         p_p = name('p')
@@ -861,10 +883,6 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
         add("                pass")
         add(f"            return {n_snd0}(*{p_a}, **{p_k})")
         add(f"        {n_pg}.mixer.Sound = _snd")
-    else:
-        add(f"{n_ns}[{H('ASSETS_DIR')}] = {n_os}.path.join(")
-        add(f"    {n_os}.path.dirname({n_os}.path.abspath(__file__)), "
-            f"{asset_dir!r})")
     add()
 
     # ---- 周期性反调试探针 ----
@@ -894,14 +912,16 @@ def loader_source(spec: PayloadSpec, *, main_name: str,
     add(f"        {n_dbg}()")
     add("    raise")
 
-    # ---- ph 行插入：全部源码（除本行）参与 n_schk 哈希 ----
-    # 生成端与运行端以相同规则过滤 #obf-ichk 行后求哈希
+    # ---- ph 行插入：全部源码（除本行）+ binding 盐参与 n_schk 哈希 ----
+    # 生成端与运行端以相同规则过滤 #obf-ichk 行后求哈希；盐值
+    # （许可证 binding，含机器指纹）只用于生成端计算 ph，不写入文件
     if self_hash:
         ph_line = f"{n_ph} = None  #obf-ichk"
         lines = L[:ph_index] + [ph_line] + L[ph_index:]
         filtered = '\n'.join(
             x for x in lines if '#obf-ichk' not in x) + '\n'
-        ph = _hash_fn(rec.hash_name)(filtered.encode('utf-8')).digest()
+        ph = _hash_fn(rec.hash_name)(
+            filtered.encode('utf-8') + selfcheck_salt).digest()
         L[:] = (L[:ph_index]
                 + [f"{n_ph} = {ph!r}  #obf-ichk"] + L[ph_index:])
     return "\n".join(L) + "\n"

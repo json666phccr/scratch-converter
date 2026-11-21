@@ -510,30 +510,32 @@ def _inject_junk(tree: ast.Module, rng: random.Random, used: Set[str]) -> None:
 # ===================== 函数簇拆分 =====================
 
 def _make_decoy_clusters(clusters: List[str], rng: random.Random,
-                         used: Set[str]) -> List[str]:
-    """从真实簇中克隆函数生成诱饵簇（真实形态/真实常量/随机标识符）。
+                         used: Set[str]) -> List[Tuple[str, str]]:
+    """克隆**整个真实簇**生成诱饵，返回 [(源码, 入口函数名)]。
 
-    克隆体内全部标识符统一换新随机名（诱饵永不执行，仅静态形态存在），
-    消除"固定 _dc 前缀 / 硬编码 opcode 常量 / 固定 code object 数"判据。
+    - 整簇克隆 -> code object 数、常量池、字符串表引用与真簇同分布
+      （"固定 9 个对象 / 0 字符串引用"判据失效）；
+    - 入口函数名作为 stage1 trampoline 名，使诱饵导出名出现在
+      stage1 的 co_names/co_consts 中（"零引用"判据失效）；
+    - 全簇标识符统一换新随机名，诱饵永不执行。
     """
     import copy as _copy
 
-    real_defs: List[ast.stmt] = []
+    trees: List[ast.Module] = []
     for source in clusters:
         try:
-            real_defs.extend(ast.parse(source).body)
+            parsed = ast.parse(source)
         except SyntaxError:
             continue
-    funcs = [d for d in real_defs
-             if isinstance(d, (ast.FunctionDef, ast.AsyncFunctionDef,
-                               ast.ClassDef))]
-    if not funcs:
+        if any(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+               for n in parsed.body):
+            trees.append(parsed)
+    if not trees:
         return []
 
-    decoys = []
+    decoys: List[Tuple[str, str]] = []
     for _ in range(rng.randrange(1, 3)):
-        template = rng.choice(funcs)
-        clone = _copy.deepcopy(template)
+        clone = _copy.deepcopy(trees[rng.randrange(len(trees))])
 
         ids: Set[str] = set()
         for n in ast.walk(clone):
@@ -544,7 +546,8 @@ def _make_decoy_clusters(clusters: List[str], rng: random.Random,
             elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
                                 ast.ClassDef)):
                 ids.add(n.name)
-        mapping = {name: _random_name(rng, used) for name in ids}
+        mapping = {name: _random_name(rng, used)
+                   for name in ids if not name.startswith('__')}
 
         for n in ast.walk(clone):
             if isinstance(n, ast.Name) and n.id in mapping:
@@ -554,9 +557,16 @@ def _make_decoy_clusters(clusters: List[str], rng: random.Random,
             elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
                                 ast.ClassDef)) and n.name in mapping:
                 n.name = mapping[n.name]
-        decoys.append("\n\n".join(
-            ast.unparse(item) for item in
-            (clone.body if isinstance(clone, ast.ClassDef) else [clone])))
+            elif isinstance(n, (ast.Global, ast.Nonlocal)):
+                n.names = [mapping.get(x, x) for x in n.names]
+
+        entry = next(
+            (n.name for n in clone.body
+             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))), None)
+        if entry is None:
+            continue
+        decoys.append(("\n\n".join(ast.unparse(item) for item in clone.body),
+                       entry))
     return decoys
 
 
@@ -711,16 +721,15 @@ def obfuscate_module(tree: ast.Module,
     clusters = _split_clusters(
         tree, rng, cluster_helper, mapping.get('main', 'main'))
 
-    # 诱饵簇：克隆真实簇函数（真实形态/常量/随机名）+ 诱饵 trampoline
-    # 注入 stage1（helper(csid 下标) 引用使诱饵 sid 与真簇同样可达）
-    decoy_clusters = _make_decoy_clusters(clusters, rng, used)
+    # 诱饵簇：整簇克隆真簇（同分布）+ 入口名注入 stage1 trampoline
+    # （导出名在 co_names/co_consts 中可见，引用计数判据失效）
+    decoy_pairs = _make_decoy_clusters(clusters, rng, used)
     base = len(clusters)
-    for offset in range(len(decoy_clusters)):
-        tname = _random_name(rng, used)
+    for offset, (_src, entry) in enumerate(decoy_pairs):
         tramp = ast.parse(
-            f"def {tname}(*_a, **_k):\n"
+            f"def {entry}(*_a, **_k):\n"
             f"    {cluster_helper}({base + offset}, globals())\n"
-            f"    return {tname}(*_a, **_k)\n").body[0]
+            f"    return {entry}(*_a, **_k)\n").body[0]
         tree.body.append(tramp)
 
     _flatten_locations(tree)
@@ -732,5 +741,5 @@ def obfuscate_module(tree: ast.Module,
         str_entries=table.entries,
         cluster_helper=cluster_helper,
         clusters=clusters,
-        decoy_clusters=decoy_clusters,
+        decoy_clusters=[src for src, _entry in decoy_pairs],
     )

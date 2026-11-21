@@ -52,7 +52,8 @@ def _export(folder):
 
 
 def _run(sb3_path):
-    return run_project(sb3_path, headless=True, max_seconds=0.6, audio=False)
+    # 1.5s 时间盒：0.6s 在负载下会截断 VM 执行（观察到 95/96/98 随机失败）
+    return run_project(sb3_path, headless=True, max_seconds=1.5, audio=False)
 
 
 def _variable(result, sprite_name, variable_name):

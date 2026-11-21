@@ -35,7 +35,7 @@ from .folding import fold_project
 from .foreign_names import collect_foreign_method_names
 from .payload import build_payload, compile_module, loader_source
 
-__version__ = "2.6.0"
+__version__ = "2.7.0"
 
 
 class ObfuscationError(Exception):
@@ -324,7 +324,8 @@ def obfuscate_sb3(input_path: str,
             asset_dir=asset_dir_name,
             seed=seed,
             frame_check=not native,
-            self_hash=not native)
+            self_hash=not native,
+            selfcheck_salt=spec.recipe.license_bind or b'')
 
         if native:
             from .native import build_native

@@ -737,6 +737,88 @@ def test_obfuscator_tail_patch_resisted():
     return True
 
 
+def test_recipe_derivation_order():
+    """OBF-2h D10 回归：派生片段必须按 index 升序计算（父先于子），
+    否则加载器按序发射时两端 K_root 分歧 -> 产物自砖（约 12.8% 种子）"""
+    print("[测试105h] 派生片段顺序")
+
+    import random as _random
+    from obfuscator.payload import make_recipe
+
+    for seed in range(2000):
+        rec = make_recipe(_random.Random(seed), 5, ['a.svg'])
+        frags = list(rec.fragments)
+        sim = []
+        for idx in range(8):
+            hit = [d for d in rec.derived if d[0] == idx]
+            if not hit:
+                sim.append(frags[idx])
+                continue
+            _, parent, mult, addend, xor_c, form = hit[0]
+            base = (sim[parent] ^ xor_c) if form else sim[parent]
+            sim.append((base * mult + addend) & 0xFFFFFFFFFFFFFFFF)
+        assert sim == frags, f"seed={seed} 派生顺序不一致"
+
+    print("  [PASS] 派生片段顺序通过")
+    return True
+
+
+def test_dec_caller_identity():
+    """OBF-2i 回归：dec 只接受 _boot/_clh/_alh 的 code object 身份，
+    外部代码（含截断重编译的 '<module>' 帧）调用即 Silent Corrupt"""
+    print("[测试105i] dec 调用方身份")
+
+    with tempfile.TemporaryDirectory() as folder:
+        project_json = make_project({
+            "hat": block("event_whenflagclicked", None, None, top_level=True),
+        }, name="CallerSprite")
+        project_json["targets"].insert(0, _stage_target())
+        sb3 = _write_sb3(folder, project_json)
+        output = os.path.join(folder, "protected.py")
+        obfuscate_sb3(sb3, output, embed_assets=True, seed=10)
+
+        probe = os.path.join(folder, "probe.py")
+        with open(probe, "w", encoding="utf-8") as handle:
+            handle.write('''import sys, os
+os.environ['SDL_VIDEODRIVER'] = 'dummy'
+sys.argv = ['probe', '--headless', '--frames', '2', '--no-audio']
+real_exit = sys.exit
+class Stop(Exception):
+    pass
+def fake_exit(code=0):
+    raise Stop()
+sys.exit = fake_exit
+src = open(%r, encoding='utf-8').read()
+ns = {'__name__': 'probe', '__file__': %r}
+try:
+    exec(compile(src, %r, 'exec'), ns)
+except Stop:
+    pass
+finally:
+    sys.exit = real_exit
+dec = None
+for v in list(ns.values()):
+    code = getattr(v, '__code__', None)
+    if code is not None and code.co_name.startswith('_') \\
+            and '_getframe' in code.co_names:
+        dec = v
+        break
+assert dec is not None
+try:
+    dec('00', b'')
+except Exception:
+    pass
+''' % (output, output, output))
+        proc = subprocess.run(
+            [sys.executable, probe], capture_output=True, text=True,
+            timeout=180, stdin=subprocess.DEVNULL,
+            env={**os.environ, "SCRATCH_OBF_DEBUG": "1"})
+        assert 'integrity' in (proc.stderr or ''), proc.stderr[-400:]
+
+    print("  [PASS] dec 调用方身份通过")
+    return True
+
+
 TESTS = [
     test_obfuscator_constant_folding,
     test_obfuscator_end_to_end,
@@ -749,4 +831,6 @@ TESTS = [
     test_license_binding,
     test_native_build,
     test_obfuscator_tail_patch_resisted,
+    test_recipe_derivation_order,
+    test_dec_caller_identity,
 ]

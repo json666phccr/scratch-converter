@@ -67,6 +67,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.license_file:
         print("许可证绑定: 已启用（指纹不在分发物中，离线复算密钥不可行；"
               "产物只能在 --license-fp 对应的机器上运行）")
+    if not args.native and not args.license_file:
+        print("提示: 纯 Python 产物的加载器必然是可读的（Tier 1 边界）——"
+              "静态离线还原无法在纯 Python 内根治。对外分发建议 "
+              "--native（编译层）或配合 --license-file（指纹出文件）。")
     return 0
 
 
