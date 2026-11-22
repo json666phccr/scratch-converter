@@ -231,9 +231,7 @@ class _Emitter:
             if target in ('_random_', '_random_position_'):
                 call('goto_random')
             else:
-                self.warnings.append(
-                    f"未转换“移到 {target}”，ScPython 暂不支持指定目标")
-                out.append(f"{spaces}# TODO goto {target}")
+                call('goto_target', _q(target))
         elif t == BlockType.GLIDE_SECS_TO:
             call('glide', exp(stmt.value), exp(stmt.extra.get('x')),
                  exp(stmt.extra.get('y')))

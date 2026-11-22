@@ -1939,6 +1939,11 @@ class RoleBuilder:
         elif name == 'goto_random':
             stmt = Statement(BlockType.GO_TO_RANDOM)
             stmt.extra['target'] = '_random_'
+        elif name == 'goto_target':
+            self._require_args(args, 1, name)
+            stmt = Statement(BlockType.GO_TO_RANDOM)
+            stmt.extra['target'] = str(
+                self._const_node(self._need(args, 0, name)))
         elif name in ('glide', 'glide_to'):
             self._require_args(args, 3, name)
             stmt = Statement(BlockType.GLIDE_SECS_TO)

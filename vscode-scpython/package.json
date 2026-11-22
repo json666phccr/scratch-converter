@@ -1,0 +1,36 @@
+{
+  "name": "scpython",
+  "displayName": "ScPython",
+  "description": "ScPython (.scpy) 语法高亮：when / init / var / list 等专属关键字",
+  "version": "0.1.0",
+  "publisher": "scratch-converter",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "scpython",
+        "aliases": [
+          "ScPython",
+          "scpython"
+        ],
+        "extensions": [
+          ".scpy"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "scpython",
+        "scopeName": "source.scpython",
+        "path": "./syntaxes/scpython.tmLanguage.json"
+      }
+    ]
+  }
+}

@@ -586,6 +586,7 @@ when green_flag:
     ext("myext", "myext_pick", extension=".mp3", _inputs=[["as", "url"]])
     while not (score > 3):
         score += 1
+    goto_target("B")
     say("A")
 """,
             'units/Bat.scpy': """\
@@ -663,6 +664,9 @@ when green_flag:
         assert ' as=' not in a_source, a_source
         assert 'spin(15)' in a_source
         assert 'spin(30)' in b_source
+        # 移到指定角色不能退化成 TODO
+        assert "goto_target('B')" in a_source, a_source
+        assert '# TODO goto' not in a_source
         # repeat_until 往返不应叠加 not
         assert 'while not (not' not in a_source, a_source
         bat_path = os.path.join(imported, 'units', 'Bat.scpy')
@@ -706,6 +710,12 @@ when green_flag:
         with zipfile.ZipFile(sb3) as archive:
             first_data = json.loads(archive.read('project.json').decode('utf-8'))
         assert _not_count(data) == _not_count(first_data)
+
+        goto_blocks = [
+            block for target in data['targets']
+            for block in (target.get('blocks') or {}).values()
+            if isinstance(block, dict) and block.get('opcode') == 'motion_goto']
+        assert len(goto_blocks) == 1, goto_blocks
 
         sprite_a = targets['A']
         assert sprite_a['currentCostume'] == 1, sprite_a['currentCostume']

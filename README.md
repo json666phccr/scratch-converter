@@ -311,6 +311,7 @@ python converter.py sb32scpy ..\example\scpy_demo.sb3 ..\example\scpy_imported
 - [ScPython 语言指南](docs/scpython.md)
 - [ScPython AI 速查表](docs/scpython-ai-cheatsheet.md)
 - [ScPython 与 Scratch 行为参考](docs/scpython-scratch-behavior.md)
+- [VS Code 语法高亮扩展](vscode-scpython/README.md)（`.scpy` 专属着色；也可一键映射为 Python）
 
 ## SB3 -> 混淆 Python（单向）
 

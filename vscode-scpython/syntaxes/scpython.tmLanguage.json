@@ -1,0 +1,119 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "ScPython",
+  "scopeName": "source.scpython",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#hats" },
+    { "include": "#declarations" },
+    { "include": "#keywords" },
+    { "include": "#numbers" },
+    { "include": "#calls" },
+    { "include": "#operators" },
+    { "include": "#punctuation" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        { "name": "comment.line.number-sign.scpython", "match": "#.*$" }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.scpython",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            { "name": "constant.character.escape.scpython", "match": "\\\\." }
+          ]
+        },
+        {
+          "name": "string.quoted.single.scpython",
+          "begin": "'",
+          "end": "'",
+          "patterns": [
+            { "name": "constant.character.escape.scpython", "match": "\\\\." }
+          ]
+        }
+      ]
+    },
+    "hats": {
+      "patterns": [
+        {
+          "name": "keyword.control.event.scpython",
+          "match": "^\\s*(when|init)\\s*(?=:|$|[A-Za-z_])"
+        },
+        {
+          "name": "entity.name.tag.event.scpython",
+          "match": "(?<=^\\s{0,40}when\\s{1,4})[A-Za-z_]\\w*"
+        },
+        {
+          "name": "keyword.control.special.scpython",
+          "match": "\\b(__hat__|__sprite_init__|__var__|__list__)\\b"
+        }
+      ]
+    },
+    "declarations": {
+      "patterns": [
+        {
+          "name": "storage.type.scpython",
+          "match": "^\\s*(var|list)\\s+"
+        },
+        {
+          "name": "variable.other.property.init.scpython",
+          "match": "^\\s*(costumes|sounds|extensions|name|current_costume|layer_order|x|y|direction|visible|size|rotation_style|draggable|costume_names|sound_names|variable_aliases|list_aliases|macros)\\s*(?==)"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.scpython",
+          "match": "\\b(if|elif|else|while|for|in|break|continue|return|pass|def|and|or|not|is)\\b"
+        },
+        {
+          "name": "constant.language.scpython",
+          "match": "\\b(True|False|None)\\b"
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.scpython",
+          "match": "\\b\\d+(?:\\.\\d+)?\\b"
+        }
+      ]
+    },
+    "calls": {
+      "patterns": [
+        {
+          "name": "support.function.scpython",
+          "match": "\\b[A-Za-z_]\\w*(?=\\s*\\()"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.scpython",
+          "match": "==|!=|<=|>=|\\+=|-=|\\*=|/=|[+\\-*/%<>=]"
+        }
+      ]
+    },
+    "punctuation": {
+      "patterns": [
+        {
+          "name": "punctuation.separator.scpython",
+          "match": "[:,]"
+        },
+        {
+          "name": "punctuation.definition.bracket.scpython",
+          "match": "[()\\[\\]{}]"
+        }
+      ]
+    }
+  }
+}

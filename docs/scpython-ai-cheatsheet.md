@@ -191,8 +191,8 @@ str(x) int(x) float(x) bool(x)
 ```python
 # 运动
 move(10) turn_right(15) turn_left(15)
-goto(x, y) goto_random()
-glide(secs, x, y)
+goto(x, y) goto_random() goto_target("Sprite1")
+glide(secs, x, y) glide_to_target(secs, "Sprite1")
 point_in_direction(90) point_towards("_mouse_")
 set_rotation_style("left-right")
 change_x(n) set_x(n) change_y(n) set_y(n)
