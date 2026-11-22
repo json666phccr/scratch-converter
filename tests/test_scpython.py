@@ -555,8 +555,12 @@ def test_scpython_sb3_import_roundtrip():
             'stage.scpy': """\
 init:
     costumes = ["bg.svg"]
+    extensions = ["myext"]
     var g = 0
 """,
+            'extension_urls.json': json.dumps({
+                'myext': 'https://extensions.turbowarp.org/demo.js',
+            }),
             'A.scpy': """\
 init:
     costumes = ["cat.svg"]
@@ -585,10 +589,19 @@ when green_flag:
 """,
         }, assets={'bg.svg': _BG_SVG, 'cat.svg': _CAT_SVG})
         sb3 = _export(root)
+        with zipfile.ZipFile(sb3) as archive:
+            data = json.loads(archive.read('project.json').decode('utf-8'))
+        assert 'myext' in data.get('extensions', [])
+        assert data.get('extensionURLs', {}).get('myext') == \
+            'https://extensions.turbowarp.org/demo.js', data.get('extensionURLs')
         _patch_sb3_comments(sb3, 'A', '旋转一次', '独立说明')
 
         imported = os.path.join(folder, 'imported')
         import_sb3(sb3, imported, split_macros=True)
+        with open(os.path.join(imported, 'extension_urls.json'),
+                  encoding='utf-8') as handle:
+            urls = json.load(handle)
+        assert urls.get('myext') == 'https://extensions.turbowarp.org/demo.js'
 
         with open(os.path.join(imported, 'macros.scpy'),
                   encoding='utf-8') as handle:
@@ -619,6 +632,8 @@ when green_flag:
         with zipfile.ZipFile(sb3_again) as archive:
             data = json.loads(archive.read('project.json').decode('utf-8'))
         project = parse_scratch_project(data)
+        assert data.get('extensionURLs', {}).get('myext') == \
+            'https://extensions.turbowarp.org/demo.js', data.get('extensionURLs')
         by_name = {sprite.name: sprite for sprite in project.sprites}
         for name in ('A', 'B'):
             proccodes = [stmt.extra.get('proccode')

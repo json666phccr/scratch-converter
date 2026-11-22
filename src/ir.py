@@ -883,6 +883,8 @@ class ProjectIR:
     runtime_options: Dict[str, Any] = field(default_factory=dict)
     # project.json 中声明的扩展 ID（用于按需拼装运行时扩展）
     extensions: Any = field(default_factory=set)
+    # TurboWarp 第三方扩展 ID -> 加载 URL（写回 project.json 的 extensionURLs）
+    extension_urls: Dict[str, str] = field(default_factory=dict)
     # 需要随 .sb3 一起写入的额外资源（文件名 -> 字节内容）
     assets: Dict[str, bytes] = field(default_factory=dict)
 

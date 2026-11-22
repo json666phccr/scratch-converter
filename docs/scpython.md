@@ -57,6 +57,7 @@ my_project/
 ├── Dog.scpy
 ├── macros.scpy             # 可选：宏函数
 ├── extensions.json         # 可选：自定义扩展声明
+├── extension_urls.json     # 可选：TurboWarp 第三方扩展 {ID: URL}
 ├── assets/
 │   ├── cat.svg
 │   ├── dog.png
@@ -710,6 +711,9 @@ sb3_to_scpython("input.sb3", "my_project", split_macros=True)
 
 - 事件帽子、运动/外观/声音/控制/侦测块、变量与列表、自制积木与调用；
 - Scratch 注释：附着在块上的注释放在对应语句前，独立注释放在文件头；
+- 保留 TurboWarp 第三方扩展：`extensionURLs` 写入工程根目录的
+  `extension_urls.json`，导出时回写到 `project.json`，避免 TurboWarp 报
+  `Unknown extension`；
 - 全局变量只在 `stage.scpy` 中声明一次，角色文件不再重复声明；
 - 默认把多个角色中**完全相同**的自制积木抽到 `macros.scpy`；
 - 无法表达的块会写成 `# TODO` 并在命令行给出警告，不会静默丢弃。

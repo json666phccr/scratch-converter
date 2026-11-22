@@ -317,6 +317,9 @@ class ScratchConverter:
 
         # 创建恢复的项目（舞台不参与Python生成，但必须原样保留）
         restored_project = ProjectIR()
+        restored_project.extensions = set(original_ir.extensions or ())
+        restored_project.extension_urls = dict(
+            getattr(original_ir, 'extension_urls', {}) or {})
         if original_ir.stage is not None:
             restored_project.add_sprite(original_ir.stage)
         for s in restored_sprites:

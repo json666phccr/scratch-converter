@@ -271,7 +271,7 @@ class ScratchWriter:
         for name in self._collect_broadcast_names(project):
             stage_target["broadcasts"].setdefault(f"bc_{name}", name)
 
-        return {
+        data = {
             "targets": targets,
             "monitors": [],
             "extensions": self._collect_extension_names(project),
@@ -281,6 +281,14 @@ class ScratchWriter:
                 "agent": ""
             }
         }
+        extension_urls = {
+            str(name): str(url)
+            for name, url in (getattr(project, 'extension_urls', {}) or {}).items()
+            if url
+        }
+        if extension_urls:
+            data["extensionURLs"] = extension_urls
+        return data
 
     def _collect_extension_names(self, project: ProjectIR) -> List[str]:
         """收集TurboWarp/Scratch扩展ID，写回project.json的extensions列表"""

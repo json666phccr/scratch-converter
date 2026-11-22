@@ -2407,6 +2407,22 @@ class ProjectCompiler:
         path = os.path.join(self.project_root, 'macros.scpy')
         return path if os.path.isfile(path) else ''
 
+    def _load_extension_urls(self) -> Dict[str, str]:
+        """读取 TurboWarp 第三方扩展 URL（extension_urls.json）"""
+        path = os.path.join(self.project_root, 'extension_urls.json')
+        if not os.path.isfile(path):
+            return {}
+        try:
+            with open(path, encoding='utf-8') as handle:
+                data = json.load(handle)
+        except (OSError, ValueError) as error:
+            raise ScPythonError(
+                f"extension_urls.json 解析失败: {error}", path=path) from error
+        if not isinstance(data, dict):
+            raise ScPythonError(
+                "extension_urls.json 必须是 {扩展ID: URL} 对象", path=path)
+        return {str(name): str(url) for name, url in data.items() if url}
+
     def find_roles(self, stage_path: str) -> List[Tuple[str, str]]:
         roles = []
         stage_abs = os.path.abspath(stage_path)
@@ -2507,6 +2523,7 @@ class ProjectCompiler:
 
         project = ProjectIR()
         project.extensions = set()
+        project.extension_urls = self._load_extension_urls()
         project.meta = {
             'semver': '3.0.0',
             # 必须是 x.y.z 或 x.y.z-suffix；TurboWarp 会按该正则校验

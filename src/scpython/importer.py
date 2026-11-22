@@ -479,7 +479,8 @@ _RESERVED_INIT = {
 
 
 def _init_lines(sprite, comments: List[str],
-                skip_vars=None, skip_lists=None) -> List[str]:
+                skip_vars=None, skip_lists=None,
+                extensions: Optional[List[str]] = None) -> List[str]:
     skip_vars = skip_vars or set()
     skip_lists = skip_lists or set()
     lines: List[str] = []
@@ -497,6 +498,8 @@ def _init_lines(sprite, comments: List[str],
     sounds = [s for s in sounds if s]
     if sounds:
         body.append(f"sounds = {sounds!r}")
+    if extensions:
+        body.append(f"extensions = {list(extensions)!r}")
     for name, value in (sprite.variables or {}).items():
         if name in skip_vars:
             continue  # 全局变量只在舞台声明一次
@@ -536,8 +539,10 @@ def _sprite_source(sprite, comments: Dict[str, List[str]],
                    standalone: List[str], warnings: List[str],
                    include_procedures: bool = True,
                    exclude_keys=None,
-                   skip_vars=None, skip_lists=None) -> Tuple[str, List[str]]:
-    lines = _init_lines(sprite, standalone, skip_vars, skip_lists)
+                   skip_vars=None, skip_lists=None,
+                   extensions: Optional[List[str]] = None
+                   ) -> Tuple[str, List[str]]:
+    lines = _init_lines(sprite, standalone, skip_vars, skip_lists, extensions)
     emitter = _Emitter(comments, warnings)
     procedures: List[str] = []
     for stmt in sprite.statements:
@@ -602,6 +607,13 @@ def import_sb3(path: str, output_dir: str, *,
                 with open(os.path.join(assets_dir, safe), 'wb') as handle:
                     handle.write(archive.read(name))
 
+        extension_urls = project.extension_urls or {}
+        if extension_urls:
+            with open(os.path.join(output_dir, 'extension_urls.json'),
+                      'w', encoding='utf-8') as handle:
+                json.dump(extension_urls, handle, ensure_ascii=False, indent=2)
+                handle.write('\n')
+
         target_comments: Dict[str, Dict[str, List[str]]] = {}
         standalone: Dict[str, List[str]] = {}
         for target in data.get('targets', []):
@@ -648,6 +660,9 @@ def import_sb3(path: str, output_dir: str, *,
                     macro_texts[key] = text
             duplicated = {key for key, count in counts.items() if count > 1}
 
+        declared_extensions = [str(name) for name in
+                               (data.get('extensions') or []) if name]
+
         for sprite in project.sprites:
             base = 'stage' if sprite.is_stage else _san(sprite.name, 'Sprite')
             filename = 'stage.scpy' if sprite.is_stage else f"{base}.scpy"
@@ -656,7 +671,8 @@ def import_sb3(path: str, output_dir: str, *,
                 sprite, comments, standalone.get(sprite.name, []), warnings,
                 include_procedures=True, exclude_keys=duplicated,
                 skip_vars=global_vars if not sprite.is_stage else None,
-                skip_lists=global_lists if not sprite.is_stage else None)
+                skip_lists=global_lists if not sprite.is_stage else None,
+                extensions=declared_extensions if sprite.is_stage else None)
             with open(os.path.join(output_dir, filename), 'w',
                       encoding='utf-8') as handle:
                 handle.write(src)

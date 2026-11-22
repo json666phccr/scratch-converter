@@ -461,6 +461,11 @@ class ScratchParser:
         """解析整个Scratch项目"""
         project = ProjectIR()
         project.meta = json_data.get('meta', {})
+        # TurboWarp 第三方扩展 URL，供回写 project.json 使用
+        raw_urls = json_data.get('extensionURLs') or {}
+        if isinstance(raw_urls, dict):
+            project.extension_urls = {
+                str(name): str(url) for name, url in raw_urls.items() if url}
         project.monitors = json_data.get('monitors', [])
         self.extensions = set(json_data.get('extensions', []) or [])
         self.unsupported = {}
