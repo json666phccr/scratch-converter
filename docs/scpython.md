@@ -482,7 +482,7 @@ def greet(name="world", *, types="s"):
 
 - 未写 `types` 时，按默认值推断：`True/False` → `b`，数字 → `n`，字符串 → `s`，无默认值 → `s`。
 - 缺省参数值会写入 Scratch 的 `argumentdefaults`；没有默认值的布尔参数为 `false`，其他为 `""`。
-- 用 `return 值` 返回结果，可以当表达式使用：
+- 用 `return 值` 返回结果，可以当表达式使用（依赖 TurboWarp 的 Custom Reporters；导出时自动在 `extensions` 中声明 `procedures_enable_return`，否则 TurboWarp 编辑器会把 return 与包含它的自制积木显示为缺失）：
 
 ```python
 def fact(n, *, types="n", warp=True):

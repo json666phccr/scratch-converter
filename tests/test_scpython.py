@@ -235,6 +235,9 @@ when green_flag:
         assert procedure.extra['proccode'] == 'fact %n'
         assert procedure.extra['arg_types'] == ['n']
         assert procedure.extra['warp'] is True
+        # return 依赖 TurboWarp Custom Reporters，必须声明对应扩展
+        assert 'procedures_enable_return' in data.get('extensions', []), \
+            data.get('extensions')
 
         result = _run(sb3)
         assert not result['errors'], result['errors']
