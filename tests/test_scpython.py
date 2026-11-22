@@ -563,7 +563,10 @@ init:
             }),
             'A.scpy': """\
 init:
-    costumes = ["cat.svg"]
+    costumes = ["cat.svg", "bg.svg"]
+    costume_names = ["猫", "背景图"]
+    current_costume = 1
+    layer_order = 7
 
 def spin(speed, *, types="n", warp=True):
     set_rotation_style("all around")
@@ -573,6 +576,10 @@ when green_flag:
     g += 1
     spin(15)
     say("A")
+""",
+            'Win-Dow.scpy': """\
+init:
+    costumes = ["bg.svg"]
 """,
             'B.scpy': """\
 init:
@@ -618,6 +625,13 @@ when green_flag:
         assert 'def spin' not in b_source
         assert 'spin(15)' in a_source
         assert 'spin(30)' in b_source
+        # 造型名/当前造型/图层顺序/角色名必须保留
+        assert "costume_names = ['猫', '背景图']" in a_source, a_source
+        assert 'current_costume = 1' in a_source
+        assert 'layer_order = 7' in a_source
+        win_source = open(os.path.join(imported, 'Win_Dow.scpy'),
+                          encoding='utf-8').read()
+        assert "name = 'Win-Dow'" in win_source, win_source
         # 注释：附着在 say 前，独立注释在文件头
         assert '# 旋转一次' in a_source, a_source
         assert '# 独立说明' in a_source, a_source
@@ -634,6 +648,12 @@ when green_flag:
         project = parse_scratch_project(data)
         assert data.get('extensionURLs', {}).get('myext') == \
             'https://extensions.turbowarp.org/demo.js', data.get('extensionURLs')
+        targets = {target['name']: target for target in data['targets']}
+        assert 'Win-Dow' in targets, list(targets)
+        sprite_a = targets['A']
+        assert sprite_a['currentCostume'] == 1, sprite_a['currentCostume']
+        assert sprite_a['layerOrder'] == 7, sprite_a['layerOrder']
+        assert [c['name'] for c in sprite_a['costumes']] == ['猫', '背景图']
         by_name = {sprite.name: sprite for sprite in project.sprites}
         for name in ('A', 'B'):
             proccodes = [stmt.extra.get('proccode')

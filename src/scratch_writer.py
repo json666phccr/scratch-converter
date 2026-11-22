@@ -417,6 +417,12 @@ class ScratchWriter:
             bc_id = f"bc_{bc}"
             broadcasts[bc_id] = bc
 
+        costumes = sprite.costumes or []
+        current_costume = int(getattr(sprite, 'current_costume', 0) or 0)
+        if costumes:
+            current_costume = max(0, min(current_costume, len(costumes) - 1))
+        else:
+            current_costume = 0
         result = {
             "isStage": sprite.is_stage,
             "name": sprite.name,
@@ -425,8 +431,8 @@ class ScratchWriter:
             "broadcasts": broadcasts,
             "blocks": blocks,
             "comments": {},
-            "currentCostume": 0,
-            "costumes": sprite.costumes or [],
+            "currentCostume": current_costume,
+            "costumes": costumes,
             "sounds": sprite.sounds or [],
         }
 
@@ -440,7 +446,7 @@ class ScratchWriter:
                 "draggable": sprite.draggable,
                 "rotationStyle": sprite.rotation_style,
                 "volume": 100,
-                "layerOrder": 1,
+                "layerOrder": int(getattr(sprite, 'layer_order', 1) or 1),
             })
         else:
             result.update({

@@ -475,6 +475,7 @@ def _procedure_source(stmt: Statement,
 _RESERVED_INIT = {
     'name', 'costumes', 'sounds', 'extensions', 'x', 'y', 'direction',
     'visible', 'size', 'rotation_style', 'draggable', 'current_costume',
+    'layer_order', 'costume_names', 'sound_names',
 }
 
 
@@ -493,13 +494,23 @@ def _init_lines(sprite, comments: List[str],
     costumes = [c for c in costumes if c]
     if costumes:
         body.append(f"costumes = {costumes!r}")
+        costume_names = [str(c.get('name') or '') for c in sprite.costumes]
+        if any(costume_names):
+            body.append(f"costume_names = {costume_names!r}")
     sounds = [str(s.get('md5ext') or s.get('name') or '')
               for s in (sprite.sounds or [])]
     sounds = [s for s in sounds if s]
     if sounds:
         body.append(f"sounds = {sounds!r}")
+        sound_names = [str(s.get('name') or '') for s in sprite.sounds]
+        if any(sound_names):
+            body.append(f"sound_names = {sound_names!r}")
     if extensions:
         body.append(f"extensions = {list(extensions)!r}")
+    # 文件名经过清洗，必须显式保留原始角色名（脚本按名字引用角色）
+    if not sprite.is_stage:
+        body.append(f"name = {sprite.name!r}")
+    body.append(f"current_costume = {int(sprite.current_costume or 0)}")
     for name, value in (sprite.variables or {}).items():
         if name in skip_vars:
             continue  # 全局变量只在舞台声明一次
@@ -520,6 +531,7 @@ def _init_lines(sprite, comments: List[str],
             body.append(f"list {ident} = {list(value)!r}")
     if not sprite.is_stage:
         body.extend([
+            f"layer_order = {int(getattr(sprite, 'layer_order', 1) or 1)}",
             f"x = {sprite.x}", f"y = {sprite.y}",
             f"direction = {sprite.direction}", f"size = {sprite.size}",
             f"visible = {sprite.visible}",

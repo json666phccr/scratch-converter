@@ -61,7 +61,7 @@ _META_KEYS = {
 
 _PROPERTY_KEYS = {
     'x', 'y', 'direction', 'visible', 'size', 'rotation_style',
-    'draggable', 'current_costume',
+    'draggable', 'current_costume', 'layer_order',
 }
 
 _MATH_FUNCTIONS = {
@@ -322,6 +322,15 @@ class ModuleAnalyzer:
                 raise ScPythonError("name 必须是字符串", path=self.path,
                                     line=node.lineno)
             module.name = text
+            module.meta['name'] = text
+            return
+        if name == 'costume_names':
+            module.meta['costume_names'] = _string_list(
+                value, self.path, 'costume_names')
+            return
+        if name == 'sound_names':
+            module.meta['sound_names'] = _string_list(
+                value, self.path, 'sound_names')
             return
         if name == 'costumes':
             module.costumes = _string_list(value, self.path, 'costumes')
@@ -804,6 +813,7 @@ class RoleBuilder:
         self.sprite.rotation_style = style
         self.sprite.current_costume = int(
             meta.get('current_costume', 0) or 0)
+        self.sprite.layer_order = int(meta.get('layer_order', 1) or 1)
         if self.module.is_stage:
             self.sprite.is_stage = True
 
@@ -900,9 +910,16 @@ class RoleBuilder:
     def _load_costumes(self) -> List[dict]:
         costumes = []
         names = set()
-        for reference in self.module.costumes:
+        explicit = self._explicit_asset_names('costume_names',
+                                              len(self.module.costumes))
+        for index, reference in enumerate(self.module.costumes):
             costume = self.compiler.asset_library.costume(
-                reference, self.module.path)
+                reference, self.module.path,
+                name=explicit[index] if explicit else None)
+            if explicit:
+                # 导入工程需要原样保留造型名（脚本按名字切换造型）
+                costumes.append(costume)
+                continue
             base = costume['name']
             name = base
             suffix = 2
@@ -917,9 +934,15 @@ class RoleBuilder:
     def _load_sounds(self) -> List[dict]:
         sounds = []
         names = set()
-        for reference in self.module.sounds:
+        explicit = self._explicit_asset_names('sound_names',
+                                              len(self.module.sounds))
+        for index, reference in enumerate(self.module.sounds):
             sound = self.compiler.asset_library.sound(
-                reference, self.module.path)
+                reference, self.module.path,
+                name=explicit[index] if explicit else None)
+            if explicit:
+                sounds.append(sound)
+                continue
             base = sound['name']
             name = base
             suffix = 2
@@ -930,6 +953,17 @@ class RoleBuilder:
             sound['name'] = name
             sounds.append(sound)
         return sounds
+
+    def _explicit_asset_names(self, key: str,
+                              count: int) -> Optional[List[str]]:
+        names = self.module.meta.get(key)
+        if not names:
+            return None
+        if len(names) != count:
+            raise ScPythonError(
+                f"{key} 有 {len(names)} 项，但共有 {count} 个资源",
+                path=self.module.path)
+        return [str(name) for name in names]
 
     # ---------- 函数与帽子 ----------
 
@@ -2540,7 +2574,8 @@ class ProjectCompiler:
         for index, (path, name) in enumerate(role_specs, 1):
             rel_path = os.path.relpath(path, self.project_root)
             module = ModuleAnalyzer(path, rel_path, False).analyze()
-            module.name = name
+            # init 中显式写的 name 优先于文件名
+            module.name = module.meta.get('name') or name
             self.merge_macros(module, macros)
             self.declared_extensions.update(module.extensions)
             builder = RoleBuilder(module, index, self)

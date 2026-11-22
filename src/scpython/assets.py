@@ -160,7 +160,8 @@ class AssetLibrary:
         size = image_size(data, extension)
         center_x = size[0] / 2 if size else 0
         center_y = size[1] / 2 if size else 0
-        display = name or os.path.splitext(os.path.basename(path))[0]
+        display = name if name is not None else \
+            os.path.splitext(os.path.basename(path))[0]
         return {
             'name': display,
             'assetId': digest,
@@ -179,7 +180,8 @@ class AssetLibrary:
             rate, samples = _wav_info(data)
         else:
             rate, samples = 44100, 0
-        display = name or os.path.splitext(os.path.basename(path))[0]
+        display = name if name is not None else \
+            os.path.splitext(os.path.basename(path))[0]
         return {
             'name': display,
             'assetId': digest,

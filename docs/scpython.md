@@ -133,7 +133,9 @@ def init():
 | 键 | 类型 | 说明 |
 |----|------|------|
 | `costumes` | 字符串列表 | 造型/背景，按顺序写入，引用 `assets/` 下的文件 |
+| `costume_names` | 字符串列表 | 可选，与 `costumes` 一一对应的造型名（脚本按名字切换造型） |
 | `sounds` | 字符串列表 | 声音，引用 `assets/` 下的文件 |
+| `sound_names` | 字符串列表 | 可选，与 `sounds` 一一对应的声音名 |
 | `extensions` | 字符串列表 | 声明项目用到的扩展，如 `["pen", "music"]` |
 | `name` | 字符串 | 覆盖角色名（舞台默认 `Stage`） |
 | `x` / `y` | 数字 | 角色坐标，默认 0 |
@@ -143,6 +145,7 @@ def init():
 | `rotation_style` | 字符串 | `all around` / `left-right` / `don't rotate` |
 | `draggable` | 布尔 | 默认 False |
 | `current_costume` | 数字 | 当前造型下标（0 起始） |
+| `layer_order` | 数字 | 图层顺序，越大越靠前（默认 1） |
 | `var 名字 = 初始值` | 声明 | 变量；舞台上是全局变量，角色上是局部变量 |
 | `list 名字 = [..]` | 声明 | 列表；舞台上是全局列表，角色上是局部列表 |
 | 其他 `名字 = 常量` | 声明 | 自动视为变量 |
@@ -711,6 +714,8 @@ sb3_to_scpython("input.sb3", "my_project", split_macros=True)
 
 - 事件帽子、运动/外观/声音/控制/侦测块、变量与列表、自制积木与调用；
 - Scratch 注释：附着在块上的注释放在对应语句前，独立注释放在文件头；
+- 保留角色原始名称、造型/声音名称、`currentCostume` 与 `layerOrder`，
+  并按名字切换造型/背景的脚本可继续正常工作；
 - 保留 TurboWarp 第三方扩展：`extensionURLs` 写入工程根目录的
   `extension_urls.json`，导出时回写到 `project.json`，避免 TurboWarp 报
   `Unknown extension`；

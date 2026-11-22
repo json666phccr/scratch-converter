@@ -497,6 +497,7 @@ class ScratchParser:
             name=data.get('name', 'Sprite'),
             is_stage=data.get('isStage', False),
             current_costume=data.get('currentCostume', 0),
+            layer_order=data.get('layerOrder', 1),
             x=data.get('x', 0),
             y=data.get('y', 0),
             direction=data.get('direction', 90),

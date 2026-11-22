@@ -843,6 +843,7 @@ class SpriteIR:
     costumes: List[Dict[str, Any]] = field(default_factory=list)
     sounds: List[Dict[str, Any]] = field(default_factory=list)
     current_costume: int = 0
+    layer_order: int = 1
     x: int = 0
     y: int = 0
     direction: float = 90
