@@ -584,7 +584,16 @@ when green_flag:
         say("loop")
     ext("myext", "myext_do", MODE="fast", _fields=["MODE"])
     ext("myext", "myext_pick", extension=".mp3", _inputs=[["as", "url"]])
+    while not (score > 3):
+        score += 1
     say("A")
+""",
+            'units/Bat.scpy': """\
+init:
+    costumes = ["cat.svg"]
+
+when green_flag:
+    say("bat")
 """,
             'Win-Dow.scpy': """\
 init:
@@ -654,6 +663,12 @@ when green_flag:
         assert ' as=' not in a_source, a_source
         assert 'spin(15)' in a_source
         assert 'spin(30)' in b_source
+        # repeat_until 往返不应叠加 not
+        assert 'while not (not' not in a_source, a_source
+        bat_path = os.path.join(imported, 'units', 'Bat.scpy')
+        assert os.path.exists(bat_path), bat_path
+        assert "name = 'units//Bat'" in open(
+            bat_path, encoding='utf-8').read()
         # 造型名/当前造型/图层顺序/角色名必须保留
         assert "costume_names = ['猫', '背景图']" in a_source, a_source
         assert 'current_costume = 1' in a_source
@@ -679,6 +694,19 @@ when green_flag:
             'https://extensions.turbowarp.org/demo.js', data.get('extensionURLs')
         targets = {target['name']: target for target in data['targets']}
         assert 'Win-Dow' in targets, list(targets)
+        assert 'units//Bat' in targets, list(targets)
+
+        def _not_count(payload):
+            return sum(
+                1 for target in payload['targets']
+                for block in (target.get('blocks') or {}).values()
+                if isinstance(block, dict)
+                and block.get('opcode') == 'operator_not')
+
+        with zipfile.ZipFile(sb3) as archive:
+            first_data = json.loads(archive.read('project.json').decode('utf-8'))
+        assert _not_count(data) == _not_count(first_data)
+
         sprite_a = targets['A']
         assert sprite_a['currentCostume'] == 1, sprite_a['currentCostume']
         assert sprite_a['layerOrder'] == 7, sprite_a['layerOrder']

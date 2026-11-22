@@ -1198,7 +1198,7 @@ class RoleBuilder:
                 self.loop_stack.pop()
             stop = self._or(
                 self._eq_one(break_var),
-                self._not(self._expr(node.test)))
+                self._negate(node.test))
             stmt = Statement(BlockType.REPEAT_UNTIL)
             stmt.condition = stop
             stmt.body = body
@@ -1214,7 +1214,7 @@ class RoleBuilder:
             stmt.body = body
             return [stmt]
         stmt = Statement(BlockType.REPEAT_UNTIL)
-        stmt.condition = self._not(self._expr(node.test))
+        stmt.condition = self._negate(node.test)
         stmt.body = body
         return [stmt]
 
@@ -1523,6 +1523,12 @@ class RoleBuilder:
     @staticmethod
     def _not(expr: Expr) -> Expr:
         return Expr(ExprType.NOT, right=expr)
+
+    def _negate(self, node: ast.AST) -> Expr:
+        """对条件取反；``not x`` 再取反时直接折叠，避免双 not 膨胀"""
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            return self._expr(node.operand)
+        return self._not(self._expr(node))
 
     @staticmethod
     def _or(left: Expr, right: Expr) -> Expr:

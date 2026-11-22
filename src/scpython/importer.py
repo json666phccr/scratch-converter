@@ -334,7 +334,13 @@ class _Emitter:
             out.append(f"{spaces}else:")
             out.extend(self._body(stmt.else_body, indent + 1))
         elif t == BlockType.REPEAT_UNTIL:
-            out.append(f"{spaces}while not ({exp(stmt.condition)}):")
+            cond = stmt.condition
+            if cond is not None and cond.type == ExprType.NOT \
+                    and cond.right is not None:
+                # repeat until <not X> 直接写成 while X，避免重复往返叠加 not
+                out.append(f"{spaces}while ({exp(cond.right)}):")
+            else:
+                out.append(f"{spaces}while not ({exp(cond)}):")
             out.extend(self._body(stmt.body, indent + 1))
         elif t == BlockType.STOP:
             option = str(stmt.extra.get('option', 'all'))
@@ -770,8 +776,19 @@ def import_sb3(path: str, output_dir: str, *,
                                (data.get('extensions') or []) if name]
 
         for sprite in project.sprites:
-            base = 'stage' if sprite.is_stage else _san(sprite.name, 'Sprite')
-            filename = 'stage.scpy' if sprite.is_stage else f"{base}.scpy"
+            if sprite.is_stage:
+                filename = 'stage.scpy'
+            else:
+                # 角色名中的 // 表示子目录：units//Bat -> units/Bat.scpy，
+                # 导出时再从相对路径还原成 units//Bat。
+                parts = [part for part in str(sprite.name).split('//')
+                         if part] or ['Sprite']
+                filename = os.path.join(
+                    *[_san(part, 'Sprite') for part in parts]) + '.scpy'
+                parent = os.path.dirname(
+                    os.path.join(output_dir, filename))
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
             comments = target_comments.get(sprite.name, {})
             src, _ = _sprite_source(
                 sprite, comments, standalone.get(sprite.name, []), warnings,

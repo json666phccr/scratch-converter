@@ -1115,6 +1115,10 @@ class ScratchWriter:
 
         if expr.type == ExprType.BOOLEAN:
             return [1, [10, "1" if expr.value else "0"]]
+        if expr.type == ExprType.NUMBER:
+            return [1, [10, str(expr.value)]]
+        if expr.type == ExprType.STRING:
+            return [1, [10, expr.value]]
 
         block_id = self.write_expression_block(expr)
         return [3, block_id, [10, "1"]]
