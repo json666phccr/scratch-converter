@@ -779,6 +779,7 @@ class RoleBuilder:
         self.hidden_counter = 0
         self.id_counter = 0
         self.current_function: Optional[FunctionInfo] = None
+        self.recursive_functions: set = set()
         self.used_macros: set = set()
         # debug.reset() 一次可能要重置多个变量/列表，这里暂存多条语句
         self.pending_debug: List[Statement] = []
@@ -793,6 +794,7 @@ class RoleBuilder:
     def build(self) -> SpriteIR:
         self._apply_meta()
         self._init_symbols()
+        self.recursive_functions = self._find_recursive_functions()
 
         for kind, obj in self.module.source_order:
             if kind == 'def':
@@ -815,6 +817,69 @@ class RoleBuilder:
         self.sprite.costumes = self._load_costumes()
         self.sprite.sounds = self._load_sounds()
         return self.sprite
+
+    def _find_recursive_functions(self) -> set:
+        """找出处于调用环中的自制积木（直接/间接递归）。
+
+        环里的循环控制变量是角色级变量，递归重入会互相覆盖，
+        只有对这些循环做入栈/出栈保护。
+        """
+        names = set(self.module.functions)
+        graph: Dict[str, set] = {}
+        for name, info in self.module.functions.items():
+            calls = set()
+            for sub in ast.walk(info.node):
+                if isinstance(sub, ast.Call) and isinstance(
+                        sub.func, ast.Name) and sub.func.id in names:
+                    calls.add(sub.func.id)
+            graph[name] = calls
+        recursive: set = set()
+        state: Dict[str, int] = {}
+        path: List[str] = []
+
+        def visit(node: str) -> None:
+            state[node] = 1
+            path.append(node)
+            for nxt in graph.get(node, ()):
+                if state.get(nxt) == 1:
+                    recursive.update(path[path.index(nxt):])
+                elif state.get(nxt, 0) == 0:
+                    visit(nxt)
+            path.pop()
+            state[node] = 2
+
+        for name in names:
+            if state.get(name, 0) == 0:
+                visit(name)
+        return recursive
+
+    def _loop_needs_stack(self) -> bool:
+        return (self.current_function is not None
+                and self.current_function.name in self.recursive_functions)
+
+    def _hidden_list(self, hint: str) -> Tuple[str, str]:
+        self.hidden_counter += 1
+        return self.ensure_list(f"__scpy_{hint}_{self.hidden_counter}")
+
+    def _stack_push(self, list_info: Tuple[str, str],
+                    value: Expr) -> Statement:
+        name, list_id = list_info
+        stmt = Statement(BlockType.ADD_TO_LIST)
+        stmt.extra.update({'name': name, 'id': list_id})
+        stmt.value = value
+        return stmt
+
+    def _stack_pop(self, list_info: Tuple[str, str],
+                   target: str) -> List[Statement]:
+        name, list_id = list_info
+        length = self._list_expr(
+            ExprType.LENGTH_OF_LIST, name, list_id)
+        assign = self._set_var(target, self._list_expr(
+            ExprType.ITEM_OF_LIST, name, list_id, length))
+        delete = Statement(BlockType.DELETE_FROM_LIST)
+        delete.extra.update({'name': name, 'id': list_id})
+        delete.value = length
+        return [assign, delete]
 
     # ---------- 元数据与符号 ----------
 
@@ -1206,6 +1271,10 @@ class RoleBuilder:
                 self._set_var(break_var, make_number(0)),
                 self._set_var(continue_var, make_number(0)),
                 stmt,
+                # 旗标是角色级变量，递归重入时内层 break/continue 若不清零，
+                # 返回外层后会误当成外层的 break/continue；出口恢复为 0。
+                self._set_var(break_var, make_number(0)),
+                self._set_var(continue_var, make_number(0)),
             ]
 
         body = self._compile_sequence(node.body)
@@ -1288,20 +1357,35 @@ class RoleBuilder:
 
         counter = self._hidden('i')
         limit = self._hidden('stop')
-        prefix = [
-            self._set_var(counter, self._expr(start_node)),
-            self._set_var(limit, self._expr(stop_node)),
-        ]
         has_flags = _contains_break_continue(node.body)
         break_var = continue_var = ''
         if has_flags:
             break_var = self._hidden('break')
             continue_var = self._hidden('continue')
-            prefix.append(self._set_var(break_var, make_number(0)))
-            prefix.append(self._set_var(continue_var, make_number(0)))
             loop = LoopContext(break_var, continue_var)
         else:
             loop = None
+
+        prefix: List[Statement] = []
+        # 递归函数里的循环控制变量是角色级变量，递归重入会覆盖外层状态，
+        # 因此进入循环时把旧值压栈、退出时弹回（调用是严格 LIFO）。
+        state_stack = self._hidden_list('loop') \
+            if self._loop_needs_stack() else None
+        if state_stack is not None:
+            prefix.append(self._stack_push(
+                state_stack, self._var_expr(counter)))
+            prefix.append(self._stack_push(
+                state_stack, self._var_expr(limit)))
+            if has_flags:
+                prefix.append(self._stack_push(
+                    state_stack, self._var_expr(break_var)))
+                prefix.append(self._stack_push(
+                    state_stack, self._var_expr(continue_var)))
+        prefix.append(self._set_var(counter, self._expr(start_node)))
+        prefix.append(self._set_var(limit, self._expr(stop_node)))
+        if has_flags:
+            prefix.append(self._set_var(break_var, make_number(0)))
+            prefix.append(self._set_var(continue_var, make_number(0)))
 
         body: List[Statement] = []
         if loop is not None:
@@ -1324,23 +1408,47 @@ class RoleBuilder:
         stmt = Statement(BlockType.REPEAT_UNTIL)
         stmt.condition = termination
         stmt.body = body
-        return prefix + [stmt]
+        result = prefix + [stmt]
+        if state_stack is not None:
+            if break_var:
+                result.extend(self._stack_pop(state_stack, continue_var))
+                result.extend(self._stack_pop(state_stack, break_var))
+            result.extend(self._stack_pop(state_stack, limit))
+            result.extend(self._stack_pop(state_stack, counter))
+        elif break_var:
+            # 递归重入时清掉内层遗留的旗标，避免外层提前退出
+            result.append(self._set_var(break_var, make_number(0)))
+            result.append(self._set_var(continue_var, make_number(0)))
+        return result
 
     def _compile_for_list(self, node: ast.For, target: str,
                           list_name: str) -> List[Statement]:
         list_name, list_id = self.ensure_list(list_name)
         index = self._hidden('idx')
-        prefix = [self._set_var(index, make_number(1))]
         has_flags = _contains_break_continue(node.body)
         break_var = continue_var = ''
         if has_flags:
             break_var = self._hidden('break')
             continue_var = self._hidden('continue')
-            prefix.append(self._set_var(break_var, make_number(0)))
-            prefix.append(self._set_var(continue_var, make_number(0)))
             loop = LoopContext(break_var, continue_var)
         else:
             loop = None
+
+        prefix: List[Statement] = []
+        state_stack = self._hidden_list('loop') \
+            if self._loop_needs_stack() else None
+        if state_stack is not None:
+            prefix.append(self._stack_push(
+                state_stack, self._var_expr(index)))
+            if has_flags:
+                prefix.append(self._stack_push(
+                    state_stack, self._var_expr(break_var)))
+                prefix.append(self._stack_push(
+                    state_stack, self._var_expr(continue_var)))
+        prefix.append(self._set_var(index, make_number(1)))
+        if has_flags:
+            prefix.append(self._set_var(break_var, make_number(0)))
+            prefix.append(self._set_var(continue_var, make_number(0)))
 
         body: List[Statement] = []
         if loop is not None:
@@ -1365,7 +1473,17 @@ class RoleBuilder:
         stmt = Statement(BlockType.REPEAT_UNTIL)
         stmt.condition = termination
         stmt.body = body
-        return prefix + [stmt]
+        result = prefix + [stmt]
+        if state_stack is not None:
+            if break_var:
+                result.extend(self._stack_pop(state_stack, continue_var))
+                result.extend(self._stack_pop(state_stack, break_var))
+            result.extend(self._stack_pop(state_stack, index))
+        elif break_var:
+            # 递归重入时清掉内层遗留的旗标，避免外层提前退出
+            result.append(self._set_var(break_var, make_number(0)))
+            result.append(self._set_var(continue_var, make_number(0)))
+        return result
 
     def _compile_break(self, node: ast.Break) -> Statement:
         if not self.loop_stack:

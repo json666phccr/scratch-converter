@@ -280,6 +280,42 @@ when green_flag:
     return True
 
 
+def test_scpython_recursive_loop_state():
+    """SC-4b 递归重入时 break/continue 与循环计数器不能污染外层循环"""
+    print("[测试98b] ScPython 递归中的循环状态")
+
+    with tempfile.TemporaryDirectory() as folder:
+        root = os.path.join(folder, 'recurse_loop')
+        _make_project(root, {
+            'stage.scpy': _STAGE_MIN,
+            'Cat.scpy': """\
+init:
+    list trace_log = []
+
+when green_flag:
+    rec(1)
+
+def rec(k, *, types="n", warp=True):
+    trace_log.append(k)
+    for i in range(k, 4):
+        trace_log.append(10 + i)
+        if i == 2:
+            break
+        rec(i + 1)
+        trace_log.append("back")
+    trace_log.append("e")
+""",
+        }, assets={'bg.svg': _BG_SVG})
+        sb3 = _export(root)
+        result = _run(sb3)
+        assert not result['errors'], result['errors']
+        assert _list_value(result, 'Cat', 'trace_log') == [
+            1, 11, 2, 12, 'e', 'back', 12, 'e']
+
+    print("  [PASS] ScPython 递归循环状态通过")
+    return True
+
+
 def test_scpython_macro_copy():
     """SC-5 宏函数按需复制到角色，局部同名函数优先"""
     print("[测试99] ScPython 宏复制")

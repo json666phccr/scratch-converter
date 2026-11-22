@@ -202,6 +202,7 @@ def fact(n, *, types="n", warp=True):
 - 没有默认值：字符串参数 `""`，布尔参数 `false`；
 - `return 值` 生成 TurboWarp 的 `procedures_return`；
 - 递归/互递归由 Scratch 线程栈执行，深度过大可能受浏览器/运行时限制；
+- 递归函数内的循环：`break`/`continue` 旗标与 `for` 的循环计数器会在进入循环时压栈、退出时恢复，递归重入不会污染外层循环状态；非递归函数里的循环不生成这层开销；
 - `warp=True` 时整个调用期间不刷新屏幕，嵌套 warp 会累加；
 - 在自制积木内执行 `stop_this_script()` 只返回上一层调用；
 - 普通 `stop_all()` 停止所有脚本。
