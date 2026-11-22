@@ -118,6 +118,12 @@ BLOCK_TYPE_TO_OPCODE: Dict[BlockType, str] = {
 }
 
 
+def _is_hat_statement(stmt: Statement) -> bool:
+    return (stmt.type.name.startswith('WHEN_')
+            or stmt.type in (BlockType.START_AS_CLONE,
+                             BlockType.EXTENSION_HAT))
+
+
 class ScratchWriter:
     """将ProjectIR写入Scratch JSON格式"""
 
@@ -382,7 +388,12 @@ class ScratchWriter:
         self.all_blocks = {}
 
         blocks = {}
-        for index, stmt in enumerate(sprite.statements):
+        # 事件帽子排在前面，打开工程就能看到可运行的脚本；
+        # 自制积木定义放在后面，避免绿旗脚本被排到画布很下方。
+        layout = sorted(
+            sprite.statements,
+            key=lambda item: 0 if _is_hat_statement(item) else 1)
+        for index, stmt in enumerate(layout):
             block_dict = self.write_statement(stmt, None)
             blocks.update(block_dict)
             # 顶层脚本（事件帽子/自制积木定义）必须带 topLevel 与坐标，
@@ -390,8 +401,8 @@ class ScratchWriter:
             top_id = next((bid for bid, data in block_dict.items()
                            if data.get("topLevel")), None)
             if top_id:
-                block_dict[top_id]["x"] = 50 + (index % 2) * 560
-                block_dict[top_id]["y"] = 50 + (index // 2) * 420
+                block_dict[top_id]["x"] = 50 + (index % 4) * 600
+                block_dict[top_id]["y"] = 50 + (index // 4) * 420
         # 合并子堆栈中创建的块
         blocks.update(self.all_blocks)
 
