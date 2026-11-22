@@ -624,6 +624,15 @@ v = ext("myext", "myext_getSpeed")
 
 `ext` 的所有关键字参数都作为输入，不能设置字段。
 
+扩展槽位名不是合法 Python 标识符（例如 `as`、`for`）时，用 `_inputs` 传递；
+字段名非法时用 `_field_values`：
+
+```python
+ext("files", "files_showPickerExtensionsAs", extension=".mp3",
+    _inputs=[["as", "url"]])
+ext("myext", "myext_do", _fields=["MODE"], MODE="fast")
+```
+
 ---
 
 ## 13. 资产

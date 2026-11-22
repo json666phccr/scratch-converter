@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import keyword
 import os
 import re
 import zipfile
@@ -38,25 +39,41 @@ def _q(value: str) -> str:
     return repr(value)
 
 
+def _valid_kwarg(name: str) -> bool:
+    return bool(re.match(r'^[A-Za-z_]\w*$', name)) and not keyword.iskeyword(name)
+
+
 def _ext_call(namespace: str, opcode: str, inputs, fields,
               warnings: Optional[List[str]] = None) -> str:
-    """生成 ext(...)，用 _fields 标记列表把下拉字段写回字段而不是输入"""
+    """生成 ext(...)；关键字/非法标识符的槽位改用 _inputs/_field_values"""
     parts = [_q(namespace), _q(opcode)]
+    special_inputs = []
     for slot, value in inputs or []:
-        if re.match(r'^[A-Za-z_]\w*$', str(slot)):
+        slot = str(slot)
+        if _valid_kwarg(slot):
             parts.append(f"{slot}={expr_source(value, warnings)}")
-        elif warnings is not None:
-            warnings.append(f"扩展 {opcode} 的输入 {slot} 不是合法标识符，已跳过")
+        else:
+            special_inputs.append((slot, expr_source(value, warnings)))
+    if special_inputs:
+        rendered = ', '.join(f"[{_q(name)}, {source}]"
+                             for name, source in special_inputs)
+        parts.append(f"_inputs=[{rendered}]")
     valid_fields = []
-    for name in (fields or {}):
-        if re.match(r'^[A-Za-z_]\w*$', str(name)):
-            valid_fields.append(str(name))
-        elif warnings is not None:
-            warnings.append(f"扩展 {opcode} 的字段 {name} 不是合法标识符，已跳过")
+    special_fields = []
+    for name, value in (fields or {}).items():
+        name = str(name)
+        if _valid_kwarg(name):
+            valid_fields.append(name)
+        else:
+            special_fields.append((name, value))
     if valid_fields:
         parts.append(f"_fields={valid_fields!r}")
         for name in valid_fields:
             parts.append(f"{name}={fields[name]!r}")
+    if special_fields:
+        rendered = ', '.join(f"[{_q(name)}, {value!r}]"
+                             for name, value in special_fields)
+        parts.append(f"_field_values=[{rendered}]")
     return f"ext({', '.join(parts)})"
 
 

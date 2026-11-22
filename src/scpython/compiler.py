@@ -1809,9 +1809,16 @@ class RoleBuilder:
         return stmt
 
     def _extension_kwargs(self, call: ast.Call):
-        """解析 ext(...) 关键字；``_fields=[...]`` 中的名字按字段写入"""
+        """解析 ext(...) 关键字。
+
+        - ``_fields=[...]`` 中的名字按字段写入
+        - ``_inputs=[[名字, 值], ...]`` 用于 Python 关键字/非法标识符的输入槽
+        - ``_field_values=[[名字, 常量], ...]`` 用于非法的字段名
+        """
         markers = None
-        pairs = []
+        raw_pairs = []
+        special_inputs = []
+        special_fields = {}
         for keyword in call.keywords:
             if keyword.arg is None:
                 raise ScPythonError("ext 不支持 **kwargs",
@@ -1824,17 +1831,46 @@ class RoleBuilder:
                         "ext 的 _fields 必须是字符串列表",
                         path=self.module.path, line=call.lineno)
                 markers = list(value)
+            elif keyword.arg == '_inputs':
+                for name, node in self._extension_pairs(keyword.value,
+                                                        '_inputs'):
+                    special_inputs.append((name, self._expr(node)))
+            elif keyword.arg == '_field_values':
+                for name, node in self._extension_pairs(keyword.value,
+                                                        '_field_values'):
+                    special_fields[name] = self._const_node(node)
             else:
-                pairs.append((keyword.arg, keyword.value))
+                raw_pairs.append((keyword.arg, keyword.value))
         field_names = set(markers or ())
-        inputs = []
-        fields = {}
-        for name, node in pairs:
+        inputs = list(special_inputs)
+        fields = dict(special_fields)
+        for name, node in raw_pairs:
             if name in field_names:
                 fields[name] = self._const_node(node)
             else:
                 inputs.append((name, self._expr(node)))
         return inputs, fields
+
+    def _extension_pairs(self, node: ast.AST, key: str):
+        if not isinstance(node, ast.List):
+            raise ScPythonError(
+                f"ext 的 {key} 必须是 [[名字, 值], ...]",
+                path=self.module.path, line=getattr(node, 'lineno', None))
+        result = []
+        for element in node.elts:
+            if not isinstance(element, ast.List) or len(element.elts) != 2:
+                raise ScPythonError(
+                    f"ext 的 {key} 每项必须是 [名字, 值]",
+                    path=self.module.path,
+                    line=getattr(element, 'lineno', None))
+            name = _constant(element.elts[0], self.module.path, key)
+            if not isinstance(name, str):
+                raise ScPythonError(
+                    f"ext 的 {key} 名字必须是字符串",
+                    path=self.module.path,
+                    line=getattr(element.elts[0], 'lineno', None))
+            result.append((name, element.elts[1]))
+        return result
 
     def _extension_statement(self, spec: ExtensionBlock,
                              call: ast.Call) -> Statement:

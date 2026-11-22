@@ -583,6 +583,7 @@ when green_flag:
     for _ in range(2):
         say("loop")
     ext("myext", "myext_do", MODE="fast", _fields=["MODE"])
+    ext("myext", "myext_pick", extension=".mp3", _inputs=[["as", "url"]])
     say("A")
 """,
             'Win-Dow.scpy': """\
@@ -612,6 +613,13 @@ when green_flag:
         assert 'myext' in data.get('extensions', [])
         assert data.get('extensionURLs', {}).get('myext') == \
             'https://extensions.turbowarp.org/demo.js', data.get('extensionURLs')
+        pick_inputs = {}
+        for target in data['targets']:
+            for block in (target.get('blocks') or {}).values():
+                if isinstance(block, dict) and \
+                        block.get('opcode') == 'myext_pick':
+                    pick_inputs = block.get('inputs') or {}
+        assert 'as' in pick_inputs, pick_inputs
         _patch_sb3_comments(sb3, 'A', '旋转一次', '独立说明')
 
         imported = os.path.join(folder, 'imported')
@@ -642,6 +650,8 @@ when green_flag:
         assert 'def spin' not in b_source
         assert "macros = ['orphan', 'spin']" in a_source, a_source
         assert 'variable_aliases' in a_source, a_source
+        assert "_inputs=[['as', 'url']]" in a_source, a_source
+        assert ' as=' not in a_source, a_source
         assert 'spin(15)' in a_source
         assert 'spin(30)' in b_source
         # 造型名/当前造型/图层顺序/角色名必须保留
@@ -693,6 +703,13 @@ when green_flag:
                 if isinstance(block, dict) and block.get('opcode') == 'myext_do':
                     ext_fields = block.get('fields') or {}
         assert ext_fields.get('MODE') == ['fast', None], ext_fields
+        pick_again = {}
+        for target in data['targets']:
+            for block in (target.get('blocks') or {}).values():
+                if isinstance(block, dict) and \
+                        block.get('opcode') == 'myext_pick':
+                    pick_again = block.get('inputs') or {}
+        assert 'as' in pick_again, pick_again
 
         # 造型旋转中心与分辨率必须保持
         first = {target['name']: {c['md5ext']: (
