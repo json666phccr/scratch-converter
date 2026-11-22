@@ -16,7 +16,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from ir import (
     BlockType, Expr, ExprType, ProjectIR, SpriteIR, Statement,
@@ -775,6 +775,7 @@ class RoleBuilder:
         self.list_ids: Dict[str, str] = {}
         self.used_extensions: set = set()
         self.loop_stack: List[LoopContext] = []
+        self.loop_guard_names: List[Set[str]] = []
         self.param_stack: List[Dict[str, Param]] = []
         self.hidden_counter = 0
         self.id_counter = 0
@@ -1228,7 +1229,8 @@ class RoleBuilder:
                 stmt = self._compile_call_statement(node.value)
                 produced: List[Statement] = []
                 if stmt is not None:
-                    produced.append(stmt)
+                    produced.extend(
+                        self._wrap_recursive_call(node.value, stmt))
                 if self.pending_debug:
                     produced.extend(self.pending_debug)
                     self.pending_debug = []
@@ -1251,15 +1253,18 @@ class RoleBuilder:
 
     def _compile_while(self, node: ast.While) -> List[Statement]:
         has_flags = _contains_break_continue(node.body)
+        guard = self._while_guard_names(node.test, node.body)
         if has_flags:
             break_var = self._hidden('break')
             continue_var = self._hidden('continue')
             loop = LoopContext(break_var, continue_var)
             self.loop_stack.append(loop)
+            self.loop_guard_names.append(guard)
             try:
                 body = [self._set_var(continue_var, make_number(0))]
                 body.extend(self._compile_sequence(node.body))
             finally:
+                self.loop_guard_names.pop()
                 self.loop_stack.pop()
             stop = self._or(
                 self._eq_one(break_var),
@@ -1277,7 +1282,11 @@ class RoleBuilder:
                 self._set_var(continue_var, make_number(0)),
             ]
 
-        body = self._compile_sequence(node.body)
+        self.loop_guard_names.append(guard)
+        try:
+            body = self._compile_sequence(node.body)
+        finally:
+            self.loop_guard_names.pop()
         if isinstance(node.test, ast.Constant) and node.test.value is True:
             stmt = Statement(BlockType.FOREVER)
             stmt.body = body
@@ -1286,6 +1295,57 @@ class RoleBuilder:
         stmt.condition = self._negate(node.test)
         stmt.body = body
         return [stmt]
+
+    def _while_guard_names(self, test: ast.AST,
+                           body: List[ast.stmt]) -> Set[str]:
+        """递归函数里由 while 条件读取、循环体内赋值的角色级变量。
+
+        这些变量在递归重入时会被内层调用覆盖，但按 Python 语义它们应
+        属于每次调用；记录后在递归调用前后压栈保存/恢复。
+        只保护循环体自己会改写的变量，避免破坏有意的跨调用共享状态。
+        """
+        if not self._loop_needs_stack():
+            return set()
+        params = {param.name for param in self.current_function.params}
+        assigned: Set[str] = set()
+        for sub in ast.walk(ast.Module(body=body, type_ignores=[])):
+            if isinstance(sub, ast.Assign):
+                for target in sub.targets:
+                    if isinstance(target, ast.Name):
+                        assigned.add(target.id)
+            elif isinstance(sub, ast.AugAssign) and isinstance(
+                    sub.target, ast.Name):
+                assigned.add(sub.target.id)
+            elif isinstance(sub, ast.For) and isinstance(
+                    sub.target, ast.Name):
+                assigned.add(sub.target.id)
+        return {
+            sub.id for sub in ast.walk(test)
+            if isinstance(sub, ast.Name)
+            and isinstance(sub.ctx, ast.Load)
+            and sub.id in assigned
+            and sub.id not in params
+        }
+
+    def _wrap_recursive_call(self, call: ast.Call,
+                             stmt: Statement) -> List[Statement]:
+        """在递归调用前后保存/恢复活动的 while 条件变量。"""
+        if not isinstance(call.func, ast.Name) or \
+                call.func.id not in self.recursive_functions:
+            return [stmt]
+        names: Set[str] = set()
+        for group in self.loop_guard_names:
+            names |= group
+        if not names:
+            return [stmt]
+        ordered = sorted(names)
+        stack = self._hidden_list('guard')
+        result = [self._stack_push(stack, self._var_expr(name))
+                  for name in ordered]
+        result.append(stmt)
+        for name in reversed(ordered):
+            result.extend(self._stack_pop(stack, name))
+        return result
 
     def _compile_for(self, node: ast.For) -> List[Statement]:
         if node.orelse:

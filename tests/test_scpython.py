@@ -316,6 +316,42 @@ def rec(k, *, types="n", warp=True):
     return True
 
 
+def test_scpython_recursive_while_variable():
+    """SC-4c 递归函数里 while 条件用的角色级变量按调用局部语义恢复"""
+    print("[测试98c] ScPython 递归中的 while 条件变量")
+
+    with tempfile.TemporaryDirectory() as folder:
+        root = os.path.join(folder, 'recurse_while')
+        _make_project(root, {
+            'stage.scpy': _STAGE_MIN,
+            'Cat.scpy': """\
+init:
+    var k = 1
+    list trace_log = []
+
+when green_flag:
+    rec()
+
+def rec(*, types="", warp=True):
+    trace_log.append(k)
+    while k < 3:
+        k += 1
+        if k == 2:
+            rec()
+        trace_log.append(10 + k)
+    trace_log.append("e")
+""",
+        }, assets={'bg.svg': _BG_SVG})
+        sb3 = _export(root)
+        result = _run(sb3)
+        assert not result['errors'], result['errors']
+        assert _list_value(result, 'Cat', 'trace_log') == [
+            1, 2, 13, 'e', 12, 13, 'e']
+
+    print("  [PASS] ScPython 递归 while 条件变量通过")
+    return True
+
+
 def test_scpython_macro_copy():
     """SC-5 宏函数按需复制到角色，局部同名函数优先"""
     print("[测试99] ScPython 宏复制")
