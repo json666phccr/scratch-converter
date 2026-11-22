@@ -55,9 +55,9 @@ BLOCK_TYPE_TO_OPCODE: Dict[BlockType, str] = {
     BlockType.SET_SIZE: 'looks_setsizeto',
     BlockType.CHANGE_EFFECT: 'looks_changeeffectby',
     BlockType.SET_EFFECT: 'looks_seteffectto',
-    BlockType.CLEAR_EFFECTS: 'looks_cleareffects',
+    BlockType.CLEAR_EFFECTS: 'looks_cleargraphiceffects',
     BlockType.GO_TO_FRONT: 'looks_gotofrontback',
-    BlockType.GO_TO_BACK: 'looks_gobacklayers',
+    BlockType.GO_TO_BACK: 'looks_gotofrontback',
     BlockType.GO_FORWARD_LAYERS: 'looks_goforwardbackwardlayers',
 
     BlockType.PLAY_SOUND: 'sound_play',
@@ -129,6 +129,27 @@ class ScratchWriter:
         """生成唯一的块ID"""
         self.block_counter += 1
         return f"block_{self.block_counter}"
+
+    def _write_comments(self, target_name: str) -> Dict[str, Dict]:
+        """把工程级注释记录写入目标；blockId 为 None 表示独立注释"""
+        result: Dict[str, Dict] = {}
+        for record in (self.project_comments or {}).get(target_name, []):
+            if not isinstance(record, dict):
+                continue
+            text = str(record.get('text', ''))
+            if not text:
+                continue
+            self.comment_counter += 1
+            result[f"comment_{self.comment_counter}"] = {
+                "blockId": None,
+                "x": record.get('x', 0),
+                "y": record.get('y', 0),
+                "width": record.get('width', 200),
+                "height": record.get('height', 100),
+                "minimized": bool(record.get('minimized', False)),
+                "text": text,
+            }
+        return result
 
     @staticmethod
     def _build_proccode(proc_name: str, arg_count: int,
@@ -240,6 +261,8 @@ class ScratchWriter:
         """将ProjectIR转换为Scratch项目JSON"""
         self.all_blocks = {}
         self.block_counter = 0
+        self.comment_counter = 0
+        self.project_comments = getattr(project, 'comments', {}) or {}
 
         targets = []
         for sprite in project.sprites:
@@ -430,7 +453,7 @@ class ScratchWriter:
             "lists": lists,
             "broadcasts": broadcasts,
             "blocks": blocks,
-            "comments": {},
+            "comments": self._write_comments(sprite.name),
             "currentCostume": current_costume,
             "costumes": costumes,
             "sounds": sprite.sounds or [],
@@ -817,16 +840,19 @@ class ScratchWriter:
             block_data["fields"]["LIST"] = [
                 list_name, stmt.extra.get('id') or f"list_{list_name}"]
 
-        elif stmt.type == BlockType.BROADCAST:
-            bc_name = stmt.value.to_scratch_value() if stmt.value else ''
-            bc_id = f"bc_{bc_name}"
-            # 类型码 11 的标准顺序是 [11, 广播名, 广播ID]，名字在前
-            block_data["inputs"]["BROADCAST_INPUT"] = [1, [11, bc_name, bc_id]]
-
-        elif stmt.type == BlockType.BROADCAST_AND_WAIT:
-            bc_name = stmt.value.to_scratch_value() if stmt.value else ''
-            bc_id = f"bc_{bc_name}"
-            block_data["inputs"]["BROADCAST_INPUT"] = [1, [11, bc_name, bc_id]]
+        elif stmt.type in (BlockType.BROADCAST, BlockType.BROADCAST_AND_WAIT):
+            if stmt.value is not None and stmt.value.type not in (
+                    ExprType.STRING, ExprType.NUMBER):
+                # 动态广播：把消息表达式写成 reporter 块
+                child = self.write_expression_block(stmt.value)
+                block_data["inputs"]["BROADCAST_INPUT"] = [
+                    3, child, [10, "message1"]]
+            else:
+                bc_name = stmt.value.to_scratch_value() if stmt.value else ''
+                bc_id = f"bc_{bc_name}"
+                # 类型码 11 的标准顺序是 [11, 广播名, 广播ID]，名字在前
+                block_data["inputs"]["BROADCAST_INPUT"] = [
+                    1, [11, bc_name, bc_id]]
 
         elif stmt.type == BlockType.CREATE_CLONE_OF:
             target = stmt.value.to_scratch_value() if stmt.value else '_myself_'
@@ -1007,10 +1033,24 @@ class ScratchWriter:
         }
         return [1, shadow_id]
 
+    def _inline_reporter(self, expr: Expr) -> Optional[List]:
+        """变量/列表内容的压缩形式（需包在 [3, 压缩值, 影子] 中）"""
+        if expr.type == ExprType.VARIABLE:
+            return [12, expr.name,
+                    expr.extra.get('id') or f"var_{expr.name}"]
+        if expr.type == ExprType.LIST_ACCESS:
+            return [13, expr.name,
+                    expr.extra.get('id') or f"list_{expr.name}"]
+        return None
+
     def write_number_input(self, expr: Optional[Expr], default: float) -> List:
         """写入数字输入（真实sb3格式: [1, [4, "10"]]）"""
         if expr is None:
             return [1, [4, str(default)]]
+
+        inline = self._inline_reporter(expr)
+        if inline is not None:
+            return [3, inline, [4, str(default)]]
 
         if expr.type == ExprType.NUMBER:
             val = expr.value
@@ -1031,6 +1071,10 @@ class ScratchWriter:
         if expr is None:
             return [1, [10, str(default)]]
 
+        inline = self._inline_reporter(expr)
+        if inline is not None:
+            return [3, inline, [10, str(default)]]
+
         if expr.type == ExprType.STRING:
             return [1, [10, expr.value]]
         elif expr.type == ExprType.NUMBER:
@@ -1046,6 +1090,10 @@ class ScratchWriter:
         if expr is None:
             return [1, [10, ""]]
 
+        inline = self._inline_reporter(expr)
+        if inline is not None:
+            return [3, inline, [10, ""]]
+
         if expr.type == ExprType.NUMBER:
             return [1, [4, str(expr.value)]]
         elif expr.type == ExprType.STRING:
@@ -1060,6 +1108,10 @@ class ScratchWriter:
         """写入布尔输入"""
         if expr is None:
             return [1, [10, "1"]]
+
+        inline = self._inline_reporter(expr)
+        if inline is not None:
+            return [3, inline, [10, "1"]]
 
         if expr.type == ExprType.BOOLEAN:
             return [1, [10, "1" if expr.value else "0"]]

@@ -295,7 +295,7 @@ python converter.py sb32scpy ..\example\scpy_demo.sb3 ..\example\scpy_imported
 - 列表索引从 1 开始，只支持原版 Scratch 列表操作；
 - 每个文件一个角色，`units/Bat.scpy` 导出为角色 `units//Bat`；
 - `macros.scpy` 中的函数在角色调用时按需复制到角色内（含传递依赖）；
-- **sb3 → ScPython**：转换事件/变量/列表/自制积木/注释；默认分析各角色中**完全相同**的自制积木并抽到 `macros.scpy`（`--no-macros` 可关闭）；全局变量只在舞台声明；保留角色名、造型/声音名、当前造型、图层顺序与 TurboWarp `extensionURLs`（`extension_urls.json`，导出时回写）；
+- **sb3 → ScPython**：转换事件/变量/列表/自制积木/注释；默认分析各角色中**完全相同**的自制积木并抽到 `macros.scpy`（`--no-macros` 可关闭）；全局变量只在舞台声明；保留角色名、变量/列表原名、造型/声音名、当前造型、图层顺序、注释（`comments.json`）、扩展字段与 TurboWarp `extensionURLs`；
 - **列表默认值**：`list xs = txt("data.txt")` 或 `debug.import_list(xs, "data.txt")` 直接读文本文件（每行一项）；
 - **调试方法**：`debug.set_default` / `debug.set_list_default` 改变量/列表默认值，`debug.set_var` / `debug.reset` 运行期改值或恢复默认值，`debug.print/trace/watch/assert` 作为编译期提示输出；
 - **调试工具**：`scpython lint` 检查未使用的变量/列表/自制积木/宏；`scpython run` 在本机无头 VM 中运行并输出变量、watch 表达式、统计与最近执行轨迹；编译错误附带源码行与列指示；

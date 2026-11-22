@@ -38,6 +38,28 @@ def _q(value: str) -> str:
     return repr(value)
 
 
+def _ext_call(namespace: str, opcode: str, inputs, fields,
+              warnings: Optional[List[str]] = None) -> str:
+    """生成 ext(...)，用 _fields 标记列表把下拉字段写回字段而不是输入"""
+    parts = [_q(namespace), _q(opcode)]
+    for slot, value in inputs or []:
+        if re.match(r'^[A-Za-z_]\w*$', str(slot)):
+            parts.append(f"{slot}={expr_source(value, warnings)}")
+        elif warnings is not None:
+            warnings.append(f"扩展 {opcode} 的输入 {slot} 不是合法标识符，已跳过")
+    valid_fields = []
+    for name in (fields or {}):
+        if re.match(r'^[A-Za-z_]\w*$', str(name)):
+            valid_fields.append(str(name))
+        elif warnings is not None:
+            warnings.append(f"扩展 {opcode} 的字段 {name} 不是合法标识符，已跳过")
+    if valid_fields:
+        parts.append(f"_fields={valid_fields!r}")
+        for name in valid_fields:
+            parts.append(f"{name}={fields[name]!r}")
+    return f"ext({', '.join(parts)})"
+
+
 def _chain(stmt: Optional[Statement]) -> List[Statement]:
     """把 parser 的 next 链展开成语句列表"""
     items: List[Statement] = []
@@ -114,17 +136,10 @@ def expr_source(expr: Optional[Expr],
         args = ', '.join(expr_source(a) for a in expr.args)
         return f"{_san(expr.name, 'fn')}({args})"
     if t == ExprType.EXTENSION_CALL:
-        namespace = str(expr.extra.get('namespace', ''))
-        opcode = str(expr.extra.get('opcode', ''))
-        parts = [_q(namespace), _q(opcode)]
-        for slot, value in expr.extra.get('inputs', []):
-            if re.match(r'^[A-Za-z_]\w*$', str(slot)):
-                parts.append(f"{slot}={expr_source(value)}")
-        fields = expr.extra.get('fields') or {}
-        if fields and warnings is not None:
-            warnings.append(
-                f"扩展 {opcode} 的字段 {sorted(fields)} 未转换")
-        return f"ext({', '.join(parts)})"
+        return _ext_call(
+            str(expr.extra.get('namespace', '')),
+            str(expr.extra.get('opcode', '')),
+            expr.extra.get('inputs'), expr.extra.get('fields'), warnings)
     if t == ExprType.PROPERTY:
         prop = expr.name
         mapping = {
@@ -288,7 +303,7 @@ class _Emitter:
         elif t == BlockType.WAIT_UNTIL:
             call('wait_until', exp(stmt.condition))
         elif t == BlockType.REPEAT:
-            out.append(f"{spaces}for _repeat in range({exp(stmt.value)}):")
+            out.append(f"{spaces}for _ in range({exp(stmt.value)}):")
             out.extend(self._body(stmt.body, indent + 1))
         elif t == BlockType.FOREVER:
             out.append(f"{spaces}while True:")
@@ -350,14 +365,7 @@ class _Emitter:
         elif t in (BlockType.BROADCAST, BlockType.BROADCAST_AND_WAIT):
             kind = ('broadcast' if t == BlockType.BROADCAST
                     else 'broadcast_and_wait')
-            value = stmt.value
-            if value is not None and value.type in (
-                    ExprType.STRING, ExprType.NUMBER):
-                call(kind, exp(value))
-            else:
-                self.warnings.append(
-                    "未转换动态广播（Scratch 只允许常量广播名）")
-                out.append(f"{spaces}# TODO 动态广播")
+            call(kind, exp(stmt.value))
         elif t == BlockType.CREATE_CLONE_OF:
             call('create_clone', exp(stmt.value))
         elif t == BlockType.DELETE_THIS_CLONE:
@@ -375,17 +383,11 @@ class _Emitter:
             for part in text.splitlines() or ['']:
                 out.append(f"{spaces}# {part}".rstrip())
         elif t == BlockType.EXTENSION:
-            namespace = str(stmt.extra.get('namespace', ''))
-            opcode = str(stmt.extra.get('opcode', ''))
-            parts = [_q(namespace), _q(opcode)]
-            for slot, value in (stmt.extra.get('inputs') or []):
-                if re.match(r'^[A-Za-z_]\w*$', str(slot)):
-                    parts.append(f"{slot}={exp(value)}")
-            fields = stmt.extra.get('fields') or {}
-            if fields:
-                self.warnings.append(
-                    f"扩展 {opcode} 的字段 {sorted(fields)} 未转换")
-            out.append(f"{spaces}ext({', '.join(parts)})")
+            out.append(f"{spaces}" + _ext_call(
+                str(stmt.extra.get('namespace', '')),
+                str(stmt.extra.get('opcode', '')),
+                stmt.extra.get('inputs'), stmt.extra.get('fields'),
+                self.warnings))
         else:
             self.warnings.append(f"未转换块 {t.name}")
             out.append(f"{spaces}# TODO: {t.name}")
@@ -465,10 +467,14 @@ def _procedure_source(stmt: Statement,
         body_lines.extend(_Emitter(comments or {}, []).emit(item, 1))
     if not body_lines:
         body_lines = ['    pass']
+    # 宏比较忽略注释，避免同一积木因注释不同而无法合并
+    key_lines: List[str] = []
+    for item in stmt.body:
+        key_lines.extend(_Emitter({}, []).emit(item, 1))
     text = '\n'.join([f"def {name}({signature}):"] + body_lines)
     key = (name, tuple(args), types, warp, label,
            re.sub(r'\s+', ' ', '\n'.join(line.strip()
-                                         for line in body_lines)))
+                                         for line in key_lines)))
     return name, text, repr(key)
 
 
@@ -476,12 +482,14 @@ _RESERVED_INIT = {
     'name', 'costumes', 'sounds', 'extensions', 'x', 'y', 'direction',
     'visible', 'size', 'rotation_style', 'draggable', 'current_costume',
     'layer_order', 'costume_names', 'sound_names',
+    'variable_aliases', 'list_aliases', 'macros',
 }
 
 
 def _init_lines(sprite, comments: List[str],
                 skip_vars=None, skip_lists=None,
-                extensions: Optional[List[str]] = None) -> List[str]:
+                extensions: Optional[List[str]] = None,
+                force_macros: Optional[List[str]] = None) -> List[str]:
     skip_vars = skip_vars or set()
     skip_lists = skip_lists or set()
     lines: List[str] = []
@@ -507,6 +515,27 @@ def _init_lines(sprite, comments: List[str],
             body.append(f"sound_names = {sound_names!r}")
     if extensions:
         body.append(f"extensions = {list(extensions)!r}")
+    if force_macros:
+        body.append(f"macros = {sorted(set(force_macros))!r}")
+    # 变量/列表名含冒号、问号等字符时，用别名在导出时还原原名
+    var_pairs = []
+    for name in (sprite.variables or {}):
+        if name in skip_vars:
+            continue
+        ident = _san(name, 'var')
+        if ident != name:
+            var_pairs.append([ident, name])
+    if var_pairs:
+        body.append(f"variable_aliases = {var_pairs!r}")
+    list_pairs = []
+    for name in (sprite.lists or {}):
+        if name in skip_lists:
+            continue
+        ident = _san(name, 'lst')
+        if ident != name:
+            list_pairs.append([ident, name])
+    if list_pairs:
+        body.append(f"list_aliases = {list_pairs!r}")
     # 文件名经过清洗，必须显式保留原始角色名（脚本按名字引用角色）
     if not sprite.is_stage:
         body.append(f"name = {sprite.name!r}")
@@ -552,9 +581,11 @@ def _sprite_source(sprite, comments: Dict[str, List[str]],
                    include_procedures: bool = True,
                    exclude_keys=None,
                    skip_vars=None, skip_lists=None,
-                   extensions: Optional[List[str]] = None
+                   extensions: Optional[List[str]] = None,
+                   force_macros: Optional[List[str]] = None
                    ) -> Tuple[str, List[str]]:
-    lines = _init_lines(sprite, standalone, skip_vars, skip_lists, extensions)
+    lines = _init_lines(sprite, standalone, skip_vars, skip_lists,
+                        extensions, force_macros)
     emitter = _Emitter(comments, warnings)
     procedures: List[str] = []
     for stmt in sprite.statements:
@@ -626,18 +657,46 @@ def import_sb3(path: str, output_dir: str, *,
                 json.dump(extension_urls, handle, ensure_ascii=False, indent=2)
                 handle.write('\n')
 
+        costume_meta: Dict[str, dict] = {}
+        for sprite in project.sprites:
+            for costume in (sprite.costumes or []):
+                md5ext = str(costume.get('md5ext')
+                             or costume.get('name') or '')
+                if not md5ext or md5ext in costume_meta:
+                    continue
+                costume_meta[md5ext] = {
+                    'rotationCenterX': costume.get('rotationCenterX', 0),
+                    'rotationCenterY': costume.get('rotationCenterY', 0),
+                    'bitmapResolution': costume.get('bitmapResolution', 1),
+                }
+        if costume_meta:
+            with open(os.path.join(output_dir, 'costume_meta.json'),
+                      'w', encoding='utf-8') as handle:
+                json.dump(costume_meta, handle, ensure_ascii=False, indent=2)
+                handle.write('\n')
+
         target_comments: Dict[str, Dict[str, List[str]]] = {}
         standalone: Dict[str, List[str]] = {}
+        all_comments: Dict[str, List[dict]] = {}
         for target in data.get('targets', []):
             tname = str(target.get('name', ''))
             by_block: Dict[str, List[str]] = {}
             top: List[str] = []
+            records: List[dict] = []
             for comment in (target.get('comments') or {}).values():
                 if not isinstance(comment, dict):
                     continue
                 text = str(comment.get('text', ''))
                 if not text:
                     continue
+                records.append({
+                    'text': text,
+                    'x': comment.get('x', 0),
+                    'y': comment.get('y', 0),
+                    'width': comment.get('width', 200),
+                    'height': comment.get('height', 100),
+                    'minimized': bool(comment.get('minimized', False)),
+                })
                 block_id = comment.get('blockId')
                 if block_id:
                     by_block.setdefault(str(block_id), []).append(text)
@@ -645,10 +704,20 @@ def import_sb3(path: str, output_dir: str, *,
                     top.append(text)
             target_comments[tname] = by_block
             standalone[tname] = top
+            if records:
+                all_comments[tname] = records
+
+        if all_comments:
+            with open(os.path.join(output_dir, 'comments.json'),
+                      'w', encoding='utf-8') as handle:
+                json.dump(all_comments, handle, ensure_ascii=False, indent=2)
+                handle.write('\n')
 
         warnings: List[str] = []
         duplicated = set()
         macro_texts: Dict[str, str] = {}
+        macro_names: Dict[str, str] = {}
+        defined_by: Dict[str, List[str]] = {}
 
         stage_target = next(
             (target for target in data.get('targets', [])
@@ -670,7 +739,15 @@ def import_sb3(path: str, output_dir: str, *,
                         stmt, target_comments.get(sprite.name, {}))
                     counts[key] += 1
                     macro_texts[key] = text
+                    macro_names[key] = _name
+                    defined_by.setdefault(key, []).append(sprite.name)
             duplicated = {key for key, count in counts.items() if count > 1}
+
+        # 抽到宏的积木所在角色需要强制引用，否则“定义但未调用”的积木会被裁掉
+        forced: Dict[str, List[str]] = {}
+        for key in duplicated:
+            for tname in defined_by.get(key, []):
+                forced.setdefault(tname, []).append(macro_names[key])
 
         declared_extensions = [str(name) for name in
                                (data.get('extensions') or []) if name]
@@ -684,7 +761,8 @@ def import_sb3(path: str, output_dir: str, *,
                 include_procedures=True, exclude_keys=duplicated,
                 skip_vars=global_vars if not sprite.is_stage else None,
                 skip_lists=global_lists if not sprite.is_stage else None,
-                extensions=declared_extensions if sprite.is_stage else None)
+                extensions=declared_extensions if sprite.is_stage else None,
+                force_macros=forced.get(sprite.name))
             with open(os.path.join(output_dir, filename), 'w',
                       encoding='utf-8') as handle:
                 handle.write(src)

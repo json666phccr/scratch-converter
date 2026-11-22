@@ -886,6 +886,8 @@ class ProjectIR:
     extensions: Any = field(default_factory=set)
     # TurboWarp 第三方扩展 ID -> 加载 URL（写回 project.json 的 extensionURLs）
     extension_urls: Dict[str, str] = field(default_factory=dict)
+    # 角色/舞台名 -> 注释记录（text/x/y/width/height/minimized）
+    comments: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
     # 需要随 .sb3 一起写入的额外资源（文件名 -> 字节内容）
     assets: Dict[str, bytes] = field(default_factory=dict)
 

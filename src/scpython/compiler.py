@@ -332,6 +332,21 @@ class ModuleAnalyzer:
             module.meta['sound_names'] = _string_list(
                 value, self.path, 'sound_names')
             return
+        if name == 'macros':
+            module.meta['force_macros'] = _string_list(
+                value, self.path, 'macros')
+            return
+        if name in ('variable_aliases', 'list_aliases'):
+            pairs = _constant(value, self.path, name)
+            if not isinstance(pairs, list) or any(
+                    not isinstance(pair, (list, tuple)) or len(pair) != 2
+                    or not all(isinstance(item, str) for item in pair)
+                    for pair in pairs):
+                raise ScPythonError(
+                    f"{name} 必须是 [[标识符, 原名], ...]",
+                    path=self.path, line=node.lineno)
+            module.meta[name] = {str(a): str(b) for a, b in pairs}
+            return
         if name == 'costumes':
             module.costumes = _string_list(value, self.path, 'costumes')
             return
@@ -767,6 +782,11 @@ class RoleBuilder:
         self.used_macros: set = set()
         # debug.reset() 一次可能要重置多个变量/列表，这里暂存多条语句
         self.pending_debug: List[Statement] = []
+        # 标识符 -> 原始 Scratch 名称（变量/列表名含非法字符时使用）
+        self.var_alias: Dict[str, str] = dict(
+            module.meta.get('variable_aliases') or {})
+        self.list_alias: Dict[str, str] = dict(
+            module.meta.get('list_aliases') or {})
 
     # ---------- 入口 ----------
 
@@ -790,6 +810,8 @@ class RoleBuilder:
             self.compiler.stage_var_ids = dict(self.variable_ids)
             self.compiler.stage_lists = dict(self.local_lists)
             self.compiler.stage_list_ids = dict(self.list_ids)
+            self.compiler.stage_var_alias = dict(self.var_alias)
+            self.compiler.stage_list_alias = dict(self.list_alias)
         self.sprite.costumes = self._load_costumes()
         self.sprite.sounds = self._load_sounds()
         return self.sprite
@@ -827,11 +849,11 @@ class RoleBuilder:
             var_names = set(self.module.explicit_vars)
             list_names = set(self.module.explicit_lists)
         self.local_vars = {
-            name: self.module.variables.get(name, 0)
+            self.var_alias.get(name, name): self.module.variables.get(name, 0)
             for name in var_names
         }
         self.local_lists = {
-            name: list(self.module.lists.get(name, []))
+            self.list_alias.get(name, name): list(self.module.lists.get(name, []))
             for name in list_names
         }
         for name in self.local_vars:
@@ -864,17 +886,25 @@ class RoleBuilder:
         return f"{prefix}_s{self.index}_{self.id_counter}"
 
     def _is_list_name(self, name: str) -> bool:
+        raw = name
+        name = self.list_alias.get(raw, raw)
         return (name in self.local_lists
-                or name in self.module.declared_lists
+                or raw in self.module.declared_lists
                 or name in self.compiler.stage_lists)
 
     def ensure_var(self, name: str) -> Tuple[str, str]:
         """返回 (存储名, ID)；无法解析时创建本地变量（舞台则全局）"""
+        raw = name
+        name = self.var_alias.get(raw, raw)
+        if not self.module.is_stage and raw not in self.var_alias:
+            mapped = self.compiler.stage_var_alias.get(raw)
+            if mapped:
+                name = mapped
         if name in self.local_vars:
             if name not in self.variable_ids:
                 self.variable_ids[name] = self._new_id('var')
             return name, self.variable_ids[name]
-        if self._is_list_name(name):
+        if self._is_list_name(raw):
             raise ScPythonError(
                 f"{name} 是列表，不能当变量使用", path=self.module.path)
         if not self.module.is_stage and name in self.compiler.stage_vars:
@@ -884,13 +914,19 @@ class RoleBuilder:
         return name, self.variable_ids[name]
 
     def ensure_list(self, name: str) -> Tuple[str, str]:
+        raw = name
+        name = self.list_alias.get(raw, raw)
+        if not self.module.is_stage and raw not in self.list_alias:
+            mapped = self.compiler.stage_list_alias.get(raw)
+            if mapped:
+                name = mapped
         if name in self.local_lists:
             if name not in self.list_ids:
                 self.list_ids[name] = self._new_id('list')
             return name, self.list_ids[name]
-        if name in self.local_vars or (
-                name in self.module.declared_vars
-                and name not in self.module.declared_lists):
+        if raw in self.local_vars or (
+                raw in self.module.declared_vars
+                and raw not in self.module.declared_lists):
             raise ScPythonError(
                 f"{name} 是变量，不是列表", path=self.module.path)
         if not self.module.is_stage and name in self.compiler.stage_lists:
@@ -1209,6 +1245,12 @@ class RoleBuilder:
             "for 只能遍历 range(...) 或列表变量",
             path=self.module.path, line=node.lineno)
 
+    @staticmethod
+    def _name_used(body: List[ast.stmt], name: str) -> bool:
+        return any(
+            isinstance(sub, ast.Name) and sub.id == name
+            for stmt in body for sub in ast.walk(stmt))
+
     def _compile_for_range(self, node: ast.For,
                            target: str) -> List[Statement]:
         call = node.iter
@@ -1232,6 +1274,18 @@ class RoleBuilder:
             raise ScPythonError("range 参数数量应为 1-3",
                                 path=self.module.path, line=node.lineno)
 
+        # 循环变量未使用且无 break/continue 时，直接还原成 Scratch 的
+        # “重复 N 次”，避免被拆成计数器 + 重复执行直到（步骤数会变多）。
+        target_used = target != '_' and self._name_used(node.body, target)
+        if step == 1 and isinstance(start_node, ast.Constant) \
+                and start_node.value == 0 \
+                and not _contains_break_continue(node.body) \
+                and not target_used:
+            stmt = Statement(BlockType.REPEAT)
+            stmt.value = self._expr(stop_node)
+            stmt.body = self._compile_sequence(node.body)
+            return [stmt]
+
         counter = self._hidden('i')
         limit = self._hidden('stop')
         prefix = [
@@ -1252,7 +1306,7 @@ class RoleBuilder:
         body: List[Statement] = []
         if loop is not None:
             body.append(self._set_var(continue_var, make_number(0)))
-        if target != '_':
+        if target_used:
             body.append(self._set_var(target, self._var_expr(counter)))
         if loop is not None:
             self.loop_stack.append(loop)
@@ -1291,7 +1345,7 @@ class RoleBuilder:
         body: List[Statement] = []
         if loop is not None:
             body.append(self._set_var(continue_var, make_number(0)))
-        if target != '_':
+        if target != '_' and self._name_used(node.body, target):
             body.append(self._set_var(
                 target, self._list_expr(ExprType.ITEM_OF_LIST, list_name,
                                         list_id, self._var_expr(index))))
@@ -1743,21 +1797,44 @@ class RoleBuilder:
                                 path=self.module.path, line=call.lineno)
         namespace = str(self._const_node(args[0]))
         opcode = str(self._const_node(args[1]))
-        inputs = []
-        for keyword in call.keywords:
-            if keyword.arg is None:
-                raise ScPythonError("ext 不支持 **kwargs",
-                                    path=self.module.path, line=call.lineno)
-            inputs.append((keyword.arg, self._expr(keyword.value)))
+        inputs, fields = self._extension_kwargs(call)
         stmt = Statement(BlockType.EXTENSION)
         stmt.extra.update({
             'namespace': namespace,
             'opcode': opcode,
             'inputs': inputs,
-            'fields': {},
+            'fields': fields,
         })
         self.used_extensions.add(namespace)
         return stmt
+
+    def _extension_kwargs(self, call: ast.Call):
+        """解析 ext(...) 关键字；``_fields=[...]`` 中的名字按字段写入"""
+        markers = None
+        pairs = []
+        for keyword in call.keywords:
+            if keyword.arg is None:
+                raise ScPythonError("ext 不支持 **kwargs",
+                                    path=self.module.path, line=call.lineno)
+            if keyword.arg == '_fields':
+                value = self._const_node(keyword.value)
+                if not isinstance(value, list) or any(
+                        not isinstance(item, str) for item in value):
+                    raise ScPythonError(
+                        "ext 的 _fields 必须是字符串列表",
+                        path=self.module.path, line=call.lineno)
+                markers = list(value)
+            else:
+                pairs.append((keyword.arg, keyword.value))
+        field_names = set(markers or ())
+        inputs = []
+        fields = {}
+        for name, node in pairs:
+            if name in field_names:
+                fields[name] = self._const_node(node)
+            else:
+                inputs.append((name, self._expr(node)))
+        return inputs, fields
 
     def _extension_statement(self, spec: ExtensionBlock,
                              call: ast.Call) -> Statement:
@@ -1934,18 +2011,16 @@ class RoleBuilder:
         elif name == 'wait_until':
             stmt = Statement(BlockType.WAIT_UNTIL)
             stmt.condition = self._arg_or(args, 0, make_boolean(True))
-        elif name == 'broadcast':
-            message = str(self._const_node(self._need(args, 0, name)))
-            stmt = Statement(BlockType.BROADCAST)
-            stmt.value = make_string(message)
-            if message not in self.sprite.broadcasts:
-                self.sprite.broadcasts.append(message)
-        elif name == 'broadcast_and_wait':
-            message = str(self._const_node(self._need(args, 0, name)))
-            stmt = Statement(BlockType.BROADCAST_AND_WAIT)
-            stmt.value = make_string(message)
-            if message not in self.sprite.broadcasts:
-                self.sprite.broadcasts.append(message)
+        elif name in ('broadcast', 'broadcast_and_wait'):
+            value = self._expr(self._need(args, 0, name))
+            stmt = Statement(
+                BlockType.BROADCAST if name == 'broadcast'
+                else BlockType.BROADCAST_AND_WAIT)
+            stmt.value = value
+            if value.type == ExprType.STRING:
+                message = str(value.value)
+                if message not in self.sprite.broadcasts:
+                    self.sprite.broadcasts.append(message)
         elif name == 'create_clone':
             stmt = Statement(BlockType.CREATE_CLONE_OF)
             target = '_myself_'
@@ -2356,18 +2431,13 @@ class RoleBuilder:
                                 path=self.module.path, line=call.lineno)
         namespace = str(self._const_node(args[0]))
         opcode = str(self._const_node(args[1]))
-        inputs = []
-        for keyword in call.keywords:
-            if keyword.arg is None:
-                raise ScPythonError("ext 不支持 **kwargs",
-                                    path=self.module.path, line=call.lineno)
-            inputs.append((keyword.arg, self._expr(keyword.value)))
+        inputs, fields = self._extension_kwargs(call)
         expr = Expr(ExprType.EXTENSION_CALL)
         expr.extra.update({
             'namespace': namespace,
             'opcode': opcode,
             'inputs': inputs,
-            'fields': {},
+            'fields': fields,
         })
         self.used_extensions.add(namespace)
         return expr
@@ -2407,12 +2477,16 @@ class ProjectCompiler:
         self.verbose = verbose
         self.warnings: List[str] = []
         self.assets: Dict[str, bytes] = {}
-        self.asset_library = AssetLibrary(self.project_root, self.assets)
+        self.costume_meta = self._load_costume_meta()
+        self.asset_library = AssetLibrary(
+            self.project_root, self.assets, costume_meta=self.costume_meta)
         self.extensions = ExtensionRegistry(self.project_root)
         self.stage_vars: Dict[str, Any] = {}
         self.stage_var_ids: Dict[str, str] = {}
         self.stage_lists: Dict[str, List[Any]] = {}
         self.stage_list_ids: Dict[str, str] = {}
+        self.stage_var_alias: Dict[str, str] = {}
+        self.stage_list_alias: Dict[str, str] = {}
         self.declared_extensions: set = set()
         self.used_extensions: set = set()
         self.last_project: Optional[ProjectIR] = None
@@ -2441,6 +2515,23 @@ class ProjectCompiler:
         path = os.path.join(self.project_root, 'macros.scpy')
         return path if os.path.isfile(path) else ''
 
+    def _load_costume_meta(self) -> Dict[str, dict]:
+        """读取 costume_meta.json：md5ext -> 旋转中心/分辨率"""
+        path = os.path.join(self.project_root, 'costume_meta.json')
+        if not os.path.isfile(path):
+            return {}
+        try:
+            with open(path, encoding='utf-8') as handle:
+                data = json.load(handle)
+        except (OSError, ValueError) as error:
+            raise ScPythonError(
+                f"costume_meta.json 解析失败: {error}", path=path) from error
+        if not isinstance(data, dict):
+            raise ScPythonError(
+                "costume_meta.json 必须是 {md5ext: 元数据} 对象", path=path)
+        return {str(name): value for name, value in data.items()
+                if isinstance(value, dict)}
+
     def _load_extension_urls(self) -> Dict[str, str]:
         """读取 TurboWarp 第三方扩展 URL（extension_urls.json）"""
         path = os.path.join(self.project_root, 'extension_urls.json')
@@ -2456,6 +2547,30 @@ class ProjectCompiler:
             raise ScPythonError(
                 "extension_urls.json 必须是 {扩展ID: URL} 对象", path=path)
         return {str(name): str(url) for name, url in data.items() if url}
+
+    def _load_comments(self) -> Dict[str, List[dict]]:
+        """读取 comments.json：角色/舞台名 -> 注释记录"""
+        path = os.path.join(self.project_root, 'comments.json')
+        if not os.path.isfile(path):
+            return {}
+        try:
+            with open(path, encoding='utf-8') as handle:
+                data = json.load(handle)
+        except (OSError, ValueError) as error:
+            raise ScPythonError(
+                f"comments.json 解析失败: {error}", path=path) from error
+        if not isinstance(data, dict):
+            raise ScPythonError(
+                "comments.json 必须是 {角色名: [注释, ...]} 对象", path=path)
+        result: Dict[str, List[dict]] = {}
+        for target, records in data.items():
+            if not isinstance(records, list):
+                continue
+            clean = [record for record in records
+                     if isinstance(record, dict) and record.get('text')]
+            if clean:
+                result[str(target)] = clean
+        return result
 
     def find_roles(self, stage_path: str) -> List[Tuple[str, str]]:
         roles = []
@@ -2495,7 +2610,8 @@ class ProjectCompiler:
                      macros: Dict[str, FunctionInfo]) -> None:
         if not macros:
             return
-        used = set()
+        # init 中 macros = [...] 强制保留（导入工程的未调用积木）
+        used = set(module.meta.get('force_macros') or ())
 
         def scan(node):
             for sub in ast.walk(node):
@@ -2558,6 +2674,7 @@ class ProjectCompiler:
         project = ProjectIR()
         project.extensions = set()
         project.extension_urls = self._load_extension_urls()
+        project.comments = self._load_comments()
         project.meta = {
             'semver': '3.0.0',
             # 必须是 x.y.z 或 x.y.z-suffix；TurboWarp 会按该正则校验

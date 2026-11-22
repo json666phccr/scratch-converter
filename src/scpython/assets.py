@@ -110,11 +110,13 @@ class AssetLibrary:
     """按工程根目录读取 assets/ 下的资源"""
 
     def __init__(self, project_root: str, assets: Dict[str, bytes],
-                 asset_dir: str = 'assets'):
+                 asset_dir: str = 'assets',
+                 costume_meta: Optional[Dict[str, dict]] = None):
         self.project_root = os.path.abspath(project_root)
         self.assets_root = os.path.abspath(
             os.path.join(self.project_root, asset_dir))
         self.assets = assets
+        self.costume_meta = costume_meta or {}
 
     def resolve(self, reference: str, source_path: str = '') -> str:
         """把角色文件里的资源引用解析成实际路径"""
@@ -162,12 +164,18 @@ class AssetLibrary:
         center_y = size[1] / 2 if size else 0
         display = name if name is not None else \
             os.path.splitext(os.path.basename(path))[0]
+        md5ext = f"{digest}.{extension}"
+        meta = (self.costume_meta or {}).get(md5ext) or {}
+        if meta.get('rotationCenterX') is not None:
+            center_x = meta['rotationCenterX']
+        if meta.get('rotationCenterY') is not None:
+            center_y = meta['rotationCenterY']
         return {
             'name': display,
             'assetId': digest,
-            'md5ext': f"{digest}.{extension}",
+            'md5ext': md5ext,
             'dataFormat': extension,
-            'bitmapResolution': 1,
+            'bitmapResolution': meta.get('bitmapResolution', 1),
             'rotationCenterX': center_x,
             'rotationCenterY': center_y,
         }

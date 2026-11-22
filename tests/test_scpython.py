@@ -525,11 +525,10 @@ def _patch_sb3_comments(sb3_path, target_name, text, standalone_text):
     data = json.loads(entries['project.json'].decode('utf-8'))
     target = next(t for t in data['targets'] if t.get('name') == target_name)
     blocks = target.get('blocks') or {}
-    block_id = next(
-        (bid for bid, block in blocks.items()
-         if isinstance(block, dict) and block.get('opcode') == 'looks_say'),
-        None)
-    assert block_id, "测试工程里应有一个 say 块"
+    say_ids = [bid for bid, block in blocks.items()
+               if isinstance(block, dict) and block.get('opcode') == 'looks_say']
+    assert say_ids, "测试工程里应有一个 say 块"
+    block_id = say_ids[-1]  # 取脚本里的 say，避免挂到重复积木上
     comments = target.setdefault('comments', {})
     comments['c_attached'] = {
         'blockId': block_id, 'x': 0, 'y': 0, 'width': 200, 'height': 100,
@@ -567,14 +566,23 @@ init:
     costume_names = ["猫", "背景图"]
     current_costume = 1
     layer_order = 7
+    var score = 0
+    variable_aliases = [["score", "得:分"]]
 
 def spin(speed, *, types="n", warp=True):
     set_rotation_style("all around")
     turn_right(speed)
 
+def orphan(*, warp=True):
+    say("dead")
+
 when green_flag:
     g += 1
     spin(15)
+    score += 1
+    for _ in range(2):
+        say("loop")
+    ext("myext", "myext_do", MODE="fast", _fields=["MODE"])
     say("A")
 """,
             'Win-Dow.scpy': """\
@@ -588,6 +596,9 @@ init:
 def spin(speed, *, types="n", warp=True):
     set_rotation_style("all around")
     turn_right(speed)
+
+def orphan(*, warp=True):
+    say("dead")
 
 when green_flag:
     g += 2
@@ -614,6 +625,12 @@ when green_flag:
                   encoding='utf-8') as handle:
             macros = handle.read()
         assert 'def spin(speed' in macros, macros
+        assert 'def orphan' in macros, macros
+        with open(os.path.join(imported, 'comments.json'),
+                  encoding='utf-8') as handle:
+            saved_comments = json.load(handle)
+        assert '旋转一次' in json.dumps(saved_comments, ensure_ascii=False)
+        assert os.path.exists(os.path.join(imported, 'costume_meta.json'))
 
         a_source = open(os.path.join(imported, 'A.scpy'),
                         encoding='utf-8').read()
@@ -623,6 +640,8 @@ when green_flag:
                             encoding='utf-8').read()
         assert 'def spin' not in a_source
         assert 'def spin' not in b_source
+        assert "macros = ['orphan', 'spin']" in a_source, a_source
+        assert 'variable_aliases' in a_source, a_source
         assert 'spin(15)' in a_source
         assert 'spin(30)' in b_source
         # 造型名/当前造型/图层顺序/角色名必须保留
@@ -656,10 +675,36 @@ when green_flag:
         assert [c['name'] for c in sprite_a['costumes']] == ['猫', '背景图']
         by_name = {sprite.name: sprite for sprite in project.sprites}
         for name in ('A', 'B'):
-            proccodes = [stmt.extra.get('proccode')
-                         for stmt in by_name[name].statements
-                         if stmt.type.name == 'PROCEDURE_DEFINE']
-            assert proccodes == ['spin %n'], (name, proccodes)
+            proccodes = sorted(
+                stmt.extra.get('proccode')
+                for stmt in by_name[name].statements
+                if stmt.type.name == 'PROCEDURE_DEFINE')
+            assert proccodes == ['orphan', 'spin %n'], (name, proccodes)
+
+        # 变量原名、扩展字段与注释都应保留
+        assert '得:分' in {value[0] for value in
+                          sprite_a['variables'].values()}, sprite_a['variables']
+        comments = sum(len(target.get('comments') or {})
+                       for target in data['targets'])
+        assert comments == 2, comments
+        ext_fields = {}
+        for target in data['targets']:
+            for block in (target.get('blocks') or {}).values():
+                if isinstance(block, dict) and block.get('opcode') == 'myext_do':
+                    ext_fields = block.get('fields') or {}
+        assert ext_fields.get('MODE') == ['fast', None], ext_fields
+
+        # 造型旋转中心与分辨率必须保持
+        first = {target['name']: {c['md5ext']: (
+            c.get('rotationCenterX'), c.get('rotationCenterY'),
+            c.get('bitmapResolution')) for c in target['costumes']}
+            for target in json.loads(
+                zipfile.ZipFile(sb3).read('project.json')).get('targets', [])}
+        again = {target['name']: {c['md5ext']: (
+            c.get('rotationCenterX'), c.get('rotationCenterY'),
+            c.get('bitmapResolution')) for c in target['costumes']}
+            for target in data['targets']}
+        assert first == again
 
         result = _run(sb3_again)
         assert not result['errors'], result['errors']

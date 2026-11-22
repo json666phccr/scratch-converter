@@ -713,9 +713,15 @@ sb3_to_scpython("input.sb3", "my_project", split_macros=True)
 转换内容：
 
 - 事件帽子、运动/外观/声音/控制/侦测块、变量与列表、自制积木与调用；
-- Scratch 注释：附着在块上的注释放在对应语句前，独立注释放在文件头；
+- Scratch 注释：文字写入工程根目录 `comments.json`（导出时回写为独立注释，
+  保留位置/大小），源码里同时保留 `#` 便于阅读；
+- 变量/列表原名列在 `variable_aliases` / `list_aliases` 中，导出时还原
+  `FortunateOS:系统版本号` 这类含冒号、问号的名字；
 - 保留角色原始名称、造型/声音名称、`currentCostume` 与 `layerOrder`，
-  并按名字切换造型/背景的脚本可继续正常工作；
+  造型旋转中心/分辨率写入 `costume_meta.json`，坐标与点击判定和原工程一致；
+- `for _ in range(n)` 会还原为 Scratch 的「重复 n 次」，不会多出计数器；
+- 扩展下拉字段通过 `ext("ns", "opcode", MODE="fast", _fields=["MODE"])`
+  写回字段；动态广播与第三方扩展 URL 也会保留；
 - 保留 TurboWarp 第三方扩展：`extensionURLs` 写入工程根目录的
   `extension_urls.json`，导出时回写到 `project.json`，避免 TurboWarp 报
   `Unknown extension`；
