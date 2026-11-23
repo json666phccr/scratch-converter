@@ -937,8 +937,6 @@ class ScratchWriter:
                 "argumentdefaults": json.dumps(arg_defaults),
                 "warp": warp,
             }
-            if stmt.extra.get('returns'):
-                proto_mutation["return"] = "true"
             self.all_blocks[proto_id] = {
                 "opcode": "procedures_prototype",
                 "next": None,

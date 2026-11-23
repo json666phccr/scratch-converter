@@ -263,8 +263,9 @@ when green_flag:
         protos = [b for b in blocks.values()
                   if isinstance(b, dict)
                   and b.get('opcode') == 'procedures_prototype']
+        # prototype 不能带 return（会把定义块变成运算块，导致整个工作区渲染失败）
         assert protos and all(
-            (b.get('mutation') or {}).get('return') == 'true'
+            'return' not in (b.get('mutation') or {})
             for b in protos), [b.get('mutation') for b in protos]
 
         result = _run(sb3)
