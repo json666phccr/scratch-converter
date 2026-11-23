@@ -1265,8 +1265,8 @@ class ScratchWriter:
                 "warp": 'true' if expr.extra.get('warp') else 'false',
             }
             if expr.extra.get('returns'):
-                # TurboWarp 用该标记把调用块渲染成运算块
-                block_data["mutation"]["return"] = "true"
+                # scratch-blocks 读取的是数字：0=语句 1=reporter 2=布尔
+                block_data["mutation"]["return"] = "1"
             for arg_id, arg in zip(arg_ids, expr.args):
                 block_data["inputs"][arg_id] = self.write_any_input(arg)
 

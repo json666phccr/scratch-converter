@@ -246,7 +246,7 @@ when green_flag:
         reporter_calls = [
             b for b in blocks.values()
             if isinstance(b, dict) and b.get('opcode') == 'procedures_call'
-            and (b.get('mutation') or {}).get('return') == 'true']
+            and (b.get('mutation') or {}).get('return') in ('1', '2')]
         assert reporter_calls, 'fact 调用应标记为 reporter'
         for top_id, top in blocks.items():
             if not (isinstance(top, dict) and top.get('topLevel')):
@@ -258,7 +258,7 @@ when green_flag:
                 cur_block = blocks[cur]
                 assert not (cur_block.get('opcode') == 'procedures_call'
                             and (cur_block.get('mutation') or {}).get(
-                                'return') == 'true'), cur_block
+                                'return') in ('1', '2')), cur_block
                 cur = cur_block.get('next')
         protos = [b for b in blocks.values()
                   if isinstance(b, dict)
