@@ -223,6 +223,7 @@ def fact(n, *, types="n", warp=True):
 
 when green_flag:
     result = fact(5)
+    fact(3)
 """,
         }, assets={'bg.svg': _BG_SVG})
         sb3 = _export(root)
@@ -238,6 +239,33 @@ when green_flag:
         # return 依赖 TurboWarp Custom Reporters，必须声明对应扩展
         assert 'procedures_enable_return' in data.get('extensions', []), \
             data.get('extensions')
+
+        # 带返回值的自制积木调用必须是运算块（mutation.return），
+        # 且不能出现在堆叠链 next 里
+        blocks = data['targets'][1]['blocks']
+        reporter_calls = [
+            b for b in blocks.values()
+            if isinstance(b, dict) and b.get('opcode') == 'procedures_call'
+            and (b.get('mutation') or {}).get('return') == 'true']
+        assert reporter_calls, 'fact 调用应标记为 reporter'
+        for top_id, top in blocks.items():
+            if not (isinstance(top, dict) and top.get('topLevel')):
+                continue
+            cur = top_id
+            seen = set()
+            while cur in blocks and cur not in seen:
+                seen.add(cur)
+                cur_block = blocks[cur]
+                assert not (cur_block.get('opcode') == 'procedures_call'
+                            and (cur_block.get('mutation') or {}).get(
+                                'return') == 'true'), cur_block
+                cur = cur_block.get('next')
+        protos = [b for b in blocks.values()
+                  if isinstance(b, dict)
+                  and b.get('opcode') == 'procedures_prototype']
+        assert protos and all(
+            (b.get('mutation') or {}).get('return') == 'true'
+            for b in protos), [b.get('mutation') for b in protos]
 
         result = _run(sb3)
         assert not result['errors'], result['errors']

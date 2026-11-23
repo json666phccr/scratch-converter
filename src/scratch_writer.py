@@ -928,6 +928,17 @@ class ScratchWriter:
                     "topLevel": False,
                 }
                 proto_inputs[arg_id] = [1, reporter_id]
+            proto_mutation = {
+                "tagName": "mutation",
+                "children": [],
+                "proccode": proccode,
+                "argumentids": json.dumps(arg_ids),
+                "argumentnames": json.dumps(arg_names),
+                "argumentdefaults": json.dumps(arg_defaults),
+                "warp": warp,
+            }
+            if stmt.extra.get('returns'):
+                proto_mutation["return"] = "true"
             self.all_blocks[proto_id] = {
                 "opcode": "procedures_prototype",
                 "next": None,
@@ -936,15 +947,7 @@ class ScratchWriter:
                 "fields": {},
                 "shadow": True,
                 "topLevel": False,
-                "mutation": {
-                    "tagName": "mutation",
-                    "children": [],
-                    "proccode": proccode,
-                    "argumentids": json.dumps(arg_ids),
-                    "argumentnames": json.dumps(arg_names),
-                    "argumentdefaults": json.dumps(arg_defaults),
-                    "warp": warp
-                }
+                "mutation": proto_mutation,
             }
             block_data["inputs"]["custom_block"] = [1, proto_id]
 
@@ -1116,23 +1119,19 @@ class ScratchWriter:
         return [3, block_id, [10, ""]]
 
     def write_boolean_input(self, expr: Optional[Expr]) -> List:
-        """写入布尔输入"""
+        """写入布尔输入（真实 sb3 格式：[2, blockId]，布尔槽没有影子块）"""
         if expr is None:
-            return [1, [10, "1"]]
-
-        inline = self._inline_reporter(expr)
-        if inline is not None:
-            return [3, inline, [10, "1"]]
+            return [1, None]
 
         if expr.type == ExprType.BOOLEAN:
-            return [1, [10, "1" if expr.value else "0"]]
+            return [1, [10, "1" if expr.value else ""]]
         if expr.type == ExprType.NUMBER:
             return [1, [10, str(expr.value)]]
         if expr.type == ExprType.STRING:
             return [1, [10, expr.value]]
 
         block_id = self.write_expression_block(expr)
-        return [3, block_id, [10, "1"]]
+        return [2, block_id]
 
     def write_expression_block(self, expr: Expr) -> str:
         """将表达式写入Scratch块，返回块ID"""
@@ -1267,6 +1266,9 @@ class ScratchWriter:
                 "argumentdefaults": json.dumps([]),
                 "warp": 'true' if expr.extra.get('warp') else 'false',
             }
+            if expr.extra.get('returns'):
+                # TurboWarp 用该标记把调用块渲染成运算块
+                block_data["mutation"]["return"] = "true"
             for arg_id, arg in zip(arg_ids, expr.args):
                 block_data["inputs"][arg_id] = self.write_any_input(arg)
 

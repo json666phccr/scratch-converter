@@ -781,6 +781,7 @@ class RoleBuilder:
         self.id_counter = 0
         self.current_function: Optional[FunctionInfo] = None
         self.recursive_functions: set = set()
+        self.reporter_functions: set = set()
         self.used_macros: set = set()
         # debug.reset() 一次可能要重置多个变量/列表，这里暂存多条语句
         self.pending_debug: List[Statement] = []
@@ -796,6 +797,7 @@ class RoleBuilder:
         self._apply_meta()
         self._init_symbols()
         self.recursive_functions = self._find_recursive_functions()
+        self.reporter_functions = self._find_reporter_functions()
 
         for kind, obj in self.module.source_order:
             if kind == 'def':
@@ -853,6 +855,19 @@ class RoleBuilder:
             if state.get(name, 0) == 0:
                 visit(name)
         return recursive
+
+    def _find_reporter_functions(self) -> set:
+        """找出带 ``return 值`` 的自制积木（TurboWarp 自定义 reporter）。
+
+        这类积木的调用块在 TurboWarp 里是运算块形状，不能当堆叠块连接。
+        """
+        result: set = set()
+        for name, info in self.module.functions.items():
+            for sub in ast.walk(info.node):
+                if isinstance(sub, ast.Return) and sub.value is not None:
+                    result.add(name)
+                    break
+        return result
 
     def _loop_needs_stack(self) -> bool:
         return (self.current_function is not None
@@ -1079,6 +1094,7 @@ class RoleBuilder:
             'argumentids': info.argumentids,
             'argumentdefaults': info.argumentdefaults,
             'warp': info.warp,
+            'returns': info.name in self.reporter_functions,
         })
         old_function = self.current_function
         self.current_function = info
@@ -1226,6 +1242,21 @@ class RoleBuilder:
                     isinstance(node.value.value, str):
                 return []
             if isinstance(node.value, ast.Call):
+                # 带返回值的自制积木在 TurboWarp 里是运算块，不能当堆叠块；
+                # 语句位置调用时把返回值丢进隐藏变量，保证块形状合法。
+                function = None
+                if isinstance(node.value.func, ast.Name):
+                    function = self.module.functions.get(node.value.func.id)
+                if function is not None and \
+                        function.name in self.reporter_functions:
+                    discard = self._hidden('discard')
+                    produced = [self._set_var(
+                        discard,
+                        self._procedure_call_expr(function, node.value))]
+                    if self.pending_debug:
+                        produced.extend(self.pending_debug)
+                        self.pending_debug = []
+                    return produced
                 stmt = self._compile_call_statement(node.value)
                 produced: List[Statement] = []
                 if stmt is not None:
@@ -2519,6 +2550,8 @@ class RoleBuilder:
                           for param in function.params[:len(args)]],
             'argumentids': function.argumentids[:len(args)],
             'warp': function.warp,
+            # TurboWarp 用 mutation.return 判断调用块是否为运算块
+            'returns': function.name in self.reporter_functions,
         })
         return expr
 
