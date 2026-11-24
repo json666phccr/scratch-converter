@@ -1597,9 +1597,10 @@ class RoleBuilder:
         stmt = Statement(BlockType.PROCEDURE_RETURN)
         if node.value is not None:
             stmt.value = self._expr(node.value)
-        # TurboWarp 的 return 属于「Custom Reporters」扩展，
-        # 工程必须声明该扩展，否则加载时会被当成缺失的自定义积木。
-        self.used_extensions.add('procedures_enable_return')
+        # procedures_return 是 TurboWarp VM 的内建积木：工程里出现 return 块
+        # 或带 return 的调用，编辑器就会自动开启 Custom Reporters。
+        # 不要把 procedures_enable_return 写进 project.extensions —— 它只是
+        # 编辑器扩展库里的伪扩展 ID，不是真实的 VM 扩展，声明它没有作用。
         return stmt
 
     def _compile_assign(self, node: ast.Assign) -> Statement:

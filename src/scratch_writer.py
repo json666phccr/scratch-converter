@@ -324,6 +324,10 @@ class ScratchWriter:
         names: List[str] = []
 
         def add(name):
+            # procedures_enable_return 只是编辑器扩展库里的伪扩展 ID，
+            # 不是真实的 VM 扩展：声明它没有作用，还可能触发 Unknown extension。
+            if name == 'procedures_enable_return':
+                return
             if name and name not in names:
                 names.append(name)
 
@@ -405,6 +409,9 @@ class ScratchWriter:
                 block_dict[top_id]["y"] = 50 + (index // 4) * 420
         # 合并子堆栈中创建的块
         blocks.update(self.all_blocks)
+        # 统一重建 parent 指针：表达式块与子堆栈首块此前可能没有 parent，
+        # 会造成工程里的块链断裂（Scratch/TurboWarp 依赖 parent 做块关系追踪）。
+        self._recompute_parents(blocks)
 
         # 收集脚本中引用但未在IR里声明的变量/列表，避免生成悬空引用
         used_vars, used_lists = self._collect_var_list_names(sprite.statements)
@@ -493,6 +500,22 @@ class ScratchWriter:
             })
 
         return result
+
+    @staticmethod
+    def _recompute_parents(blocks: Dict[str, Dict]) -> None:
+        """按 inputs/next 关系重建每个块的 parent 字段"""
+        for blk in blocks.values():
+            blk["parent"] = None
+        for bid, blk in blocks.items():
+            for inp in (blk.get("inputs") or {}).values():
+                if not isinstance(inp, list):
+                    continue
+                for item in inp:
+                    if isinstance(item, str) and item in blocks:
+                        blocks[item]["parent"] = bid
+            nxt = blk.get("next")
+            if isinstance(nxt, str) and nxt in blocks:
+                blocks[nxt]["parent"] = bid
 
     def write_statement(self, stmt: Statement, parent_id: Optional[str]) -> Dict[str, Dict]:
         """将Statement转换为Scratch块字典，返回 {block_id: block_data}"""

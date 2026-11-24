@@ -236,8 +236,10 @@ when green_flag:
         assert procedure.extra['proccode'] == 'fact %n'
         assert procedure.extra['arg_types'] == ['n']
         assert procedure.extra['warp'] is True
-        # return 依赖 TurboWarp Custom Reporters，必须声明对应扩展
-        assert 'procedures_enable_return' in data.get('extensions', []), \
+        # return 使用 TurboWarp VM 内建的 procedures_return，
+        # 绝不能把编辑器伪扩展 procedures_enable_return 写进工程
+        # （VM 会抛 Unknown extension 导致工程无法安装）
+        assert 'procedures_enable_return' not in data.get('extensions', []), \
             data.get('extensions')
 
         # 带返回值的自制积木调用必须是运算块（mutation.return），

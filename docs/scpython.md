@@ -482,8 +482,8 @@ def greet(name="world", *, types="s"):
 
 - 未写 `types` 时，按默认值推断：`True/False` → `b`，数字 → `n`，字符串 → `s`，无默认值 → `s`。
 - 缺省参数值会写入 Scratch 的 `argumentdefaults`；没有默认值的布尔参数为 `false`，其他为 `""`。
-- 用 `return 值` 返回结果，可以当表达式使用（依赖 TurboWarp 的 Custom Reporters；导出时自动在 `extensions` 中声明 `procedures_enable_return`，否则 TurboWarp 编辑器会把 return 与包含它的自制积木显示为缺失）：
-- 带 `return` 的自制积木在 TurboWarp 里是**运算块**。表达式位置调用会写入 `mutation.return=true`；如果在语句位置调用（丢弃返回值），会自动赋给隐藏变量 `__scpy_discard_*`，避免运算块被塞进堆叠链导致工程无法加载。
+- 用 `return 值` 返回结果，可以当表达式使用。该能力依赖 **TurboWarp 的 Custom Reporters**（`procedures_return` 是 TurboWarp VM 的内建积木），**官方 Scratch 不支持**：在 Scratch 里 `return` 不会生效，调用处只会拿到空值。导出时**不要**在 `project.extensions` 中声明 `procedures_enable_return` —— 那只是编辑器扩展库里的伪扩展 ID，VM 并不认识；只要工程里出现 `procedures_return` 块或带 `return` 的调用，编辑器就会自动开启该功能。
+- 带 `return` 的自制积木在 TurboWarp 里是**运算块**。表达式位置调用会写入 `mutation.return`（`"1"` = 圆形运算块，`"2"` = 六边形布尔块）；如果在语句位置调用（丢弃返回值），会自动赋给隐藏变量 `__scpy_discard_*`，避免运算块被塞进堆叠链导致工程无法加载。
 
 ```python
 def fact(n, *, types="n", warp=True):
